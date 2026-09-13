@@ -76,10 +76,16 @@ jobs:
       - name: Build
         run: cargo build --workspace --release --target ${{ matrix.target }}
 
-      # Hashing is neither bitness- nor ISA-dependent, so the full suite runs once
-      # on x64 and the other targets are compile-checked.
+      # Windows x64 runners execute both x64 and x86 binaries natively (WOW64), so
+      # both are tested. aarch64 is the only compile-only target: its binaries need
+      # an ARM64 host or an emulator these runners do not provide.
+      #
+      # The hash algorithms themselves are bitness-independent, and that is exactly
+      # why the *rest* of the suite has to run here: a 64-bit `usize` literal once
+      # hid inside a UI message constant, which x86_64 compiled happily and 32-bit
+      # targets rejected outright.
       - name: Test
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: ${{ !contains(matrix.target, 'aarch64') }}
         run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Test (diagnostics enabled)

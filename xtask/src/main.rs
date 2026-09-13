@@ -97,16 +97,20 @@ fn check_reference_untracked() -> ExitCode {
 }
 
 fn usage() {
+    // A raw string, not a line-continuation puzzle: the usage text has blank
+    // lines in it, and `\` at end of line eats them. `#` elsewhere in the text
+    // means the delimiter needs only one hash.
     println!(
-        "\
+        r#"
 cargo xtask <command>
 
   check     Run everything that must pass before a commit: fmt, clippy with
             -D warnings, the test suite, the coverage audit, and the external
             verification. Run this after changing files.
-            Always targets x86_64-pc-windows-msvc (the shipping target) rather
-            than the host, so a GNU host cannot make the gate pass vacuously.
-            --target <triple>   Check a different target instead.
+            Names every supported target explicitly rather than trusting the
+            host, so a GNU host cannot make the gate pass vacuously, and lints
+            all three triples so a 32-bit-only compile error cannot hide.
+            --target <triple>   Check only that target.
 
   verify    Check digests against external authorities (OpenSSL, frozen vectors).
             --require-tools   Fail instead of skipping when a tool is missing.
@@ -126,12 +130,59 @@ cargo xtask <command>
             Validate the local internal notes: they must be Chinese. Skips cleanly
             when docs/internal/ is absent, which is the normal case in a clone.
 
-Exit codes: 0 ok, 1 verification failure or missing required tool, 2 usage error."
+Exit codes: 0 ok, 1 verification failure or missing required tool, 2 usage error."#
     );
 }
 
 /// The triple rustHashTab ships for 64-bit hosts.
 const SHIPPING_TARGET: &str = "x86_64-pc-windows-msvc";
+
+/// Every triple we claim to support, shipping triple first.
+///
+/// `check` compiles all of them. Compiling only the shipping triple is how the
+/// i686 build stayed broken with a green gate: `MESSAGE_MAGIC` was a 64-bit
+/// literal in a `usize` context, which is a plain `error: literal out of range`
+/// on a 32-bit target and therefore invisible to any x86_64-only run. Type-level
+/// target bugs are exactly what the compiler catches and a code review does not.
+const SUPPORTED_TARGETS: &[&str] = &[
+    SHIPPING_TARGET,
+    "i686-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+];
+
+/// Whether built test binaries for `target` can execute on this host.
+///
+/// The comparison is on **architecture**, not on the full triple, and that
+/// distinction is the whole point. A GNU host builds `x86_64-pc-windows-msvc`
+/// test binaries that run perfectly well: both are x86_64 PE binaries, and the
+/// only difference is which CRT they link (msvcrt vs ucrt/msvcrt), which does not
+/// stop the loader. Comparing whole triples would silently downgrade the shipping
+/// target's tests to a link-only check on this machine -- the exact vacuous-gate
+/// failure this command exists to prevent.
+///
+/// This is deliberately conservative otherwise. Only the host architecture, and
+/// 32-bit x86 on any x86 host (WOW64 runs those natively), count. aarch64 test
+/// binaries are linted and linked but never run, because running them would need
+/// an emulator that a plain `cargo test` does not use.
+fn target_is_runnable(target: &str, host: &str) -> bool {
+    let (t_arch, h_arch) = (arch_of(target), arch_of(host));
+
+    if t_arch == h_arch {
+        return true;
+    }
+    // 32-bit x86 binaries run natively on a 64-bit x86 Windows host via WOW64.
+    t_arch == "i686" && h_arch == "x86_64"
+}
+
+/// The architecture component of a target triple, e.g. `x86_64`.
+///
+/// Every triple rustc accepts starts with its architecture and then a hyphen, so
+/// this does not need a table. A triple with no hyphen is returned unchanged: it
+/// is malformed, and returning it makes the comparison above simply fail closed
+/// rather than silently treating it as runnable.
+fn arch_of(triple: &str) -> &str {
+    triple.split('-').next().unwrap_or(triple)
+}
 
 /// Ask rustc for the host triple, so `check` reports which toolchain it used.
 fn detect_host() -> String {
@@ -163,7 +214,7 @@ fn step(label: &str, program: &str, args: &[&str]) -> bool {
 
 /// The pre-commit gate.
 ///
-/// # Why the target is explicit
+/// # Why the targets are explicit
 ///
 /// `cargo test` with no `--target` builds for the *host*. When the host toolchain
 /// is `x86_64-pc-windows-gnu` -- which `rust-toolchain.toml` selects on a machine
@@ -171,11 +222,15 @@ fn step(label: &str, program: &str, args: &[&str]) -> bool {
 /// MinGW build, not the MSVC build that ships. A green run would say nothing about
 /// the artifact users get.
 ///
-/// So the gate always names its target, and prints the host it ran on. Override
-/// with `cargo xtask check --target <triple>` when deliberately testing the GNU
-/// build.
+/// So the gate always names its targets, and prints the host it ran on. It lints
+/// **every** supported triple, and runs tests wherever the built binaries can
+/// actually execute.
+///
+/// Restrict it with `--target <triple>` when iterating on one platform; an
+/// intentionally non-supported triple (e.g. the GNU build) is still accepted, but
+/// only that triple is checked.
 fn check(args: &[String]) -> ExitCode {
-    let mut target = SHIPPING_TARGET.to_string();
+    let mut requested: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -184,7 +239,7 @@ fn check(args: &[String]) -> ExitCode {
                     eprintln!("check: --target needs a triple");
                     return ExitCode::from(2);
                 };
-                target = v.clone();
+                requested = Some(v.clone());
                 i += 2;
             }
             other => {
@@ -196,39 +251,65 @@ fn check(args: &[String]) -> ExitCode {
 
     let host = detect_host();
     println!("host toolchain : {host}");
-    println!("checking target: {target}");
-    if host != target {
-        println!(
-            "  (host and target differ, which is expected: the shipping target is \
-             {SHIPPING_TARGET} regardless of which host toolchain is active)"
-        );
-    }
 
+    let targets: Vec<String> = match requested {
+        Some(t) => vec![t],
+        None => SUPPORTED_TARGETS.iter().map(|t| (*t).to_string()).collect(),
+    };
+
+    // `cargo fmt` is target-independent: it parses, it does not compile. Run it
+    // last so a formatting failure cannot mask a compile or test failure the way
+    // an early `&&` would -- all the failures should be visible in one run.
     let mut ok = true;
+
+    for target in &targets {
+        let runnable = target_is_runnable(target, &host);
+        println!(
+            "\n--- target {target} ({}) ---",
+            if runnable {
+                "lint + test"
+            } else {
+                "lint only; test binaries cannot run on this host"
+            }
+        );
+
+        ok &= step(
+            &format!("cargo clippy --workspace --all-targets --target {target} -- -D warnings"),
+            "cargo",
+            &[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--target",
+                target,
+                "--",
+                "-D",
+                "warnings",
+            ],
+        );
+
+        if runnable {
+            ok &= step(
+                &format!("cargo test --workspace --target {target}"),
+                "cargo",
+                &["test", "--workspace", "--target", target],
+            );
+        } else {
+            // Still build the test harness for this triple: `clippy --all-targets`
+            // type-checks it, but `cargo test --no-run` links it, and link errors
+            // are target-specific too.
+            ok &= step(
+                &format!("cargo test --workspace --no-run --target {target}"),
+                "cargo",
+                &["test", "--workspace", "--no-run", "--target", target],
+            );
+        }
+    }
 
     ok &= step(
         "cargo fmt --all --check",
         "cargo",
         &["fmt", "--all", "--check"],
-    );
-    ok &= step(
-        &format!("cargo clippy --workspace --all-targets --target {target} -- -D warnings"),
-        "cargo",
-        &[
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--target",
-            &target,
-            "--",
-            "-D",
-            "warnings",
-        ],
-    );
-    ok &= step(
-        &format!("cargo test --workspace --target {target}"),
-        "cargo",
-        &["test", "--workspace", "--target", &target],
     );
 
     // External verification runs last: it is the slowest, and a compile error
@@ -252,7 +333,8 @@ fn check(args: &[String]) -> ExitCode {
     }
 
     if ok {
-        println!("\nAll checks passed (target {target}).");
+        let list = targets.join(", ");
+        println!("\nAll checks passed (targets: {list}).");
         ExitCode::SUCCESS
     } else {
         eprintln!("\nCHECKS FAILED -- see the output above.");
@@ -443,4 +525,86 @@ fn audit() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arch_of_takes_the_leading_component() {
+        assert_eq!(arch_of("x86_64-pc-windows-msvc"), "x86_64");
+        assert_eq!(arch_of("i686-pc-windows-msvc"), "i686");
+        assert_eq!(arch_of("aarch64-pc-windows-msvc"), "aarch64");
+        assert_eq!(arch_of("x86_64-pc-windows-gnu"), "x86_64");
+        assert_eq!(arch_of("x86_64-unknown-linux-musl"), "x86_64");
+    }
+
+    /// A triple with no hyphen cannot be split, so it comes back whole and the
+    /// comparison against a real host fails closed instead of matching by accident.
+    #[test]
+    fn arch_of_fails_closed_on_a_malformed_triple() {
+        assert_eq!(arch_of("nonsense"), "nonsense");
+        assert!(!target_is_runnable("nonsense", "x86_64-pc-windows-msvc"));
+    }
+
+    /// The regression this function exists for. This machine's rustup host is
+    /// GNU, and an exact-triple comparison silently downgraded the *shipping*
+    /// target's tests to a link-only check.
+    #[test]
+    fn msvc_tests_run_on_a_gnu_host_of_the_same_architecture() {
+        assert!(target_is_runnable(
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-gnu"
+        ));
+        assert!(target_is_runnable(
+            "x86_64-pc-windows-gnu",
+            "x86_64-pc-windows-msvc"
+        ));
+    }
+
+    #[test]
+    fn host_architecture_always_runs() {
+        for triple in SUPPORTED_TARGETS {
+            assert!(
+                target_is_runnable(triple, triple),
+                "{triple} must run on itself"
+            );
+        }
+    }
+
+    /// WOW64 really does run these; the gate should not waste a build on
+    /// `--no-run` for a target whose tests it could have executed.
+    #[test]
+    fn i686_runs_on_an_x86_64_host_but_not_the_reverse() {
+        assert!(target_is_runnable(
+            "i686-pc-windows-msvc",
+            "x86_64-pc-windows-msvc"
+        ));
+        assert!(!target_is_runnable(
+            "x86_64-pc-windows-msvc",
+            "i686-pc-windows-msvc"
+        ));
+    }
+
+    /// aarch64 binaries need an emulator a plain `cargo test` will not use.
+    #[test]
+    fn aarch64_is_linted_but_not_claimed_runnable() {
+        assert!(!target_is_runnable(
+            "aarch64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc"
+        ));
+        assert!(!target_is_runnable(
+            "aarch64-pc-windows-msvc",
+            "i686-pc-windows-msvc"
+        ));
+    }
+
+    /// The shipping triple must stay first: it is the one whose tests actually
+    /// gate a release, and the loop reports targets in this order.
+    #[test]
+    fn shipping_target_is_listed_first() {
+        assert_eq!(SUPPORTED_TARGETS.first(), Some(&SHIPPING_TARGET));
+        assert_eq!(SUPPORTED_TARGETS.len(), 3);
+    }
 }

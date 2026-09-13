@@ -95,7 +95,22 @@ pub const WM_FILE_PROGRESS: u32 = 0x0401;
 pub const PROGRESS_RESOLUTION: u64 = 256;
 
 /// Magic value carried in `wParam` to authenticate our own messages.
+///
+/// `wParam` is `WPARAM`, which is pointer-sized, so on a 32-bit build only the low
+/// half of the 64-bit constant fits. That is a property of the platform, not a
+/// choice: the upstream C++ had the same split, and the truncation is what its
+/// 32-bit build produced.
+///
+/// Both values are deliberately odd and high-entropy in their low 32 bits. The
+/// check only ever compares against this constant, so what matters is that a
+/// stray `WM_USER`-range message from an unrelated control is extremely unlikely
+/// to match — not which particular number is used.
+#[cfg(target_pointer_width = "64")]
 pub const MESSAGE_MAGIC: usize = 0x1c72_5fcf_dcbf_5843;
+/// See the 64-bit definition. Truncated to the low 32 bits because `WPARAM` is
+/// 32-bit here and the full constant does not fit.
+#[cfg(target_pointer_width = "32")]
+pub const MESSAGE_MAGIC: usize = 0xdcbf_5843;
 
 /// Errors the UI layer can produce.
 #[derive(Debug, thiserror::Error)]
