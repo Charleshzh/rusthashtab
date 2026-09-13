@@ -1,0 +1,109 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Lowest Rust this workspace compiles with. Distinct from rust-toolchain.toml,
+# which pins the version we *use*: this is the floor a consumer may go down to, and
+# it must not be raised without reason.
+#
+# It must also never exceed the pinned toolchain, or the two contradict each other.
+# It sat at 1.90 while the pin moved to 1.98.1 -- 1.90 < 1.98.1 so nothing broke,
+# but the number no longer meant anything. Both now say 1.98.1: this project has no
+# downstream consumers yet, and claiming compatibility it is not testing would be
+# a guess. Lower it deliberately if a real floor is established.
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/Charleshzh/rusthashtab"
+authors = ["The rustHashTab contributors"]
+categories = ["windows", "algorithms", "cryptography", "utility"]
+# Belt and braces for `cargo package`. Cargo already skips files git ignores, but
+# the exclusion is spelled out because one of these directories is someone else's
+# code under an unresolved claim, and "cargo happened to skip it" is not a control.
+exclude = [
+    "OpenHashTab/",   # reference checkout -- see .gitignore for why
+    "docs/internal/", # research notes, not for distribution
+    ".github/",
+    "CLAUDE.md",
+]
+
+[workspace.dependencies]
+# ---- internal crates ----------------------------------------------------
+# NB: `crates/*` are individual path dependencies below rather than being
+# re-exported from a single `workspace.dependencies` alias, so that a crate
+# only pulls in what it actually needs.
+rusthashtab-abi = { path = "crates/rusthashtab-abi" }
+rusthashtab-hash = { path = "crates/rusthashtab-hash" }
+rusthashtab-sumfile = { path = "crates/rusthashtab-sumfile" }
+rusthashtab-settings = { path = "crates/rusthashtab-settings" }
+rusthashtab-scan = { path = "crates/rusthashtab-scan" }
+rusthashtab-net = { path = "crates/rusthashtab-net" }
+rusthashtab-ui = { path = "crates/rusthashtab-ui" }
+
+# ---- hashing primitives -------------------------------------------------
+digest = "0.11"
+crc32fast = "1.5"
+crc = "3.4"
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64", "xxh3"] }
+md4 = "0.11"
+md-5 = "0.11"
+ripemd = "0.2"
+sha1 = "0.11"
+sha2 = "0.11"
+sha3 = "0.12"
+blake2s_simd = "1.0"
+blake3 = "1.8"
+k12 = "0.5"
+streebog = "0.11"
+quickxorhash = "0.1"
+# NOTE: `sp800-185` is deliberately NOT used. Its ParallelHash implementation is
+# functionally correct but allocates per 8 KiB block and drives rayon's global
+# thread pool, neither of which is acceptable inside a shell extension.
+# See docs/internal/CRATE-COVERAGE.md §ParallelHash.
+
+# ---- Windows interop (see docs/internal/SHELL-EXTENSION-NOTES.md §2) ----
+# `windows` 0.62 and `windows-core` 0.100 are NOT semver-compatible.
+# Keep both on the 0.62 track; `#[implement]` lives in windows-core's
+# proc-macros feature and is reached via `windows::core::implement`.
+windows = "0.62"
+windows-core = "0.62"
+
+# ---- misc ---------------------------------------------------------------
+base64 = "0.22"
+hex = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[profile.release]
+# A shell extension must never unwind into the host. Every COM entry point
+# wraps its body in `catch_unwind` (see crates/rusthashtab-abi), so unwinding
+# stays enabled -- do NOT set panic = "abort" here.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.release.package."*"]
+opt-level = 3
+
+[profile.dev]
+# Debug builds are for logic only; hashing throughput is irrelevant.
+opt-level = 1
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

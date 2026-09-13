@@ -1,0 +1,48 @@
+# Target-specific build settings.
+#
+# Hashing throughput lives or dies on this file. Without an explicit target-cpu
+# several dependencies silently fall back to scalar code:
+#   - `sha2`      loses SHA-NI        (otherwise auto-detected, ~4 GB/s measured)
+#   - `xxhash-rust` loses AVX2
+#   - `blake3`    loses AVX-512
+#
+# x86-64-v3 == AVX2 + BMI2 + FMA. It is the right floor for a Windows 10/11
+# shell extension in 2026. Do NOT use `native`: release binaries are built on CI
+# and must not assume the build machine's CPU.
+
+# MSVC is the project's toolchain. See docs/internal/TOOLCHAIN-EVALUATION.md.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=generic"]
+
+# i686 has no useful SIMD baseline beyond SSE2, and the 32-bit build is only
+# there so the DLL can load into 32-bit hosts. SSE2 is guaranteed on i686.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+sse2"]
+
+# ---------------------------------------------------------------------------
+# Not a supported configuration. Kept so that xtask/toolchain-compare/compare.ps1
+# can reproduce the MSVC-vs-GNU measurement on demand -- it needs both targets
+# built with identical flags, otherwise it would be measuring the flags rather
+# than the toolchains.
+#
+# Building these requires installing the target yourself; it is deliberately not
+# in rust-toolchain.toml's `targets` list. Do not ship them, and do not add them
+# to CI. Rationale, with measurements: docs/internal/TOOLCHAIN-EVALUATION.md.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.i686-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+sse2"]
+
+[build]
+# Default to the native 64-bit target; CI overrides with --target.
+# (No `jobs` key: cargo defaults to the host's parallelism already.)
+
+[alias]
+# Developer automation. `cargo xtask <cmd>` -- see `cargo xtask help`.
+xtask = "run --package xtask --"
+# Release-mode test run, for timing-sensitive work.
+xtest = "test --workspace --release"

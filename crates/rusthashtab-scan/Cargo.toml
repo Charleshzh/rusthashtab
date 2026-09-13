@@ -1,0 +1,17 @@
+[package]
+name = "rusthashtab-scan"
+description = "File discovery, path normalization and concurrent hashing pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusthashtab-hash.workspace = true
+rusthashtab-sumfile.workspace = true
+rusthashtab-settings.workspace = true
+thiserror.workspace = true

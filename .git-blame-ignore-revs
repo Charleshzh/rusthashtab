@@ -1,0 +1,16 @@
+# Commits whose changes are pure formatting, listed so `git blame` can skip them.
+#
+# Usage:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically when it is named exactly this and lives
+# at the repository root.
+#
+# Add a commit here when it changes no behaviour -- a `cargo fmt` sweep, a
+# line-ending normalisation, a mass rename. Do NOT add ordinary commits: the
+# point is that every entry can be ignored without losing information.
+#
+# NOTE: entries must be full 40-character SHAs. A short SHA silently does nothing.
+#
+# Empty for now. The initial commit is not listed because there is nothing before
+# it to attribute work away from.

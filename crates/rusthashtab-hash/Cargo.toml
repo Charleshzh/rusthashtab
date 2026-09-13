@@ -1,0 +1,50 @@
+[package]
+name = "rusthashtab-hash"
+description = "The 31 hash algorithms rustHashTab exposes, as uniform streaming contexts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes internal state for integration tests. Never enable in a release build.
+test-internals = []
+
+[dependencies]
+digest.workspace = true
+crc32fast.workspace = true
+crc.workspace = true
+xxhash-rust.workspace = true
+md4.workspace = true
+md-5.workspace = true
+ripemd.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+sha3.workspace = true
+blake2s_simd.workspace = true
+blake3.workspace = true
+k12.workspace = true
+streebog.workspace = true
+quickxorhash.workspace = true
+
+# ParallelHash is hand-written on top of the SP 800-185 building blocks.
+# `sp800-185` itself is deliberately avoided: see the note in the workspace
+# manifest.
+cshake = "0.2"
+shake = "0.1"
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+# Verification oracle only -- never a runtime dependency. Its ParallelHash is
+# correct but unusable in-process (see src/parallel_hash.rs), so it exists here
+# purely so `cargo run --bin phdiff` can diff against it.
+sp800-185 = { version = "0.2", features = ["parallelhash"] }
+
+shake = "0.1"
+cshake = "0.2"

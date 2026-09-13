@@ -1,0 +1,16 @@
+[package]
+name = "rusthashtab-sumfile"
+description = "Sumfile parsing and export (hex, base64, SFV, corz .hash)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+regex.workspace = true
+thiserror.workspace = true

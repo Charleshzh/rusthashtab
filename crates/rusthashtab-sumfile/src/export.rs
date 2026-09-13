@@ -1,0 +1,309 @@
+//! Sumfile export.
+//!
+//! Mirrors the format knobs rustHashTab exposes in its settings, because users
+//! hand these files to other tools and the exact byte layout matters:
+//!
+//! * `upper` — uppercase hex, the default and what most tools emit
+//! * `forward_slashes` — `/` instead of `\` in paths
+//! * `unix_endings` — LF instead of CRLF
+//! * `double_space` — `HASH␣␣FILE` instead of `HASH␣*FILE`
+//! * `banner` / `banner_date` — a provenance header
+//! * `corz_compatible` — emit the extra `#algo#path#timestamp` line that the
+//!   corz `.hash` format uses
+
+#![warn(missing_docs)]
+
+use crate::FileSum;
+
+/// Which sumfile flavour to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// `sha256sum`-style: `HASH␣␣FILE`.
+    Sumfile,
+    /// `HASH␣*FILE`-style (the GNU binary marker), plus corz `.hash` lines.
+    DotHash,
+    /// SFV: `FILE␣CRC32`, semicolon comments.
+    Sfv,
+}
+
+/// Formatting options for [`export`].
+#[derive(Debug, Clone)]
+pub struct ExportOptions {
+    /// Uppercase hex digests.
+    pub upper: bool,
+    /// Replace `\` with `/` in paths.
+    pub forward_slashes: bool,
+    /// LF line endings instead of CRLF.
+    pub unix_endings: bool,
+    /// Use two spaces rather than space-asterisk between digest and path.
+    pub double_space: bool,
+    /// Emit a provenance banner.
+    pub banner: bool,
+    /// Include a timestamp in the banner.
+    pub banner_date: bool,
+    /// Emit corz `.hash` compatible `#algo#path#timestamp` lines.
+    pub corz_compatible: bool,
+    /// Algorithm name to embed in corz lines, lowercased and with `-` removed.
+    pub algorithm_label: String,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            upper: true,
+            forward_slashes: true,
+            unix_endings: true,
+            double_space: false,
+            banner: true,
+            banner_date: false,
+            corz_compatible: false,
+            algorithm_label: String::new(),
+        }
+    }
+}
+
+/// Product name and URL used in the banner.
+const PRODUCT: &str = "rustHashTab";
+
+/// Encode a digest as hex, honouring the case setting.
+///
+/// # Panics
+/// Never in practice: `upper` only selects the lookup table.
+pub fn to_hex(bytes: &[u8], upper: bool) -> String {
+    const LOWER: &[u8; 16] = b"0123456789abcdef";
+    const UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    let table = if upper { UPPER } else { LOWER };
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(table[(b >> 4) as usize] as char);
+        s.push(table[(b & 0x0F) as usize] as char);
+    }
+    s
+}
+
+/// Rewrite a path for export.
+fn export_path(path: &str, opts: &ExportOptions) -> String {
+    if opts.forward_slashes {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    }
+}
+
+/// `#2026-09-12T07:07:09Z`
+fn iso8601_utc() -> String {
+    // Deliberately dependency-free: a shell extension should not pull in a
+    // date/time crate for a banner. Formatting is done from the raw epoch.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = now / 86_400;
+    let secs = now % 86_400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Howard Hinnant's `civil_from_days`, valid for the whole proleptic Gregorian
+/// range we care about.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Render `entries` in the requested format.
+///
+/// `entries` is sorted by path so the output is deterministic regardless of the
+/// order the scanner finished files in.
+pub fn export(entries: &[FileSum], format: ExportFormat, opts: &ExportOptions) -> String {
+    let eol = if opts.unix_endings { "\n" } else { "\r\n" };
+    let mut sorted: Vec<&FileSum> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut out = String::new();
+
+    if opts.banner {
+        let stamp = if opts.banner_date {
+            format!(" at {}", iso8601_utc())
+        } else {
+            String::new()
+        };
+        let marker = if format == ExportFormat::Sfv {
+            ';'
+        } else {
+            '#'
+        };
+        out.push_str(&format!("{marker} Generated by {PRODUCT}{stamp}{eol}"));
+        out.push_str(&format!("{marker}{eol}"));
+    }
+
+    let separator = if opts.double_space { "  " } else { " *" };
+
+    for e in sorted {
+        let path = export_path(&e.path, opts);
+        let digest = to_hex(&e.digest, opts.upper);
+        match format {
+            ExportFormat::Sfv => {
+                // SFV is always `FILE<space>CRC32`, and never uppercased by us
+                // unless asked — the format has no case convention.
+                out.push_str(&format!("{path} {digest}{eol}"));
+            }
+            ExportFormat::DotHash | ExportFormat::Sumfile => {
+                if opts.corz_compatible {
+                    out.push_str(&format!(
+                        "#{}#{path}#1970.01.01@00.00:00{eol}",
+                        opts.algorithm_label
+                    ));
+                }
+                out.push_str(&format!("{digest}{separator}{path}{eol}"));
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, digest: &[u8]) -> FileSum {
+        FileSum {
+            path: path.to_string(),
+            digest: digest.to_vec(),
+        }
+    }
+
+    #[test]
+    fn hex_case() {
+        assert_eq!(to_hex(&[0x00, 0xAB, 0xFF], true), "00ABFF");
+        assert_eq!(to_hex(&[0x00, 0xAB, 0xFF], false), "00abff");
+    }
+
+    #[test]
+    fn default_sumfile_shape() {
+        let opts = ExportOptions {
+            banner: false,
+            ..Default::default()
+        };
+        let out = export(
+            &[entry("a.txt", &[0x5B, 0x72])],
+            ExportFormat::Sumfile,
+            &opts,
+        );
+        assert_eq!(out, "5B72 *a.txt\n");
+    }
+
+    #[test]
+    fn double_space_variant() {
+        let opts = ExportOptions {
+            banner: false,
+            double_space: true,
+            ..Default::default()
+        };
+        let out = export(
+            &[entry("a.txt", &[0x5B, 0x72])],
+            ExportFormat::Sumfile,
+            &opts,
+        );
+        assert_eq!(out, "5B72  a.txt\n");
+    }
+
+    #[test]
+    fn crlf_and_backslashes() {
+        let opts = ExportOptions {
+            banner: false,
+            unix_endings: false,
+            forward_slashes: false,
+            ..Default::default()
+        };
+        let out = export(
+            &[entry("dir\\a.txt", &[0x01])],
+            ExportFormat::Sumfile,
+            &opts,
+        );
+        assert_eq!(out, "01 *dir\\a.txt\r\n");
+    }
+
+    #[test]
+    fn forward_slashes_are_default() {
+        let opts = ExportOptions {
+            banner: false,
+            ..Default::default()
+        };
+        let out = export(
+            &[entry("dir\\a.txt", &[0x01])],
+            ExportFormat::Sumfile,
+            &opts,
+        );
+        assert_eq!(out, "01 *dir/a.txt\n");
+    }
+
+    #[test]
+    fn entries_are_sorted_for_determinism() {
+        let opts = ExportOptions {
+            banner: false,
+            ..Default::default()
+        };
+        let out = export(
+            &[entry("z.txt", &[0x02]), entry("a.txt", &[0x01])],
+            ExportFormat::Sumfile,
+            &opts,
+        );
+        assert_eq!(out, "01 *a.txt\n02 *z.txt\n");
+    }
+
+    #[test]
+    fn sfv_shape() {
+        let opts = ExportOptions {
+            banner: false,
+            ..Default::default()
+        };
+        let out = export(
+            &[entry("file.txt", &[0x5B, 0x72, 0x1D, 0x06])],
+            ExportFormat::Sfv,
+            &opts,
+        );
+        assert_eq!(out, "file.txt 5B721D06\n");
+    }
+
+    #[test]
+    fn sfv_banner_uses_semicolon() {
+        let opts = ExportOptions::default();
+        let out = export(&[entry("f", &[0x00])], ExportFormat::Sfv, &opts);
+        assert!(out.starts_with("; Generated by rustHashTab\n"));
+    }
+
+    #[test]
+    fn corz_lines_precede_the_sumfile_line() {
+        let opts = ExportOptions {
+            banner: false,
+            corz_compatible: true,
+            algorithm_label: "sha256".into(),
+            ..Default::default()
+        };
+        let out = export(&[entry("a.txt", &[0xAB])], ExportFormat::DotHash, &opts);
+        assert_eq!(out, "#sha256#a.txt#1970.01.01@00.00:00\nAB *a.txt\n");
+    }
+
+    #[test]
+    fn civil_date_conversion_is_correct() {
+        // 1970-01-01 is day 0; 2026-09-12 is a known value.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_000), (2022, 1, 8));
+    }
+}

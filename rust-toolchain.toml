@@ -1,0 +1,48 @@
+[toolchain]
+# Pinned to the latest stable at the time of writing.
+#
+# OBSOLETE: 1.90 was pinned from 2025-09-18 to 2026-09-12. It is no longer
+# defensible:
+#   * Rust provides security updates only for the most recent stable release --
+#     no LTS, no backports -- so 1.90 had been out of support for ~8 releases.
+#   * 1.90 ships LLVM 20; 1.91 moved to LLVM 21 and 1.95 to LLVM 22. That is two
+#     LLVM majors of codegen lost on exactly the sha2/blake3/xxhash-rust path that
+#     .cargo/config.toml's `target-cpu` exists to accelerate.
+#
+# DO NOT PIN 1.98.0. It miscompiles trait-object vtables -- it can emit a null
+# function pointer where a real one belongs (rust-lang/rust#161441, fixed in
+# 1.98.1). A shell extension is nothing but vtables. 1.98.1 or later only.
+#
+# Next releases: 1.99.0 on 2026-10-01, 1.100.0 on 2026-11-12 (6-week cadence).
+# When bumping, re-run `cargo xtask check` -- notably because new
+# deny-by-default lints keep landing (`invalid_runtime_symbol_definitions` in
+# 1.98.0 targets memcmp/memset/strlen, which hand-vectorised hash code can
+# define).
+channel = "1.98.1"
+
+components = ["rust-analyzer", "rustfmt", "clippy"]
+
+# MSVC only. This is the project's toolchain decision, recorded in
+# docs/internal/TOOLCHAIN-EVALUATION.md: the ABI is not the reason (x86_64 GNU is
+# ABI-compatible with MSVC and cross-loading was measured working both ways), the
+# reasons are that a GNU-built DLL carries no PDB -- so a debugger inside
+# explorer.exe shows only disassembly -- plus an officially unmaintained target,
+# non-portable linker flags, and a CRT dependency that varies with whichever
+# MinGW is on PATH.
+#
+# The host toolchain cannot be pinned from this file (rustup does not honour a
+# `host` key here, and the channel field rejects a target tuple). That is
+# precisely why `cargo xtask check` names `--target` explicitly instead of
+# relying on the host: a machine whose rustup default host is GNU would otherwise
+# test the GNU build while reporting success.
+#
+# If you need the GNU target for a one-off comparison, add it with
+# `rustup target add x86_64-pc-windows-gnu`; it is deliberately not part of the
+# default install.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "i686-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+profile = "minimal"

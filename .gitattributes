@@ -1,0 +1,46 @@
+# Normalise line endings.
+#
+# Windows-first project, but the repository stores LF. Without this, a checkout on
+# a machine with `core.autocrlf=true` rewrites every file, which buries real
+# changes in whitespace noise and makes `git blame` useless.
+#
+# `text=auto` lets git decide per file, then the explicit rules below override it
+# where the choice matters.
+
+* text=auto
+
+# --- source and config: always LF in the repository -------------------------
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.lock      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.rc        text eol=lf
+*.manifest  text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+.editorconfig  text eol=lf
+LICENSE-MIT text eol=lf
+
+# PowerShell scripts are the one exception: Windows PowerShell 5.1 handles LF in
+# .ps1 poorly, and these are developer tooling rather than shipped source.
+*.ps1       text eol=crlf
+
+# --- binaries: never touch ------------------------------------------------
+*.ico       binary
+*.png       binary
+*.dll       binary
+*.exe       binary
+*.msi       binary
+*.pdb       binary
+
+# --- generated / vendored: keep out of diffs and language stats ------------
+/target/            export-ignore
+/docs/internal/     linguist-documentation
+/xtask/toolchain-compare/out/ export-ignore
+
+# Mark the research notes as documentation so language statistics reflect the
+# product, not the research.
+docs/internal/*.md  linguist-documentation

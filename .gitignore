@@ -1,0 +1,73 @@
+# Build output
+/target
+**/*.rs.bk
+*.pdb
+
+# Scratch files and directories. Research, toolchain experiments and commit-message
+# files create these at the repository root; they are working state, never source.
+#
+# NO trailing slash: with one, this matched directories only, and a stray
+# `.tmp-commit-msg` was committed on the first attempt. The pattern has to cover
+# files too.
+/.tmp-*
+
+# Toolchain comparison output: raw benchmark text, regenerated on every run.
+/xtask/toolchain-compare/out/
+
+# Reference checkout of the upstream C++ implementation.
+#
+# It sits in the working tree purely so behaviour can be compared and so the
+# provenance notes have something concrete to point at. It must NEVER enter
+# version control:
+#
+#   * it is someone else's code, under someone else's licence, carrying an
+#     unresolved DMCA claim -- committing it would import both problems into
+#     this repository's history, where they cannot be removed by a later commit;
+#   * `cargo package`/`cargo publish` would pick it up as stray files;
+#   * a fork or a source tarball would redistribute it.
+#
+# Nothing under `crates/` or `xtask/` may read from this directory at build time.
+/OpenHashTab/
+
+# Local agent / AI-tooling guidance. Kept out of version control on purpose:
+# it encodes the working rules for whoever is editing this checkout, including
+# the provenance constraints, and is not part of the shipped product.
+# NOTE: README.md links to CLAUDE.md, so an untracked checkout would have a
+# dangling reference -- see the note in that file if you decide to publish it.
+/CLAUDE.md
+
+# Generated localization resources
+/crates/rusthashtab-ui/src/generated/
+
+# Installer build output
+/installer/build/
+*.msi
+*.wixpdb
+
+# Local, non-published research material and reference binaries.
+#
+# Scope is deliberate: only `docs/internal/` is ignored, NOT all of `docs/`.
+# Ignoring `/docs/` would work today (nothing else lives there) and then silently
+# swallow the first real document someone adds under `docs/`. The pattern has to
+# name the part that is local-only.
+/docs/internal/
+/reference/
+*.dll
+!crates/**/tests/fixtures/**/*.dll
+
+# `docs/internal/` is kept out of version control entirely. It is the research and
+# decision record, it names the upstream project, and none of that belongs in the
+# product's history. It lives on the developer's disk only.
+#
+# CONSEQUENCE, and it matters: a fresh clone has no docs/internal/. Nothing may
+# require it to exist -- scripts and CI must treat it as optional, and anything
+# that reads it has to degrade gracefully when it is absent. `cargo xtask check`
+# validates it only when present.
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+desktop.ini

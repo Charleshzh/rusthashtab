@@ -1,0 +1,30 @@
+# Editor defaults, so a contributor's editor does not reformat the tree.
+#
+# rustfmt is authoritative for Rust (`cargo fmt --all`); this file only stops
+# editors from fighting it and keeps the non-Rust files consistent.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{toml,yml,yaml,json}]
+indent_size = 2
+
+# Markdown: two trailing spaces are a hard line break, so they must survive.
+[*.md]
+trim_trailing_whitespace = false
+
+# PowerShell tooling uses CRLF (see .gitattributes).
+[*.ps1]
+end_of_line = crlf
+indent_size = 4
+
+# The generated resource templates are checked in with their own layout.
+[*.rc]
+indent_size = 4

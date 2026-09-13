@@ -1,0 +1,234 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["*.*.*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: rustup show active-toolchain
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Correctness evidence against something we did not write. A digest that only
+  # agrees with a constant this repository also produced proves nothing, so this
+  # job is not optional: it either finds OpenSSL and checks every algorithm that
+  # has an external authority, or it fails.
+  verify:
+    name: external verification
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          # windows-2025 images ship Strawberry Perl's OpenSSL; fall back to a
+          # winget install if it is not on PATH.
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            winget install --source winget --exact --id ShiningLight.OpenSSL.Light `
+              --disable-interactivity --accept-source-agreements
+          }
+          openssl version
+
+      - name: Coverage map must name an authority for every algorithm
+        run: cargo run --package xtask -- audit
+
+      # --require-tools turns "OpenSSL is missing" from a silent skip into a
+      # failure. Without it this job could pass while checking nothing.
+      - name: Differential check against OpenSSL
+        run: cargo run --package xtask -- verify --require-tools
+
+  test:
+    name: test (${{ matrix.target }})
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          # ARM64 builds fine on an x64 host but cannot be *run* there, so it is
+          # compile-checked only until a native runner is available.
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      # Hashing is neither bitness- nor ISA-dependent, so the full suite runs once
+      # on x64 and the other targets are compile-checked.
+      - name: Test
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --workspace --release --target ${{ matrix.target }}
+
+      - name: Test (diagnostics enabled)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test -p rusthashtab-hash --features test-internals --target ${{ matrix.target }}
+
+  # These are not code bugs, so a later patch cannot undo them. Fail the build.
+  provenance:
+    name: release hygiene
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+
+      # README.md is bilingual: English is authoritative, Chinese must be kept in
+      # sync. That is easy to forget in a single-language edit, so it is enforced.
+      - name: README must stay bilingual
+        shell: pwsh
+        run: |
+          $lines = Get-Content README.md
+          if (-not $lines) { Write-Host '::error::README.md is empty'; exit 1 }
+
+          # Section headings are ASCII on purpose: anchors depend on them, and this
+          # check must find them without relying on regex Unicode classes.
+          $sections = @($lines | Where-Object { $_ -match '^## ' })
+          if ($sections.Count -eq 0) {
+            Write-Host '::error::README.md has no level-2 sections'
+            exit 1
+          }
+
+          # Non-ASCII lines are how the Chinese half of the document is detected.
+          $cjk = @($lines | Where-Object { $_ -match '[\u4e00-\u9fff]' })
+          if ($cjk.Count -lt 40) {
+            Write-Host "::error::README.md looks untranslated: only $($cjk.Count) lines carry CJK text."
+            exit 1
+          }
+
+          # Every prose section must have a Chinese counterpart. The two table-only
+          # sections are exempt: their tables already pair both languages per row.
+          $tableOnly = @('## Algorithms / 算法', '## Project layout / 项目结构')
+          $missing = @()
+          for ($i = 0; $i -lt $sections.Count; $i++) {
+            $heading = $sections[$i]
+            if ($tableOnly -contains $heading) { continue }
+            $start = [array]::IndexOf($lines, $heading) + 1
+            $end = if ($i + 1 -lt $sections.Count) {
+                     [array]::IndexOf($lines, $sections[$i + 1])
+                   } else { $lines.Count }
+            $body = $lines[$start..($end - 1)]
+            if (-not ($body | Where-Object { $_ -match '[\u4e00-\u9fff]' })) {
+              $missing += $heading
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host '::error::These README sections have no Chinese counterpart:'
+            $missing | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "README.md is bilingual: $($sections.Count) sections, all with both languages."
+
+      # `.gitignore` stops a careless `git add`, but not `git add -f`, and not a merge
+      # that dragged the directory in. Once it is tracked it is in the history, and no
+      # later commit removes it. So check what is actually tracked, every run.
+      #
+      # The check lives in xtask rather than here so that this workflow file does
+      # not itself carry the directory's name; xtask assembles it at runtime.
+      - name: The reference checkout must not be tracked
+        run: cargo run --package xtask -- reference-check
+
+      - name: Toolchain policy — MSVC only
+        shell: pwsh
+        run: |
+          # The project decided on MSVC (docs/internal/TOOLCHAIN-EVALUATION.md).
+          # That decision is easy to erode by accident: someone adds the GNU
+          # target "just to check", or a workflow copy-pastes a GNU command. Both
+          # would make the toolchain support surface grow without a decision.
+          $fail = 0
+
+          # 1. rust-toolchain.toml must not auto-install a GNU target.
+          $tc = Get-Content rust-toolchain.toml -Raw
+          $inTargets = $false
+          foreach ($line in ($tc -split "`n")) {
+            if ($line -match '^\s*targets\s*=') { $inTargets = $true; continue }
+            if ($inTargets -and $line -match '^\s*\]') { $inTargets = $false; continue }
+            if ($line -match '^\s*#') { continue }
+            if ($inTargets -and $line -match 'gnu') {
+              Write-Host '::error::rust-toolchain.toml lists a GNU target; the project is MSVC-only.'
+              $fail = 1
+            }
+          }
+
+          # 2. No CI command may build for a GNU target.
+          $gnu = 'windows-' + 'gnu'
+          $hits = Select-String -Path .github/workflows/*.yml -Pattern $gnu -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Line -notmatch '^\s*#' }
+          foreach ($h in $hits) {
+            Write-Host "::error::$($h.Path):$($h.LineNumber) references a GNU target"
+            $fail = 1
+          }
+
+          if ($fail) { exit 1 }
+          Write-Host 'Toolchain policy holds: MSVC only.'
+
+      # NOTE: there is deliberately no check here that docs/internal/ exists. That
+      # directory is git-ignored by decision (see .gitignore), so a fresh clone in
+      # CI does not have it and a job requiring it would fail on every run.
+      # `cargo xtask check` validates the internal notes on a developer machine,
+      # where they do exist, and skips cleanly when they do not.
+
+      # Scans only files that ship. The workflow files are excluded deliberately:
+      # this job contains the very pattern it searches for.
+      - name: No upstream identifiers in shipped files
+        shell: pwsh
+        run: |
+          $shipped = @('README.md', 'Cargo.toml', 'rust-toolchain.toml',
+                       '.cargo/config.toml', '.gitignore', 'LICENSE-MIT')
+          # CLAUDE.md is git-ignored, but scan it whenever a local checkout has it.
+          if (Test-Path 'CLAUDE.md') { $shipped += 'CLAUDE.md' }
+          $shipped += (Get-ChildItem crates -Recurse -File -Include *.rs, *.toml, *.rc |
+                       ForEach-Object FullName)
+
+          # Split so this file does not match its own source text.
+          $needles = @('OpenHash' + 'Tab', 'Legacy' + 'Hasher', 'namaz' + 'so')
+          $hits = Select-String -Path $shipped -Pattern $needles -ErrorAction SilentlyContinue
+          if ($hits) {
+            Write-Host '::error::Public-facing material names the upstream project:'
+            $hits | ForEach-Object { Write-Host "  $($_.Path):$($_.LineNumber)" }
+            exit 1
+          }
+          Write-Host 'Clean: no upstream identifiers in shipped files.'
+
+      - name: The test oracle must not be a runtime dependency
+        shell: pwsh
+        run: |
+          # `sp800-185` is a valid differential oracle but unusable in-process:
+          # per-block allocation, a global rayon pool, and a wrong empty-input
+          # result. It must stay in [dev-dependencies].
+          $fail = 0
+          foreach ($m in Get-ChildItem crates -Recurse -Filter Cargo.toml) {
+            $lines = Get-Content $m.FullName
+            $section = ''
+            foreach ($line in $lines) {
+              if ($line -match '^\s*\[') { $section = $line.Trim() }
+              # Ignore comments: the manifests explain *why* this crate is dev-only.
+              if ($line -match '^\s*#') { continue }
+              if ($line -match '^\s*sp800-185' -and $section -eq '[dependencies]') {
+                Write-Host "::error::$($m.FullName): sp800-185 is a runtime dependency"
+                $fail = 1
+              }
+            }
+          }
+          if ($fail) { exit 1 }
+          Write-Host 'sp800-185 is dev-only everywhere.'
