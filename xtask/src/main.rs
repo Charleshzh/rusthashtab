@@ -150,6 +150,17 @@ const SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-pc-windows-msvc",
 ];
 
+/// The minimum number of Chinese lines a bilingual README must carry.
+///
+/// Set well above a stray CJK character (someone's name in a contributors list)
+/// and well below the real count, so it catches "the translation is gone" without
+/// becoming a number that has to be tuned on every edit.
+const MIN_README_CJK_LINES: usize = 40;
+
+/// Sections whose tables already pair both languages on every row, so their body
+/// is exempt from the "some line must be Chinese" rule.
+const TABLE_ONLY_SECTIONS: &[&str] = &["## Algorithms / 算法", "## Project layout / 项目结构"];
+
 /// Whether built test binaries for `target` can execute on this host.
 ///
 /// The comparison is on **architecture**, not on the full triple, and that
@@ -330,6 +341,7 @@ fn check(args: &[String]) -> ExitCode {
         ok &= matches!(check_reference_untracked(), ExitCode::SUCCESS);
         ok &= matches!(check_no_scratch_tracked(), ExitCode::SUCCESS);
         ok &= matches!(check_internal_docs(), ExitCode::SUCCESS);
+        ok &= matches!(check_readme_bilingual(), ExitCode::SUCCESS);
     }
 
     if ok {
@@ -399,6 +411,91 @@ fn check_internal_docs() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!("ERROR: internal-note convention violations:");
+        for p in &problems {
+            eprintln!("  {p}");
+        }
+        ExitCode::FAILURE
+    }
+}
+
+/// Enforce that `README.md` stays bilingual.
+///
+/// English is authoritative and the Chinese half must be kept in sync. That is
+/// easy to forget in a single-language edit, and nothing else catches it: the
+/// file is prose, so no compiler and no test looks at it.
+///
+/// This duplicates the CI check in `.github/workflows/ci.yml` on purpose. A rule
+/// that is only enforced in CI fails *after* the push, on the slowest possible
+/// feedback loop, so the local gate should catch it first. CI keeps its own copy
+/// because a gate a contributor can skip is not an enforcement mechanism.
+///
+/// The rules are deliberately shape-based rather than semantic. A section counts
+/// as translated when *some* line in it carries CJK text, which catches a wholly
+/// untranslated section but not a half-translated one. That is the honest limit
+/// of a check that cannot read: it is a reminder to sync the two halves, not a
+/// proof that they agree.
+fn check_readme_bilingual() -> ExitCode {
+    let Ok(text) = std::fs::read_to_string("README.md") else {
+        eprintln!("ERROR: README.md is missing or not valid UTF-8.");
+        return ExitCode::FAILURE;
+    };
+
+    let has_cjk = |s: &str| s.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}'));
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        eprintln!("ERROR: README.md is empty.");
+        return ExitCode::FAILURE;
+    }
+
+    // A body of text with no Chinese in it at all means the translation is simply
+    // absent, which is a more useful message than listing every section.
+    let cjk_lines = lines.iter().filter(|l| has_cjk(l)).count();
+    if cjk_lines < MIN_README_CJK_LINES {
+        eprintln!(
+            "ERROR: README.md looks untranslated: only {cjk_lines} lines carry Chinese text \
+             (expected at least {MIN_README_CJK_LINES})."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Section headings are ASCII on purpose: anchors depend on them, and matching
+    // them needs no Unicode classes.
+    let headings: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("## "))
+        .collect();
+    if headings.is_empty() {
+        eprintln!("ERROR: README.md has no level-2 sections.");
+        return ExitCode::FAILURE;
+    }
+
+    let mut problems: Vec<&str> = Vec::new();
+    for (i, heading) in headings.iter().enumerate() {
+        // Table-only sections pair both languages per row, so a Chinese line is not
+        // guaranteed to exist in any given slice of them.
+        if TABLE_ONLY_SECTIONS.contains(heading) {
+            continue;
+        }
+        let start = lines.iter().position(|l| l == heading).unwrap_or(0) + 1;
+        let end = headings
+            .get(i + 1)
+            .and_then(|next| lines.iter().position(|l| l == next))
+            .unwrap_or(lines.len());
+        if start < end && !lines[start..end].iter().any(|l| has_cjk(l)) {
+            problems.push(heading);
+        }
+    }
+
+    if problems.is_empty() {
+        println!(
+            "OK: README.md is bilingual ({cjk_lines} Chinese lines, {} sections all paired).",
+            headings.len()
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("ERROR: these README.md sections have no Chinese counterpart:");
         for p in &problems {
             eprintln!("  {p}");
         }

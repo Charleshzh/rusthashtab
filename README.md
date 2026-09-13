@@ -122,6 +122,17 @@ green test run then says nothing about the artifact users get.
 > 是 GNU，那测的就是 MinGW 构建而不是发布用的 MSVC 构建——测试全绿却对用户拿到的产物
 > 什么都没证明。
 
+`cargo xtask check` covers all three supported targets, not just one. It lints each of them and
+runs the test suite wherever the resulting binaries can actually execute on the current machine:
+`x86_64` and `i686` binaries run natively on an x64 Windows host, while `aarch64` is compiled and
+linked but not run. A single-target gate is how a 64-bit-only constant once passed every local
+check and still failed to compile for 32-bit.
+
+> `cargo xtask check` **覆盖全部三个受支持 target**，而不只是一个。它逐个 lint，并在当前机器
+> 真能执行二进制时跑测试：`x86_64` 与 `i686` 在 x64 Windows host 上原生运行，`aarch64`
+> 只编译并链接、不运行。只查一个 target 的门禁，曾让一个仅 64 位成立的常量通过了所有本地
+> 检查，却在 32 位下根本编译不过。
+
 ### Toolchain
 
 **Windows builds use MSVC only.** `x86_64-pc-windows-msvc` is the one supported configuration;
@@ -402,3 +413,4 @@ a naive licence scanner.
 > `xxhash-rust` 用的是 Boost Software License 1.0，而不是常见的 MIT/Apache 双许可——同样
 > 宽松、同样与 MIT 兼容，但因为它是唯一的例外、且可能触发粗糙的许可证扫描器，所以单独
 > 列出来。
+
