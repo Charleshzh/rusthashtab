@@ -30,6 +30,7 @@ pub mod blake2sp;
 pub mod blake3_family;
 pub mod checksums;
 mod digest_adapter;
+pub mod ed2k;
 pub mod gost;
 pub mod k12;
 pub mod parallel_hash;

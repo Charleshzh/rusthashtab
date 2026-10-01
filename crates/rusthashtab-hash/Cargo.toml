@@ -48,6 +48,10 @@ hex.workspace = true
 # correct but unusable in-process (see src/parallel_hash.rs), so it exists here
 # purely so `cargo run --bin phdiff` can diff against it.
 sp800-185 = { version = "0.2", features = ["parallelhash"] }
+# Verification oracle only, for tests/ed2k_oracle.rs -- it pins digest 0.10,
+# which is precisely why src/ed2k.rs is hand-written over `md4` instead of
+# re-exporting this crate. Never a runtime dependency.
+ed2k = "1"
 
 shake = "0.1"
 cshake = "0.2"

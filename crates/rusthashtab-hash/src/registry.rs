@@ -20,6 +20,7 @@ use crate::Hasher;
 use crate::blake2sp::Blake2sp;
 use crate::blake3_family::Blake3;
 use crate::checksums::{Crc32, Crc64, Xxh3, Xxh32, Xxh64};
+use crate::ed2k::{Ed2k, Flavour};
 use crate::gost::{Gost256, Gost512};
 use crate::k12::K12;
 use crate::sha2_family::{Md4, Md5, RipeMd160, Sha1, Sha224, Sha256, Sha384, Sha512};
@@ -291,6 +292,8 @@ pub fn make(name: &str) -> Option<Box<dyn Hasher>> {
         "BLAKE3-512" => Box::new(Blake3::new_512()),
         "GOST 2012 (256)" => Box::new(Gost256::new()),
         "GOST 2012 (512)" => Box::new(Gost512::new()),
+        "eD2k" => Box::new(Ed2k::new(Flavour::Blue)),
+        "eD2k (Old)" => Box::new(Ed2k::new(Flavour::Red)),
         _ => return None,
     })
 }

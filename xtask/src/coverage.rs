@@ -363,18 +363,21 @@ pub(crate) const COVERAGE: &[Coverage] = &[
     Coverage {
         name: "eD2k",
         output_len: 16,
+        // Hand-written tree over md4; checked against the `ed2k` crate
+        // (docs.rs vectors + differential oracle across the 9,728,000-byte
+        // chunk boundary) in crates/rusthashtab-hash/tests/ed2k_oracle.rs.
         authority: Authority::ReferenceImpl {
-            what: "eDonkey2000 hash specification (chunk boundary cases)",
+            what: "ed2k crate: docs.rs vectors + differential oracle",
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "eD2k (Old)",
         output_len: 16,
         authority: Authority::ReferenceImpl {
-            what: "eDonkey2000 hash specification (chunk boundary cases)",
+            what: "ed2k crate: docs.rs vectors + differential oracle",
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "QuickXorHash",
