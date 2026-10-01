@@ -15,3 +15,15 @@ rusthashtab-hash.workspace = true
 rusthashtab-sumfile.workspace = true
 rusthashtab-settings.workspace = true
 thiserror.workspace = true
+
+# The pipeline reads with overlapped I/O and owns its events. `Win32_Security` is
+# not about security here: `CreateEventW` lives behind it because its
+# `SECURITY_ATTRIBUTES` parameter does.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

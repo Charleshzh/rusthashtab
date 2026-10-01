@@ -456,6 +456,7 @@ dependencies = [
  "rusthashtab-settings",
  "rusthashtab-sumfile",
  "thiserror",
+ "windows",
 ]
 
 [[package]]
