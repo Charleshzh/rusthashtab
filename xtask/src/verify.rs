@@ -12,6 +12,10 @@
 //!   Streebog, eD2k or QuickXorHash at all — see [`crate::coverage`].
 //! * **Frozen vectors from an independent reference build** for the rest, kept
 //!   next to the implementation with the source named in a comment.
+//! * **Vendored vector files** under `vectors/` for algorithms whose authority
+//!   publishes machine-readable vectors (BLAKE3, BLAKE2). Each directory's
+//!   `PROVENANCE.md` records where the file came from; a missing or malformed
+//!   file is a hard failure, not a skip.
 //!
 //! # Payload sizes
 //!
@@ -25,7 +29,7 @@ use std::process::{Command, ExitCode};
 
 use rusthashtab_hash::registry;
 
-use crate::coverage::{Authority, COVERAGE, Status};
+use crate::coverage::{Authority, COVERAGE, Coverage, Status, VectorKind};
 
 /// Payload sizes that stress padding and block boundaries.
 const SIZES: &[usize] = &[
@@ -164,7 +168,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         "Checking {} algorithms over {} payload sizes (0 B … {} B)\n",
         COVERAGE
             .iter()
-            .filter(|c| c.status != Status::Pending && c.is_tool_backed())
+            .filter(|c| c.status != Status::Pending && c.checked_by_verify())
             .count(),
         SIZES.len(),
         SIZES[SIZES.len() - 1]
@@ -179,12 +183,31 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         if cov.status == Status::Pending {
             continue;
         }
+
+        // Vendored vector files are self-contained: no external tool, and the
+        // inputs come from the file kind's own generation rule.
+        if let Authority::VectorFile { file, kind } = cov.authority {
+            match check_vector_file(cov, file, kind) {
+                Ok(cases) => {
+                    passed += cases;
+                    println!("  {:<18} OK   ({cases} cases vs {file})", cov.name);
+                }
+                Err(e) => {
+                    mismatches.push(format!("{}: {e}", cov.name));
+                    failed += 1;
+                }
+            }
+            continue;
+        }
+
         let (digest, legacy) = match cov.authority {
             Authority::OpenSsl { digest } => (digest, false),
             Authority::OpenSslLegacy { digest } => (digest, true),
             // Standard vectors and frozen reference values are checked by the
             // crate's own test suite, not here.
-            Authority::StandardVector { .. } | Authority::ReferenceImpl { .. } => continue,
+            Authority::StandardVector { .. }
+            | Authority::ReferenceImpl { .. }
+            | Authority::VectorFile { .. } => continue,
         };
 
         let Some(openssl) = openssl.as_deref() else {
@@ -283,4 +306,71 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Run a vendored vector file against our implementation.
+///
+/// Returns the number of cases checked. Every inconsistency is an `Err` — a
+/// vector file that is missing, malformed or the wrong length proves nothing,
+/// and must not be allowed to look like a pass.
+fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usize, String> {
+    // xtask lives at <workspace>/xtask, so the workspace root is one level up.
+    // Anchor there rather than at the invocation directory, so `verify` works
+    // from anywhere.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(file);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{file}: malformed JSON: {e}"))?;
+    match kind {
+        VectorKind::Blake3Json => check_blake3_vectors(cov, file, &json),
+    }
+}
+
+/// BLAKE3's official `test_vectors.json`. Inputs are `i % 251` repeated; the
+/// `hash` field is a 131-byte extended output, of which we compare the first
+/// `output_len` bytes (32 for BLAKE3, 64 for BLAKE3-512).
+fn check_blake3_vectors(
+    cov: &Coverage,
+    file: &str,
+    json: &serde_json::Value,
+) -> Result<usize, String> {
+    let cases = json
+        .get("cases")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| format!("{file}: `cases` is not an array"))?;
+    let mut checked = 0usize;
+    for case in cases {
+        let input_len = case
+            .get("input_len")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("{file}: bad `input_len`"))? as usize;
+        let expected_hex = case
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{file}: bad `hash`"))?;
+        if expected_hex.len() < cov.output_len * 2 {
+            return Err(format!(
+                "{file} case n={input_len}: expected output is {} bytes, table needs {}",
+                expected_hex.len() / 2,
+                cov.output_len
+            ));
+        }
+        let input: Vec<u8> = (0..input_len).map(|i| (i % 251) as u8).collect();
+        let ours = our_digest(cov.name, &input).ok_or_else(|| {
+            format!(
+                "{}: marked {:?} but registry::make() returns None",
+                cov.name, cov.status
+            )
+        })?;
+        if ours != expected_hex[..cov.output_len * 2] {
+            return Err(format!(
+                "{} n={input_len}:\n    ours     = {ours}\n    {file} = {}",
+                cov.name,
+                &expected_hex[..cov.output_len * 2]
+            ));
+        }
+        checked += 1;
+    }
+    Ok(checked)
 }

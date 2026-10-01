@@ -591,6 +591,7 @@ fn audit() -> ExitCode {
             Authority::OpenSslLegacy { .. } => "openssl-legacy",
             Authority::StandardVector { .. } => "standard-vector",
             Authority::ReferenceImpl { .. } => "reference-impl",
+            Authority::VectorFile { .. } => "vector-file",
         };
         println!(
             "{:<18} {:>5}  {:<10}  {:<16} {}",

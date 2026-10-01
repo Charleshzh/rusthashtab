@@ -17,6 +17,7 @@
 //! be distinguished from a plausible-looking wrong one.
 
 use crate::Hasher;
+use crate::blake3_family::Blake3;
 use crate::checksums::{Crc32, Crc64, Xxh3, Xxh32, Xxh64};
 use crate::sha2_family::{Md4, Md5, RipeMd160, Sha1, Sha224, Sha256, Sha384, Sha512};
 use crate::sha3_family::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
@@ -279,6 +280,8 @@ pub fn make(name: &str) -> Option<Box<dyn Hasher>> {
         "SHA3-512" => Box::new(Sha3_512::new()),
         "PH128-264" => Box::new(crate::parallel_hash::ParallelHash::ph128_264().ok()?),
         "PH256-528" => Box::new(crate::parallel_hash::ParallelHash::ph256_528().ok()?),
+        "BLAKE3" => Box::new(Blake3::new_256()),
+        "BLAKE3-512" => Box::new(Blake3::new_512()),
         _ => return None,
     })
 }

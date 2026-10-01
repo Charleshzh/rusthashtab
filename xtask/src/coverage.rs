@@ -49,6 +49,27 @@ pub(crate) enum Authority {
         /// Human-readable description of the tool or vector set.
         what: &'static str,
     },
+    /// A vector file vendored under `vectors/`, checked by `cargo xtask verify`.
+    ///
+    /// Stronger than [`Authority::ReferenceImpl`]: the comparison runs on every
+    /// `verify` invocation rather than existing only as frozen constants in a
+    /// unit test. The file itself must come from outside this repository — see
+    /// the `PROVENANCE.md` next to it.
+    VectorFile {
+        /// Path relative to the workspace root, e.g. `"vectors/blake3/test_vectors.json"`.
+        file: &'static str,
+        /// Which parser and input-generation rule interprets the file.
+        kind: VectorKind,
+    },
+}
+
+/// How a vendored vector file is turned into (input, expected) pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorKind {
+    /// BLAKE3's official `test_vectors.json`: cases are `{input_len, hash, …}`;
+    /// the input is `i % 251` repeated, and `hash` is a 131-byte extended
+    /// output of which we compare the first `output_len` bytes.
+    Blake3Json,
 }
 
 /// Implementation state of one algorithm.
@@ -76,11 +97,14 @@ pub(crate) struct Coverage {
 }
 
 impl Coverage {
-    /// True when an external tool (rather than a document) can check this.
-    pub(crate) const fn is_tool_backed(&self) -> bool {
+    /// True when `cargo xtask verify` actively checks this row (as opposed to
+    /// authorities discharged by the crate's own test suite).
+    pub(crate) const fn checked_by_verify(&self) -> bool {
         matches!(
             self.authority,
-            Authority::OpenSsl { .. } | Authority::OpenSslLegacy { .. }
+            Authority::OpenSsl { .. }
+                | Authority::OpenSslLegacy { .. }
+                | Authority::VectorFile { .. }
         )
     }
 
@@ -91,6 +115,7 @@ impl Coverage {
             Authority::OpenSslLegacy { digest } => digest,
             Authority::StandardVector { source } => source,
             Authority::ReferenceImpl { what } => what,
+            Authority::VectorFile { file, .. } => file,
         }
     }
 }
@@ -276,18 +301,22 @@ pub(crate) const COVERAGE: &[Coverage] = &[
     Coverage {
         name: "BLAKE3",
         output_len: 32,
-        authority: Authority::ReferenceImpl {
-            what: "BLAKE3 official test_vectors.json",
+        authority: Authority::VectorFile {
+            file: "vectors/blake3/test_vectors.json",
+            kind: VectorKind::Blake3Json,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "BLAKE3-512",
         output_len: 64,
-        authority: Authority::ReferenceImpl {
-            what: "BLAKE3 official test_vectors.json (extended output)",
+        // Same official file: its `hash` fields are 131-byte extended outputs,
+        // of which this row compares the first 64 bytes.
+        authority: Authority::VectorFile {
+            file: "vectors/blake3/test_vectors.json",
+            kind: VectorKind::Blake3Json,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "GOST 2012 (256)",

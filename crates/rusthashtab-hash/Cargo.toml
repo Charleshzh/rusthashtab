@@ -26,6 +26,9 @@ sha1.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 blake2s_simd.workspace = true
+# Default features only ("std"). The `rayon` feature and `update_rayon` must
+# stay off: a shell extension does not join a global thread pool (see
+# src/blake3_family.rs).
 blake3.workspace = true
 k12.workspace = true
 streebog.workspace = true
