@@ -19,6 +19,7 @@
 use crate::Hasher;
 use crate::checksums::{Crc32, Crc64, Xxh3, Xxh32, Xxh64};
 use crate::sha2_family::{Md4, Md5, RipeMd160, Sha1, Sha224, Sha256, Sha384, Sha512};
+use crate::sha3_family::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
 
 /// Static description of one supported algorithm.
 #[derive(Debug, Clone, Copy)]
@@ -272,6 +273,10 @@ pub fn make(name: &str) -> Option<Box<dyn Hasher>> {
         "SHA-256" => Box::new(Sha256::new()),
         "SHA-384" => Box::new(Sha384::new()),
         "SHA-512" => Box::new(Sha512::new()),
+        "SHA3-224" => Box::new(Sha3_224::new()),
+        "SHA3-256" => Box::new(Sha3_256::new()),
+        "SHA3-384" => Box::new(Sha3_384::new()),
+        "SHA3-512" => Box::new(Sha3_512::new()),
         "PH128-264" => Box::new(crate::parallel_hash::ParallelHash::ph128_264().ok()?),
         "PH256-528" => Box::new(crate::parallel_hash::ParallelHash::ph256_528().ok()?),
         _ => return None,

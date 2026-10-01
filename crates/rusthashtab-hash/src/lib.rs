@@ -27,9 +27,11 @@
 #![warn(missing_docs)]
 
 pub mod checksums;
+mod digest_adapter;
 pub mod parallel_hash;
 pub mod registry;
 pub mod sha2_family;
+pub mod sha3_family;
 
 pub use parallel_hash::{ParallelHash, ParallelHashError, Strength};
 pub use registry::{ALGORITHMS, Algorithm};

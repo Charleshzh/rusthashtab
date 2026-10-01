@@ -154,7 +154,8 @@ pub(crate) const COVERAGE: &[Coverage] = &[
         authority: Authority::StandardVector {
             source: "RFC 1320 §A.5 Appendix",
         },
-        status: Status::Pending,
+        // The full §A.5 suite (all seven vectors) is in sha2_family's tests.
+        status: Status::Done,
     },
     Coverage {
         name: "MD5",
@@ -212,25 +213,25 @@ pub(crate) const COVERAGE: &[Coverage] = &[
         name: "SHA3-224",
         output_len: 28,
         authority: Authority::OpenSsl { digest: "sha3-224" },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "SHA3-256",
         output_len: 32,
         authority: Authority::OpenSsl { digest: "sha3-256" },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "SHA3-384",
         output_len: 48,
         authority: Authority::OpenSsl { digest: "sha3-384" },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "SHA3-512",
         output_len: 64,
         authority: Authority::OpenSsl { digest: "sha3-512" },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "K12-264",
