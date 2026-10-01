@@ -69,15 +69,21 @@ pub(crate) enum VectorKind {
     /// BLAKE3's official `test_vectors.json`: cases are `{input_len, hash, …}`;
     /// the input is `i % 251` repeated, and `hash` is a 131-byte extended
     /// output of which we compare the first `output_len` bytes.
-    Blake3Json,
+    Blake3,
     /// The BLAKE2 team's `blake2-kat.json`: entries are `{hash, in, key, out}`
     /// with hex-encoded fields. We consume only the unkeyed entries (`key ==
     /// ""`) for our algorithm's `hash` name; the keyed half is not a mode the
     /// product exposes.
-    Blake2KatJson {
+    Blake2Kat {
         /// The `hash` field value to select, e.g. `"blake2sp"`.
         hash: &'static str,
     },
+    /// Our curated KangarooTwelve KAT (`vectors/k12/k12-kat.json`): cases are
+    /// `{msg_len, out_len, expected}`; the message is `i % 251` repeated and
+    /// the customization is empty. A row compares its `output_len` bytes
+    /// against the case's prefix (KangarooTwelve is a XOF), skipping cases
+    /// whose `out_len` is shorter than the row's output.
+    K12Kat,
 }
 
 /// Implementation state of one algorithm.
@@ -239,7 +245,7 @@ pub(crate) const COVERAGE: &[Coverage] = &[
         output_len: 32,
         authority: Authority::VectorFile {
             file: "vectors/blake2/blake2-kat.json",
-            kind: VectorKind::Blake2KatJson { hash: "blake2sp" },
+            kind: VectorKind::Blake2Kat { hash: "blake2sp" },
         },
         status: Status::Done,
     },
@@ -270,26 +276,29 @@ pub(crate) const COVERAGE: &[Coverage] = &[
     Coverage {
         name: "K12-264",
         output_len: 33,
-        authority: Authority::ReferenceImpl {
-            what: "KangarooTwelve draft test vectors / XKCP K12",
+        authority: Authority::VectorFile {
+            file: "vectors/k12/k12-kat.json",
+            kind: VectorKind::K12Kat,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "K12-256",
         output_len: 32,
-        authority: Authority::ReferenceImpl {
-            what: "KangarooTwelve draft test vectors / XKCP K12",
+        authority: Authority::VectorFile {
+            file: "vectors/k12/k12-kat.json",
+            kind: VectorKind::K12Kat,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "K12-512",
         output_len: 64,
-        authority: Authority::ReferenceImpl {
-            what: "KangarooTwelve draft test vectors / XKCP K12",
+        authority: Authority::VectorFile {
+            file: "vectors/k12/k12-kat.json",
+            kind: VectorKind::K12Kat,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "PH128-264",
@@ -312,7 +321,7 @@ pub(crate) const COVERAGE: &[Coverage] = &[
         output_len: 32,
         authority: Authority::VectorFile {
             file: "vectors/blake3/test_vectors.json",
-            kind: VectorKind::Blake3Json,
+            kind: VectorKind::Blake3,
         },
         status: Status::Done,
     },
@@ -323,7 +332,7 @@ pub(crate) const COVERAGE: &[Coverage] = &[
         // of which this row compares the first 64 bytes.
         authority: Authority::VectorFile {
             file: "vectors/blake3/test_vectors.json",
-            kind: VectorKind::Blake3Json,
+            kind: VectorKind::Blake3,
         },
         status: Status::Done,
     },

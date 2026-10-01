@@ -323,9 +323,67 @@ fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usi
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("{file}: malformed JSON: {e}"))?;
     match kind {
-        VectorKind::Blake3Json => check_blake3_vectors(cov, file, &json),
-        VectorKind::Blake2KatJson { hash } => check_blake2_kat(cov, file, &json, hash),
+        VectorKind::Blake3 => check_blake3_vectors(cov, file, &json),
+        VectorKind::Blake2Kat { hash } => check_blake2_kat(cov, file, &json, hash),
+        VectorKind::K12Kat => check_k12_kat(cov, file, &json),
     }
+}
+
+/// Our curated KangarooTwelve KAT. Messages are `i % 251` repeated to
+/// `msg_len`; customization is empty. KangarooTwelve is a XOF, so a row
+/// compares its `output_len` bytes against the case's prefix, skipping cases
+/// whose `out_len` is shorter than the row's output.
+fn check_k12_kat(cov: &Coverage, file: &str, json: &serde_json::Value) -> Result<usize, String> {
+    let cases = json
+        .get("cases")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| format!("{file}: `cases` is not an array"))?;
+    let mut checked = 0usize;
+    for case in cases {
+        let msg_len = case
+            .get("msg_len")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("{file}: bad `msg_len`"))? as usize;
+        let out_len = case
+            .get("out_len")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("{file}: bad `out_len`"))? as usize;
+        let expected_hex = case
+            .get("expected")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{file}: bad `expected`"))?;
+        if expected_hex.len() != out_len * 2 {
+            return Err(format!(
+                "{file} case n={msg_len}: `expected` is {} bytes, `out_len` says {out_len}",
+                expected_hex.len() / 2
+            ));
+        }
+        if out_len < cov.output_len {
+            continue;
+        }
+        let input: Vec<u8> = (0..msg_len).map(|i| (i % 251) as u8).collect();
+        let ours = our_digest(cov.name, &input).ok_or_else(|| {
+            format!(
+                "{}: marked {:?} but registry::make() returns None",
+                cov.name, cov.status
+            )
+        })?;
+        if ours != expected_hex[..cov.output_len * 2] {
+            return Err(format!(
+                "{} n={msg_len}:\n    ours     = {ours}\n    {file} = {}",
+                cov.name,
+                &expected_hex[..cov.output_len * 2]
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        return Err(format!(
+            "{file}: no case covers {} output bytes for {}",
+            cov.output_len, cov.name
+        ));
+    }
+    Ok(checked)
 }
 
 /// The BLAKE2 team's `blake2-kat.json`, restricted to the unkeyed entries of

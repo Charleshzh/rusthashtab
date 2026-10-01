@@ -1,0 +1,67 @@
+{
+  "_comment": "KangarooTwelve (KT128) known-answer cases, empty customization. Messages are the pattern i % 251 repeated to `msg_len` bytes (the RFC 9861 §5 `ptn()` convention). Each `expected` is `out_len` hex-encoded output bytes; a row compares its own output length against the prefix. Sources: RFC 9861 §5 (all 32-byte values, and the full 64 bytes of the empty-message case) and the XKCP K12 Python reference implementation (bytes 32..64 of the non-empty 64-byte cases). See PROVENANCE.md.",
+  "message_pattern": "i % 251",
+  "customization_hex": "",
+  "cases": [
+    {
+      "msg_len": 0,
+      "out_len": 64,
+      "source": "RFC 9861 §5",
+      "expected": "1ac2d450fc3b4205d19da7bfca1b37513c0803577ac7167f06fe2ce1f0ef39e54269c056b8c82e48276038b6d292966cc07a3d4645272e31ff38508139eb0a71"
+    },
+    {
+      "msg_len": 1,
+      "out_len": 64,
+      "source": "RFC 9861 §5 (first 32 bytes) + XKCP K12 Python reference (rest)",
+      "expected": "2bda92450e8b147f8a7cb629e784a058efca7cf7d8218e02d345dfaa65244a1f546818263d43a3f2d00e7a15eaf6472cc108fa805ddfa6b2c766dd543c066f7c"
+    },
+    {
+      "msg_len": 17,
+      "out_len": 64,
+      "source": "RFC 9861 §5 (first 32 bytes) + XKCP K12 Python reference (rest)",
+      "expected": "6bf75fa2239198db4772e36478f8e19b0f371205f6a9a93a273f51df37122888b4b7a3a2b598ed4bd8fcf4cd38e03dd86474e48eed8db6418dfe39a3d07b8567"
+    },
+    {
+      "msg_len": 289,
+      "out_len": 64,
+      "source": "RFC 9861 §5 (first 32 bytes) + XKCP K12 Python reference (rest)",
+      "expected": "0c315ebcdedbf61426de7dcf8fb725d1e74675d7f5327a5067f367b108ecb67cfcfa2da7e28b53c710e6177ba80b316c12cca8b4ea0dbd4e4ffc96360461d46f"
+    },
+    {
+      "msg_len": 4913,
+      "out_len": 64,
+      "source": "RFC 9861 §5 (first 32 bytes) + XKCP K12 Python reference (rest)",
+      "expected": "cb552e2ec77d9910701d578b457ddf772c12e322e4ee7fe417f92c758f0d59d00454cfc1532862d42120ef0ed82c4d71b93135074cb37704f97f91ec4b41c612"
+    },
+    {
+      "msg_len": 8191,
+      "out_len": 64,
+      "source": "RFC 9861 §5 (first 32 bytes) + XKCP K12 Python reference (rest)",
+      "expected": "1b577636f723643e990cc7d6a659837436fd6a103626600eb8301cd1dbe553d679ae08f57b35ebc7f68c67271f406d821ac11fbdb6b8d36d599a3f846a88d6d7"
+    },
+    {
+      "msg_len": 8192,
+      "out_len": 64,
+      "source": "RFC 9861 §5 (first 32 bytes) + XKCP K12 Python reference (rest)",
+      "expected": "48f256f6772f9edfb6a8b661ec92dc93b95ebd05a08a17b39ae3490870c926c32e6c54c347e4c925171ca1f2c731871e9834f11ca1a01cf6af1f6eb6104308cc"
+    },
+    {
+      "msg_len": 83521,
+      "out_len": 32,
+      "source": "RFC 9861 §5",
+      "expected": "8701045e22205345ff4dda05555cbb5c3af1a771c2b89baef37db43d9998b9fe"
+    },
+    {
+      "msg_len": 1419857,
+      "out_len": 32,
+      "source": "RFC 9861 §5",
+      "expected": "844d610933b1b9963cbdeb5ae3b6b05cc7cbd67ceedf883eb678a0a8e0371682"
+    },
+    {
+      "msg_len": 24137569,
+      "out_len": 32,
+      "source": "RFC 9861 §5",
+      "expected": "3c390782a8a4e89fa6367f72feaaf13255c8d95878481d3cd8ce85f58e880af8"
+    }
+  ]
+}
