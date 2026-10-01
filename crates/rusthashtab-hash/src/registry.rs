@@ -23,6 +23,7 @@ use crate::checksums::{Crc32, Crc64, Xxh3, Xxh32, Xxh64};
 use crate::ed2k::{Ed2k, Flavour};
 use crate::gost::{Gost256, Gost512};
 use crate::k12::K12;
+use crate::quickxor::QuickXor;
 use crate::sha2_family::{Md4, Md5, RipeMd160, Sha1, Sha224, Sha256, Sha384, Sha512};
 use crate::sha3_family::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
 
@@ -294,6 +295,7 @@ pub fn make(name: &str) -> Option<Box<dyn Hasher>> {
         "GOST 2012 (512)" => Box::new(Gost512::new()),
         "eD2k" => Box::new(Ed2k::new(Flavour::Blue)),
         "eD2k (Old)" => Box::new(Ed2k::new(Flavour::Red)),
+        "QuickXorHash" => Box::new(QuickXor::new()),
         _ => return None,
     })
 }

@@ -90,6 +90,10 @@ pub(crate) enum VectorKind {
     /// output width; message files that are not vendored (the 4 GiB M7) are
     /// skipped, not failed.
     GostEtalon,
+    /// rclone's QuickXorHash test file (Go source): entries are
+    /// `{size, `<base64 in>`, "<base64 out>"}`, the input possibly wrapped
+    /// across lines inside the backticks.
+    QuickXorRclone,
 }
 
 /// Implementation state of one algorithm.
@@ -382,10 +386,11 @@ pub(crate) const COVERAGE: &[Coverage] = &[
     Coverage {
         name: "QuickXorHash",
         output_len: 20,
-        authority: Authority::ReferenceImpl {
-            what: "Microsoft QuickXorHash reference (documented vectors)",
+        authority: Authority::VectorFile {
+            file: "vectors/quickxorhash/quickxorhash_test.go",
+            kind: VectorKind::QuickXorRclone,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
 ];
 

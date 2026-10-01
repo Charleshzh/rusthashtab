@@ -32,7 +32,11 @@ blake2s_simd.workspace = true
 blake3.workspace = true
 k12.workspace = true
 streebog.workspace = true
-quickxorhash.workspace = true
+
+# NOTE: `quickxorhash` is deliberately NOT used. It stores the input length in
+# a `usize` and therefore produces non-standard digests on 32-bit targets —
+# Microsoft's reference fixes the length at 8 bytes little-endian. Our own
+# implementation lives in src/quickxor.rs.
 
 # ParallelHash is hand-written on top of the SP 800-185 building blocks.
 # `sp800-185` itself is deliberately avoided: see the note in the workspace

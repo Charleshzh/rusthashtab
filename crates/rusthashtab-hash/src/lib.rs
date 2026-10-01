@@ -34,6 +34,7 @@ pub mod ed2k;
 pub mod gost;
 pub mod k12;
 pub mod parallel_hash;
+pub mod quickxor;
 pub mod registry;
 pub mod sha2_family;
 pub mod sha3_family;

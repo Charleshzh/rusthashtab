@@ -338,12 +338,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quickxorhash"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14d2e01846404baf1fb7339cc2ec5d2dfe592901293ab0c505e8d819d91fe686"
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -433,7 +427,6 @@ dependencies = [
  "k12",
  "md-5",
  "md4 0.11.0",
- "quickxorhash",
  "ripemd",
  "serde",
  "serde_json",
@@ -797,7 +790,9 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "hex",
+ "regex",
  "rusthashtab-hash",
  "serde_json",
 ]

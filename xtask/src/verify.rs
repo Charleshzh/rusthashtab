@@ -320,9 +320,11 @@ fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usi
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(file);
 
     // Not every authority is JSON — the GOST etalon is a text index over raw
-    // message files. Branch on the kind before parsing.
-    if let VectorKind::GostEtalon = kind {
-        return check_gost_etalon(cov, file, &path);
+    // message files, and the QuickXorHash set is a Go source file.
+    match kind {
+        VectorKind::GostEtalon => return check_gost_etalon(cov, file, &path),
+        VectorKind::QuickXorRclone => return check_quickxor_rclone(cov, file, &path),
+        _ => {}
     }
 
     let text = std::fs::read_to_string(&path)
@@ -333,7 +335,7 @@ fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usi
         VectorKind::Blake3 => check_blake3_vectors(cov, file, &json),
         VectorKind::Blake2Kat { hash } => check_blake2_kat(cov, file, &json, hash),
         VectorKind::K12Kat => check_k12_kat(cov, file, &json),
-        VectorKind::GostEtalon => unreachable!("handled above"),
+        VectorKind::GostEtalon | VectorKind::QuickXorRclone => unreachable!("handled above"),
     }
 }
 
@@ -382,6 +384,65 @@ fn check_gost_etalon(cov: &Coverage, file: &str, path: &Path) -> Result<usize, S
             "{file}: no `md_gost12_{}` cases with vendored messages",
             cov.output_len * 8
         ));
+    }
+    Ok(checked)
+}
+
+/// rclone's QuickXorHash test file (Go source). Entries have the shape
+/// `{size, `<base64 in>`, "<base64 out>"}`, with the input possibly wrapped
+/// across lines inside the backticks.
+fn check_quickxor_rclone(cov: &Coverage, file: &str, path: &Path) -> Result<usize, String> {
+    use base64::Engine;
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    // A literal regex; a compile failure would be a programming error, caught
+    // by running `verify` at all.
+    #[allow(clippy::expect_used)]
+    let entry_re =
+        regex::Regex::new(r#"(?s)\{(\d+),\s*`([^`]*)`,\s*"([^"]+)"\}"#).expect("literal regex");
+    let mut checked = 0usize;
+    for caps in entry_re.captures_iter(&text) {
+        let size: usize = caps[1]
+            .parse()
+            .map_err(|e| format!("{file}: bad size {:?}: {e}", &caps[1]))?;
+        let in_b64: String = caps[2].chars().filter(|c| !c.is_whitespace()).collect();
+        let input = base64::engine::general_purpose::STANDARD
+            .decode(&in_b64)
+            .map_err(|e| format!("{file}: bad input base64: {e}"))?;
+        if input.len() != size {
+            return Err(format!(
+                "{file}: entry says {size} bytes, decodes to {}",
+                input.len()
+            ));
+        }
+        let expected = base64::engine::general_purpose::STANDARD
+            .decode(&caps[3])
+            .map_err(|e| format!("{file}: bad output base64: {e}"))?;
+        if expected.len() != cov.output_len {
+            return Err(format!(
+                "{file}: expected output is {} bytes, table says {}",
+                expected.len(),
+                cov.output_len
+            ));
+        }
+        let ours = our_digest(cov.name, &input).ok_or_else(|| {
+            format!(
+                "{}: marked {:?} but registry::make() returns None",
+                cov.name, cov.status
+            )
+        })?;
+        if ours != hex::encode(&expected) {
+            return Err(format!(
+                "{} n={size}:\n    ours     = {ours}\n    {file} = {}",
+                cov.name,
+                hex::encode(&expected)
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        return Err(format!("{file}: no vector entries found"));
     }
     Ok(checked)
 }

@@ -57,7 +57,9 @@ blake2s_simd = "1.0"
 blake3 = "1.8"
 k12 = "0.5"
 streebog = "0.11"
-quickxorhash = "0.1"
+# NOTE: `quickxorhash` is deliberately NOT used. Its length field is a `usize`,
+# so it produces non-standard digests on 32-bit targets (Microsoft's reference
+# fixes the length at 8 bytes LE). See crates/rusthashtab-hash/src/quickxor.rs.
 # NOTE: `sp800-185` is deliberately NOT used. Its ParallelHash implementation is
 # functionally correct but allocates per 8 KiB block and drives rayon's global
 # thread pool, neither of which is acceptable inside a shell extension.
