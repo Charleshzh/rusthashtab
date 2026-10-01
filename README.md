@@ -22,11 +22,13 @@ hash quickly.
 > **本文档为中英双语。** 每节先英文、后中文。以英文为准；两者若有出入，以英文为准。
 > **改动一种语言时，必须在同一次提交中同步另一种。**
 
-> **Status: pre-alpha.** All 31 hash algorithms are implemented and externally verified;
-> the shell extension, UI and installer are being built. See [Roadmap](#roadmap--路线图).
+> **Status: pre-alpha.** All 31 hash algorithms are implemented and externally verified, and
+> the scan pipeline — asynchronous block reads, bounded buffers, cancellation and progress —
+> is done. The shell extension, UI and installer are being built. See [Roadmap](#roadmap--路线图).
 >
-> **状态：pre-alpha。** 全部 31 种哈希算法已实现并通过外部校验；shell 扩展、界面与安装器
-> 正在开发中。见[路线图](#roadmap--路线图)。
+> **状态：pre-alpha。** 全部 31 种哈希算法已实现并通过外部校验，扫描管线（异步分块读取、
+> 有界缓冲、可取消、进度上报）也已完成。shell 扩展、界面与安装器正在开发中。
+> 见[路线图](#roadmap--路线图)。
 
 ---
 
@@ -231,6 +233,10 @@ Also verified:
 - **Streaming is a tested invariant.** Every algorithm must produce the same digest whether
   data arrives in one call, in 2 MiB blocks, or one byte at a time. The scanner feeds 2 MiB
   blocks, so a chunk-size-dependent digest would be a silent corruption bug.
+- **The pipeline does not change the answer.** Every digest a scan produces is compared, for
+  **all 31 algorithms**, against the same algorithm fed the whole file in one call — at sizes
+  that land exactly on a block boundary, where a read-ahead ring that dropped, duplicated or
+  reordered a block would show up.
 - **ParallelHash128/256** are checked against the independent XKCP C reference
   implementation at multiple block sizes, including empty input, plus a second differential
   test against an unrelated Rust implementation.
@@ -238,6 +244,9 @@ Also verified:
 > - **流式是受测试保护的不变式。** 无论数据是一次性喂入、按 2 MiB 分块喂入，还是逐字节
 >   喂入，每个算法都必须产出相同摘要。扫描器正是按 2 MiB 分块读取的，所以分块相关的摘要
 >   就是一个静默的数据损坏 bug。
+> - **管线不改变答案。** 扫描产出的每一个摘要，都会对**全部 31 种算法**与「一次性整体喂入」
+>   的结果逐字节比对，并且专门覆盖恰好落在分块边界上的长度——读取预读环一旦丢块、重复块或
+>   乱序，都会在这里暴露。
 > - **ParallelHash128/256** 与独立的 XKCP C 参考实现在多个块大小上比对通过（含空输入），
 >   另有第二个差分测试与一个不相关的 Rust 实现交叉验证。
 
@@ -308,7 +317,7 @@ rather than RFC 6986's printed vectors, and QuickXorHash is our own implementati
 > gost-engine 的 etalon 套件（工具生态的字节序），而非 RFC 6986 的印刷向量；
 > QuickXorHash 是我们的自研实现——`quickxorhash` crate 在 32 位目标上产出非标准摘要。
 
-### Phase 2 — the scan pipeline / 扫描管线
+### Phase 2 — the scan pipeline / 扫描管线 ✅
 
 Async reads, a bounded pool of 2 MiB buffers (1 GiB ceiling), cancellation, and
 per-file progress reporting.
@@ -322,6 +331,23 @@ the test is that the pipeline does not change the answer.
 
 > 新增受测不变式：对**全部 31 个**算法，按 2 MiB 分块喂入与整体喂入必须产出相同摘要。
 > 正确性本身属于算法层、已经证明过；这里新的是管线，所以测的是"管线不改变答案"。
+
+**Status: complete — the gate above passes.** How the pipeline reads is worth stating
+because it is where the difficulty was: each worker hashes one file at a time, issuing
+several **overlapped** reads ahead of the block being hashed, so the device stays busy while
+the CPU works. Buffers come from a pool shared by the whole scan and are recycled, so a
+steady state allocates nothing per block, and a worker that cannot get a buffer reads *less
+far ahead* rather than waiting for one — waiting is only ever done by a worker holding no
+buffer at all, which is what makes a deadlock impossible. Cancelling cancels the I/O itself
+and waits for every outstanding operation to be reaped before its buffer is released;
+dropping the scan handle cancels and joins, so no thread outlives it.
+
+> **状态：已完成——上述门禁已通过。** 管线的读取方式值得说明，因为难点正在这里：每个 worker
+> 一次只处理一个文件，并在当前正在哈希的块之前发出若干**重叠（overlapped）**读，从而在 CPU
+> 工作时让设备保持忙碌。缓冲来自整个扫描共享的池并循环复用，因此稳态下每块不产生任何分配；
+> 拿不到缓冲的 worker 会**减少预读深度**，而不是等待缓冲——只有「一个缓冲都没持有」的 worker
+> 才会等待，这正是死锁不可能发生的原因。取消会真正取消 I/O，并在释放缓冲之前等待每一个在飞
+> 操作被收割；丢弃扫描句柄会取消并 join，因此没有任何线程会比扫描活得更久。
 
 ### Phase 3 — the property sheet page / 属性页
 
@@ -379,7 +405,8 @@ identifier in any shipped file.
 |---|---|
 | Workspace, CI matrix, licence, verification harness / 工作区、CI 矩阵、许可证、校验工具 | ✅ done |
 | Phase 1 algorithms — 31 of 31 verified / 第一阶段算法 —— 31 个全部已验证 | ✅ done / 已完成 |
-| Phases 2–6 | ⬜ not started / 未开始 |
+| Phase 2 scan pipeline / 第二阶段扫描管线 | ✅ done / 已完成 |
+| Phases 3–6 | ⬜ not started / 未开始 |
 
 ## Contributing / 贡献
 
