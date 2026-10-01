@@ -36,6 +36,10 @@ LICENSE-MIT text eol=lf
 *.msi       binary
 *.pdb       binary
 
+# Vendored test vectors: byte-exact message files and indexes. A CRLF
+# conversion would silently change the hashed bytes.
+/vectors/** -text
+
 # --- generated / vendored: keep out of diffs and language stats ------------
 /target/            export-ignore
 /docs/internal/     linguist-documentation
