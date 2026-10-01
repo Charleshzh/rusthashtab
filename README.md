@@ -22,11 +22,11 @@ hash quickly.
 > **本文档为中英双语。** 每节先英文、后中文。以英文为准；两者若有出入，以英文为准。
 > **改动一种语言时，必须在同一次提交中同步另一种。**
 
-> **Status: pre-alpha.** The hash core is implemented and tested; the shell extension,
-> UI and installer are being built. See [Roadmap](#roadmap--路线图).
+> **Status: pre-alpha.** All 31 hash algorithms are implemented and externally verified;
+> the shell extension, UI and installer are being built. See [Roadmap](#roadmap--路线图).
 >
-> **状态：pre-alpha。** 哈希核心已实现并通过测试；shell 扩展、界面与安装器正在开发中。
-> 见[路线图](#roadmap--路线图)。
+> **状态：pre-alpha。** 全部 31 种哈希算法已实现并通过外部校验；shell 扩展、界面与安装器
+> 正在开发中。见[路线图](#roadmap--路线图)。
 
 ---
 
@@ -200,9 +200,10 @@ from the start. So correctness rests on **independent authorities**:
 
 | Authority / 权威 | Covers / 覆盖 |
 |---|---|
-| OpenSSL 3.x | SHA-1, SHA-2 ×4, MD5, RIPEMD-160 |
-| Published standard vectors / 公开标准向量 | MD4 (RFC 1320), Streebog (RFC 6986) |
-| Upstream reference implementations / 上游参考实现 | xxHash, BLAKE2sp, BLAKE3, KangarooTwelve, ParallelHash, eD2k, QuickXorHash |
+| OpenSSL 3.x | SHA-1, SHA-2 ×4, SHA-3 ×4, MD5, RIPEMD-160 |
+| Published standard vectors / 公开标准向量 | MD4 (RFC 1320) |
+| Vendored upstream vector files / 上游向量文件（vendored） | BLAKE3, BLAKE2sp, KangarooTwelve, GOST (gost-engine etalon), QuickXorHash (rclone) |
+| Upstream reference implementations / 上游参考实现 | xxHash, ParallelHash (XKCP), eD2k |
 | CRC catalogue check values / CRC 目录校验值 | CRC32, CRC64/XZ |
 
 ```powershell
@@ -212,13 +213,15 @@ cargo xtask audit     # which algorithm is validated by what
 cargo xtask bench     # throughput
 ```
 
-`cargo xtask verify` currently performs **168 byte-for-byte comparisons against OpenSSL**
-across 24 payload sizes chosen to land on block and padding boundaries, including exactly
-2 MiB (the scanner's read block). It fails the build if OpenSSL is missing rather than
-silently checking nothing.
+`cargo xtask verify` currently performs **698 byte-for-byte comparisons**: 264 against
+OpenSSL across 24 payload sizes chosen to land on block and padding boundaries (including
+exactly 2 MiB, the scanner's read block), plus 434 against vector files vendored from
+upstream authorities under `vectors/`. In CI it fails the build if OpenSSL is missing
+rather than silently checking nothing.
 
-> `cargo xtask verify` 目前对 **24 种载荷长度做 168 次与 OpenSSL 的逐字节比对**，长度刻意
-> 落在分块与填充边界上，包括恰好 2 MiB（扫描器的读取块大小）。OpenSSL 缺失时它会让构建
+> `cargo xtask verify` 目前执行 **698 次逐字节比对**：其中 264 次对照 OpenSSL，覆盖 24 种
+> 刻意落在分块与填充边界上的载荷长度（包括恰好 2 MiB——扫描器的读取块大小）；另外 434
+> 次对照 `vectors/` 下从上游权威 vendored 的向量文件。CI 中 OpenSSL 缺失时它会让构建
 > 失败，而不是静默地什么都不检查。
 
 Also verified:
@@ -239,10 +242,12 @@ Also verified:
 >   另有第二个差分测试与一个不相关的 Rust 实现交叉验证。
 
 Where a dependency disagrees with the specification, the specification wins and the
-divergence is documented in the source — see `crates/rusthashtab-hash/src/parallel_hash.rs`.
+divergence is documented in the source — see `crates/rusthashtab-hash/src/parallel_hash.rs`
+and `crates/rusthashtab-hash/src/quickxor.rs`.
 
 > 当某个依赖与规范冲突时，以规范为准，并在源码中记录该分歧——见
-> `crates/rusthashtab-hash/src/parallel_hash.rs`。
+> `crates/rusthashtab-hash/src/parallel_hash.rs` 与
+> `crates/rusthashtab-hash/src/quickxor.rs`。
 
 ## Roadmap / 路线图
 
@@ -268,17 +273,18 @@ without one.
 
 | Authority / 权威 | Cost / 成本 | Algorithms / 算法 |
 |---|---|---|
-| **OpenSSL 3.x** | free, widely installed | SHA-3 ×4, SHAKE128/256 |
-| **Published standard vectors / 公开标准向量** | free, citable | MD4 (RFC 1320), Streebog (RFC 6986) |
-| **Upstream reference implementation / 上游参考实现** | needs a build or a vector file | BLAKE2sp, BLAKE3, KangarooTwelve, eD2k, QuickXorHash |
+| **OpenSSL 3.x** | free, widely installed | SHA-1, SHA-2 ×4, SHA-3 ×4, MD5, RIPEMD-160 |
+| **Published standard vectors / 公开标准向量** | free, citable | MD4 (RFC 1320) |
+| **Upstream reference implementation / vector files / 上游参考实现或向量文件** | needs a build or a vector file | BLAKE2sp, BLAKE3, KangarooTwelve, GOST (gost-engine etalon), ParallelHash (XKCP), eD2k, QuickXorHash (rclone) |
 
-### Phase 1 — finish the algorithm set / 完成算法集
+### Phase 1 — finish the algorithm set / 完成算法集 ✅
 
-16 algorithms remain. Sequenced by verification cost, cheapest authority first, so the
-coverage map closes evenly rather than leaving all the awkward ones to the end.
+All 31 algorithms are implemented and verified. The sequencing below is the record of how
+the coverage map closed — cheapest authority first, so it converged evenly instead of
+leaving the awkward ones to the end.
 
-> 还剩 16 个算法。按校验成本排序，权威最容易的先做——这样覆盖图是均匀收敛的，而不是把所有
-> 麻烦的留到最后。
+> 全部 31 种算法已实现并通过校验。下面的顺序是覆盖图收敛过程的记录——权威最容易的先做，
+> 因而均匀收敛，而不是把麻烦的留到最后。
 
 | # | Algorithms | Authority | Extra work / 额外工作 |
 |---|---|---|---|
@@ -292,6 +298,15 @@ coverage map closes evenly rather than leaving all the awkward ones to the end.
 
 **Gate / 门禁:** `cargo xtask audit` shows 31 verified, 0 pending; `cargo xtask verify`
 passes with `--require-tools`; `cargo xtask bench` covers all 31.
+
+**Status: complete — the gate above passes.** Two rows landed differently than planned:
+GOST is verified against gost-engine's etalon suite (the tool ecosystem's byte order)
+rather than RFC 6986's printed vectors, and QuickXorHash is our own implementation — the
+`quickxorhash` crate produces non-standard digests on 32-bit targets.
+
+> **状态：已完成——上述门禁已通过。** 有两行的落地方式与计划不同：GOST 对照的是
+> gost-engine 的 etalon 套件（工具生态的字节序），而非 RFC 6986 的印刷向量；
+> QuickXorHash 是我们的自研实现——`quickxorhash` crate 在 32 位目标上产出非标准摘要。
 
 ### Phase 2 — the scan pipeline / 扫描管线
 
@@ -363,7 +378,7 @@ identifier in any shipped file.
 | Phase | State / 状态 |
 |---|---|
 | Workspace, CI matrix, licence, verification harness / 工作区、CI 矩阵、许可证、校验工具 | ✅ done |
-| Phase 1 algorithms — 15 of 31 verified / 第一阶段算法 — 31 个中 15 个已验证 | 🔄 in progress |
+| Phase 1 algorithms — 31 of 31 verified / 第一阶段算法 —— 31 个全部已验证 | ✅ done / 已完成 |
 | Phases 2–6 | ⬜ not started / 未开始 |
 
 ## Contributing / 贡献
