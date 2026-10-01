@@ -84,6 +84,12 @@ pub(crate) enum VectorKind {
     /// against the case's prefix (KangarooTwelve is a XOF), skipping cases
     /// whose `out_len` is shorter than the row's output.
     K12Kat,
+    /// gost-engine's etalon suite (`vectors/gost/etalon/`): `dgst.result`
+    /// lists `md_gost12_<bits>(<name>)= <hex>` lines; each `<name>` is a
+    /// message file in the same directory. The row selects lines by its own
+    /// output width; message files that are not vendored (the 4 GiB M7) are
+    /// skipped, not failed.
+    GostEtalon,
 }
 
 /// Implementation state of one algorithm.
@@ -339,18 +345,20 @@ pub(crate) const COVERAGE: &[Coverage] = &[
     Coverage {
         name: "GOST 2012 (256)",
         output_len: 32,
-        authority: Authority::StandardVector {
-            source: "RFC 6986 §A.1 (M1/M2)",
+        authority: Authority::VectorFile {
+            file: "vectors/gost/etalon/dgst.result",
+            kind: VectorKind::GostEtalon,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "GOST 2012 (512)",
         output_len: 64,
-        authority: Authority::StandardVector {
-            source: "RFC 6986 §A.1 (M1/M2)",
+        authority: Authority::VectorFile {
+            file: "vectors/gost/etalon/dgst.result",
+            kind: VectorKind::GostEtalon,
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "eD2k",

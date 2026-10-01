@@ -318,6 +318,13 @@ fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usi
     // Anchor there rather than at the invocation directory, so `verify` works
     // from anywhere.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(file);
+
+    // Not every authority is JSON — the GOST etalon is a text index over raw
+    // message files. Branch on the kind before parsing.
+    if let VectorKind::GostEtalon = kind {
+        return check_gost_etalon(cov, file, &path);
+    }
+
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let json: serde_json::Value =
@@ -326,7 +333,57 @@ fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usi
         VectorKind::Blake3 => check_blake3_vectors(cov, file, &json),
         VectorKind::Blake2Kat { hash } => check_blake2_kat(cov, file, &json, hash),
         VectorKind::K12Kat => check_k12_kat(cov, file, &json),
+        VectorKind::GostEtalon => unreachable!("handled above"),
     }
+}
+
+/// gost-engine's etalon suite. `dgst.result` lists
+/// `md_gost12_<bits>(<name>)= <hex>`; each `<name>` is a message file in the
+/// same directory. The row's output width selects the lines. A missing
+/// message file (the 4 GiB M7, which we do not vendor) is skipped, not
+/// failed; zero applicable cases is an error.
+fn check_gost_etalon(cov: &Coverage, file: &str, path: &Path) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{file}: no parent directory"))?;
+    let prefix = format!("md_gost12_{}(", cov.output_len * 8);
+    let mut checked = 0usize;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let Some((name, expected)) = rest.split_once(")= ") else {
+            return Err(format!("{file}: malformed line {line:?}"));
+        };
+        let msg_path = dir.join(name);
+        if !msg_path.is_file() {
+            continue; // not vendored (e.g. the 4 GiB M7)
+        }
+        let msg = std::fs::read(&msg_path)
+            .map_err(|e| format!("cannot read {}: {e}", msg_path.display()))?;
+        let ours = our_digest(cov.name, &msg).ok_or_else(|| {
+            format!(
+                "{}: marked {:?} but registry::make() returns None",
+                cov.name, cov.status
+            )
+        })?;
+        if ours != expected.trim() {
+            return Err(format!(
+                "{} case {name}:\n    ours     = {ours}\n    {file} = {expected}",
+                cov.name
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        return Err(format!(
+            "{file}: no `md_gost12_{}` cases with vendored messages",
+            cov.output_len * 8
+        ));
+    }
+    Ok(checked)
 }
 
 /// Our curated KangarooTwelve KAT. Messages are `i % 251` repeated to
