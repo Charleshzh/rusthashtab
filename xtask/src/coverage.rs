@@ -70,6 +70,14 @@ pub(crate) enum VectorKind {
     /// the input is `i % 251` repeated, and `hash` is a 131-byte extended
     /// output of which we compare the first `output_len` bytes.
     Blake3Json,
+    /// The BLAKE2 team's `blake2-kat.json`: entries are `{hash, in, key, out}`
+    /// with hex-encoded fields. We consume only the unkeyed entries (`key ==
+    /// ""`) for our algorithm's `hash` name; the keyed half is not a mode the
+    /// product exposes.
+    Blake2KatJson {
+        /// The `hash` field value to select, e.g. `"blake2sp"`.
+        hash: &'static str,
+    },
 }
 
 /// Implementation state of one algorithm.
@@ -229,10 +237,11 @@ pub(crate) const COVERAGE: &[Coverage] = &[
     Coverage {
         name: "Blake2sp",
         output_len: 32,
-        authority: Authority::ReferenceImpl {
-            what: "BLAKE2 upstream testvectors/blake2sp.json",
+        authority: Authority::VectorFile {
+            file: "vectors/blake2/blake2-kat.json",
+            kind: VectorKind::Blake2KatJson { hash: "blake2sp" },
         },
-        status: Status::Pending,
+        status: Status::Done,
     },
     Coverage {
         name: "SHA3-224",

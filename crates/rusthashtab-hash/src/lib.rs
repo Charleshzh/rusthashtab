@@ -26,6 +26,7 @@
 
 #![warn(missing_docs)]
 
+pub mod blake2sp;
 pub mod blake3_family;
 pub mod checksums;
 mod digest_adapter;

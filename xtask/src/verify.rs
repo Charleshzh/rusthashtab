@@ -324,7 +324,67 @@ fn check_vector_file(cov: &Coverage, file: &str, kind: VectorKind) -> Result<usi
         serde_json::from_str(&text).map_err(|e| format!("{file}: malformed JSON: {e}"))?;
     match kind {
         VectorKind::Blake3Json => check_blake3_vectors(cov, file, &json),
+        VectorKind::Blake2KatJson { hash } => check_blake2_kat(cov, file, &json, hash),
     }
+}
+
+/// The BLAKE2 team's `blake2-kat.json`, restricted to the unkeyed entries of
+/// one variant. `in` and `out` are hex; entries are selected by `hash` and
+/// `key == ""`.
+fn check_blake2_kat(
+    cov: &Coverage,
+    file: &str,
+    json: &serde_json::Value,
+    hash: &str,
+) -> Result<usize, String> {
+    let entries = json
+        .as_array()
+        .ok_or_else(|| format!("{file}: top level is not an array"))?;
+    let mut checked = 0usize;
+    for entry in entries {
+        let is_wanted = entry.get("hash").and_then(|v| v.as_str()) == Some(hash)
+            && entry.get("key").and_then(|v| v.as_str()) == Some("");
+        if !is_wanted {
+            continue;
+        }
+        let in_hex = entry
+            .get("in")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{file}: bad `in`"))?;
+        let out_hex = entry
+            .get("out")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{file}: bad `out`"))?;
+        if out_hex.len() != cov.output_len * 2 {
+            return Err(format!(
+                "{file}: `out` is {} bytes, table says {}",
+                out_hex.len() / 2,
+                cov.output_len
+            ));
+        }
+        let input = hex::decode(in_hex).map_err(|e| format!("{file}: bad `in` hex: {e}"))?;
+        let ours = our_digest(cov.name, &input).ok_or_else(|| {
+            format!(
+                "{}: marked {:?} but registry::make() returns None",
+                cov.name, cov.status
+            )
+        })?;
+        if ours != out_hex {
+            return Err(format!(
+                "{} n={}:\n    ours     = {ours}\n    {file} = {out_hex}",
+                cov.name,
+                input.len()
+            ));
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        return Err(format!(
+            "{file}: no unkeyed `{hash}` entries found — the file is not the \
+             authority it was expected to be"
+        ));
+    }
+    Ok(checked)
 }
 
 /// BLAKE3's official `test_vectors.json`. Inputs are `i % 251` repeated; the
