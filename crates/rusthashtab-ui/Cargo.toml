@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
@@ -14,16 +15,37 @@ workspace = true
 rusthashtab-hash.workspace = true
 rusthashtab-scan.workspace = true
 rusthashtab-settings.workspace = true
+rusthashtab-sumfile.workspace = true
 rusthashtab-abi.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-core.workspace = true
+# The feature list is the transitive closure the property sheet page actually
+# touches, and it is asserted by compiling: `IShellExtInit_Impl::Initialize`
+# needs `Win32_System_Com` + `Win32_System_Registry` + `Win32_UI_Shell_Common`,
+# `PROPSHEETPAGEW` needs `Win32_UI_Controls`, and the clipboard work needs
+# `Win32_System_Memory` + `Win32_System_DataExchange` + `Win32_System_Ole`.
+# Adding a Win32 call without its feature is a compile error, so this list cannot
+# drift silently -- but an unused feature silently bloats nothing, so it is also
+# worth removing one when the last caller goes.
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    # `STGMEDIUM` and `ReleaseStgMedium` need this alongside `Win32_Graphics_Gdi`
+    # (verified against windows 0.62.2's own cfg gates), which is why the pair
+    # below is not optional.
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
     "Win32_UI_Controls",
-    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    # `ITEMIDLIST` lives behind this feature, and `IShellExtInit_Impl`'s signature
+    # names it.
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }

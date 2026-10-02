@@ -1,0 +1,68 @@
+// Dialog template for the rustHashTab property sheet page.
+//
+// Compiled by the Windows SDK's rc.exe from build.rs -- see the comment there
+// for why this is not embed-resource.
+//
+// Deliberately does NOT #include <windows.h>. The template needs a handful of
+// style bits and nothing else, and pulling in the SDK's headers would make this
+// build depend on the resource compiler's include search path being arranged for
+// it -- which `rc.exe` invoked from a build script does not get. The values
+// below are from the Win32 window-style documentation and are ABI constants, not
+// implementation details: they cannot change without breaking every compiled
+// resource in existence.
+//
+//   WS_CHILD 0x40000000   WS_VISIBLE 0x10000000   WS_CLIPCHILDREN 0x02000000
+//   WS_TABSTOP 0x00010000 WS_GROUP 0x00020000     WS_EX_CONTROLPARENT 0x00010000
+//   DS_SETFONT 0x40       DS_FIXEDSYS 0x8         DS_CONTROL 0x400
+//   LVS_REPORT 0x0001     LVS_SHOWSELALWAYS 0x0008   LVS_NOSORTHEADER 0x8000
+//   PBS_SMOOTH 0x01       SS_LEFT 0x0    SS_NOPREFIX 0x80    BS_PUSHBUTTON 0x0
+
+#define WS_CHILD            0x40000000L
+#define WS_VISIBLE          0x10000000L
+#define WS_CLIPCHILDREN     0x02000000L
+#define WS_TABSTOP          0x00010000L
+#define WS_GROUP            0x00020000L
+#define WS_EX_CONTROLPARENT 0x00010000L
+
+#define DS_SETFONT          0x00000040L
+#define DS_FIXEDSYS         0x00000008L
+#define DS_CONTROL          0x00000400L
+
+#define LVS_REPORT          0x00000001L
+#define LVS_SHOWSELALWAYS   0x00000008L
+#define LVS_NOSORTHEADER    0x00008000L
+
+#define PBS_SMOOTH          0x00000001L
+#define SS_LEFT             0x00000000L
+#define SS_NOPREFIX         0x00000080L
+#define BS_PUSHBUTTON       0x00000000L
+
+// Control identifiers. Keep in step with src/resource.rs -- a test parses this
+// file and fails if the two lists disagree.
+#define IDD_HASH_PROPPAGE   101
+
+#define IDC_HASH_LIST       1001
+#define IDC_HASH_STATUS     1002
+#define IDC_HASH_PROGRESS   1003
+#define IDC_HASH_COPY       1004
+
+IDD_HASH_PROPPAGE DIALOGEX 0, 0, 260, 178
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_CONTROL | WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "Hashes"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    CONTROL         "", IDC_HASH_LIST, "SysListView32",
+                    LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_TABSTOP,
+                    7, 7, 246, 140
+
+    LTEXT           "", IDC_HASH_STATUS, 7, 150, 246, 9,
+                    SS_LEFT | SS_NOPREFIX | WS_GROUP
+
+    CONTROL         "", IDC_HASH_PROGRESS, "msctls_progress32",
+                    PBS_SMOOTH,
+                    7, 163, 186, 10
+
+    PUSHBUTTON      "&Copy", IDC_HASH_COPY, 200, 160, 53, 15,
+                    BS_PUSHBUTTON | WS_TABSTOP
+END
