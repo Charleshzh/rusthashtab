@@ -66,6 +66,22 @@ impl TempDir {
         std::fs::write(&path, payload(len)).expect("the test file must be writable");
         path
     }
+
+    /// Write a large file **without writing its bytes**, and return its path.
+    ///
+    /// `set_len` extends the file and leaves the new region as a hole, so the
+    /// filesystem stores no data and the call is independent of `len`. NTFS reports
+    /// the holes as zeroes, so the file hashes correctly and a scan of it takes
+    /// long enough to be interrupted deliberately.
+    ///
+    /// The alternative -- `file(name, 64 MiB)` -- would write 64 MiB per file and
+    /// make the cancellation tests slow enough that nobody would run them.
+    fn large_file(&self, name: &str, len: u64) -> PathBuf {
+        let path = self.0.join(name);
+        let file = std::fs::File::create(&path).expect("the test file must be creatable");
+        file.set_len(len).expect("the test file must be extendable");
+        path
+    }
 }
 
 impl Drop for TempDir {
@@ -607,12 +623,30 @@ fn dropping_the_handle_stops_the_scan_promptly() {
 // cancellation
 // ---------------------------------------------------------------------------
 
+/// Cancelling after the first file must stop the rest.
+///
+/// # Why the files here are large and hollow
+///
+/// The canceller wakes within a millisecond of the first `FileFinished`, but the
+/// other workers do not stop the instant the flag is set: they stop when they next
+/// look at it, which for a worker already inside a file is at the next block. With
+/// small files that window is long enough for every other worker to finish, and the
+/// assertion below then fails with a message about cancellation having reported
+/// every file -- measured on i686, where the whole-suite run made the machine far
+/// busier than a single-test run did.
+///
+/// Large files turn that race into a certainty: a worker that has started a 64 MiB
+/// file cannot finish it in the time the flag takes to set. One small file is kept
+/// so a `FileFinished` arrives promptly to trigger the cancellation.
 #[test]
 fn cancelling_mid_scan_stops_the_work_and_reports_cancelled() {
     let dir = TempDir::new("cancel");
-    let jobs: Vec<FileJob> = (0..64)
-        .map(|index| job_for(&dir.file(&format!("cancel-{index}.bin"), 256 * 1024)))
-        .collect();
+    let mut jobs: Vec<FileJob> = vec![job_for(&dir.file("cancel-small.bin", 4096))];
+    jobs.extend(
+        (0..63).map(|index| {
+            job_for(&dir.large_file(&format!("cancel-{index}.bin"), 64 * 1024 * 1024))
+        }),
+    );
 
     let report = run_scan(
         ScanConfig::all_algorithms(jobs),

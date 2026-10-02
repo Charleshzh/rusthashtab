@@ -17,4 +17,11 @@ thiserror.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Registry",
+    # `RegCreateKeyExW` takes a `SECURITY_ATTRIBUTES`, which lives behind this
+    # feature, so the real-registry round-trip test cannot compile without it.
+    # It was already enabled transitively by another crate in the same build
+    # graph, which made `cargo test --workspace` pass while
+    # `cargo test -p rusthashtab-settings` failed outright. A crate has to
+    # declare what its own code needs.
+    "Win32_Security",
 ] }

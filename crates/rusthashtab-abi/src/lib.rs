@@ -82,9 +82,24 @@ pub enum GuardError {
     /// The body panicked. The panic message has been logged; the shell only
     /// needs a failure code.
     Panicked,
+    /// The body failed with a specific `HRESULT`.
+    ///
+    /// Separate from [`GuardError::Com`] because most failures in a shell
+    /// extension are not `windows_core` errors at all -- a `CreatePropertySheetPageW`
+    /// that returned null has to be turned into one to be carried, and collapsing
+    /// every such code to `E_FAIL` would throw away the only diagnostic COM can
+    /// be told about.
+    Hresult(windows_core::HRESULT),
     /// The body returned a `windows_core::Error`.
     #[cfg(windows)]
     Com(windows_core::Error),
+}
+
+#[cfg(windows)]
+impl From<windows_core::HRESULT> for GuardError {
+    fn from(code: windows_core::HRESULT) -> Self {
+        GuardError::Hresult(code)
+    }
 }
 
 #[cfg(windows)]
@@ -99,6 +114,7 @@ impl From<GuardError> for windows_core::HRESULT {
     fn from(e: GuardError) -> Self {
         match e {
             GuardError::Panicked => windows::Win32::Foundation::E_UNEXPECTED,
+            GuardError::Hresult(code) => code,
             GuardError::Com(e) => e.code(),
         }
     }
@@ -215,5 +231,18 @@ mod tests {
     fn success_passes_through() {
         let result: Guarded<u32> = guarded(|| Ok(0x5EED));
         assert_eq!(result, Ok(0x5EED));
+    }
+
+    #[test]
+    fn a_specific_hresult_is_preserved_rather_than_collapsed() {
+        // A shell extension has plenty of failures that are not
+        // `windows_core::Error`s -- a null page handle, a refused page, a missing
+        // resource. Each has a documented code, and COM is the only thing that
+        // will ever see it, so losing it here would make the failure unloggable
+        // in the one place it matters.
+        let code = windows::Win32::Foundation::E_INVALIDARG;
+        let result: Guarded<()> = guarded(|| Err(code.into()));
+        assert_eq!(result, Err(GuardError::Hresult(code)));
+        assert_eq!(windows_core::HRESULT::from(result.unwrap_err()), code);
     }
 }
