@@ -1,0 +1,64 @@
+// VERSIONINFO for the rustHashTab shell extension.
+//
+// Compiled by the Windows SDK's rc.exe from build.rs. Only the version resource
+// is here: there is no application manifest, deliberately, because a DLL that
+// declares its own DPI awareness or common-controls version changes what the
+// *host* does, and this DLL is loaded into explorer.exe. It inherits the host's
+// context, which is also what makes the property sheet page scale with the rest
+// of the Properties dialog.
+//
+// No #include <windows.h>: nothing below needs it, and a build script cannot
+// rely on rc.exe's include search path being arranged for it.
+//
+// The point of this resource is diagnostic. When the extension misbehaves, the
+// first question is which build the shell loaded -- there may be several on a
+// machine, and the answer is otherwise only available from a debugger.
+
+// rc.exe predefines the WINAPI language; it does NOT predefine these
+// VERSIONINFO identifiers, because they come from windows.h, which this file
+// deliberately avoids. Leaving them undefined does not fail the build: the
+// resource still lands in the table as RT_VERSION, but its root block is named
+// something else and Windows cannot enumerate it -- the DLL simply reports no
+// version information. The values are from the VERSIONINFO documentation.
+#define VS_VERSION_INFO      1
+#define VS_FFI_FILEFLAGSMASK 0x0000003FL
+#define VOS_NT_WINDOWS32     0x00040004L
+#define VFT_DLL              0x00000002L
+#define VFT2_UNKNOWN         0x00000000L
+
+// A VS_FIXEDFILEINFO is required: without it the root block is not a
+// VS_VERSIONINFO and `GetFileVersionInfoSize` returns zero. Its fields are order
+// sensitive and are the same eight-byte pairs Windows reports.
+VS_VERSION_INFO VERSIONINFO
+// No spaces around the commas. rc.exe's VERSIONINFO grammar accepts
+// `FILEVERSION 0,1,0,0` and silently produces a block that Windows cannot
+// enumerate when written `0, 1, 0, 0` -- the resource table still lists a
+// VERSIONINFO entry, so the mistake shows up only as "the file has no version
+// information", never as a build error.
+FILEVERSION     0,1,0,0
+PRODUCTVERSION  0,1,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "The rustHashTab contributors"
+            VALUE "FileDescription",  "rustHashTab shell extension"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "rusthashtab_shell"
+            VALUE "LegalCopyright",   "MIT licensed"
+            VALUE "OriginalFilename", "rusthashtab_shell.dll"
+            VALUE "ProductName",      "rustHashTab"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

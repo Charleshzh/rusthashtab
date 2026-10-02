@@ -468,6 +468,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusthashtab-shell"
+version = "0.1.0"
+dependencies = [
+ "rusthashtab-abi",
+ "rusthashtab-settings",
+ "rusthashtab-ui",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "rusthashtab-sumfile"
 version = "0.1.0"
 dependencies = [
@@ -484,6 +495,7 @@ dependencies = [
  "rusthashtab-hash",
  "rusthashtab-scan",
  "rusthashtab-settings",
+ "rusthashtab-sumfile",
  "thiserror",
  "windows",
  "windows-core",

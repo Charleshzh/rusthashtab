@@ -180,13 +180,18 @@ crates/
   rusthashtab-settings   persisted user settings
   rusthashtab-scan       file discovery and the concurrent hashing pipeline
   rusthashtab-net        reputation lookup and update check
-  rusthashtab-ui         Win32 dialog UI
+  rusthashtab-ui         Win32 dialog UI and the property sheet page
+  rusthashtab-shell      the shell extension DLL: COM plumbing and registration
 xtask/                   developer automation: verification, benchmarks, pre-commit gate
 docs/internal/           design notes and research -- NOT shipped / 不随发行物发布
 ```
 
-Each crate has one job. The shell-extension DLL is thin: it implements COM, creates the
-property sheet page, and delegates everything else.
+Each crate has one job. The shell-extension DLL is thin: it implements COM, registers
+itself, and delegates everything else to `rusthashtab-ui`, which is an ordinary library
+and can therefore be tested by an ordinary test binary.
+
+> 每个 crate 只负责一件事。shell 扩展 DLL 本身很薄：它只实现 COM、完成注册，其余全部
+> 委派给 `rusthashtab-ui`——那是一个普通库，因此可以用普通的测试二进制来测。
 
 > 每个 crate 只负责一件事。shell 扩展 DLL 本身很薄：它只实现 COM、创建属性页，其余全部
 > 委派出去。
@@ -362,6 +367,46 @@ what this phase is actually about.
 > `cargo xtask check`，外加在真实 `explorer.exe` 属性对话框中人工确认渲染正常。这个阶段真正
 > 的重点是贡献者文档里那几条 COM 不变式。
 
+**Status: done, and verified where it runs.** The page appears in a real file's
+Properties dialog and hashes the selection there.
+
+> **状态：已完成，并已在它真正运行的地方验收。** 页面会出现在真实文件的属性对话框里并哈希所选内容。
+
+* The page hashes the selection, one row per enabled algorithm per file, and draws
+  matched and mismatched rows in different colours. This is checked by hosting the page
+  in a real dialog — `cargo test -p rusthashtab-ui --test property_sheet_page` opens it,
+  reads the digest back out of the list view, and compares it with the algorithm's own
+  output for the same bytes.
+* Every COM invariant the contributors' notes call out has a test: panic containment at
+  the vtable slot, `Agile = false`, independent and saturating lock and object counts,
+  and no global thread pool.
+* Registration is a real round trip against `HKCU` — register, read the values back,
+  unregister, confirm they are gone — and it is per-user, so installing needs no
+  elevation.
+* **The dialog template is checked to be in the shipped DLL.**
+  `the_dll_contains_the_pages_dialog_template` opens the built DLL as a data file and
+  asserts `RT_DIALOG 101` is reachable through it. That check exists because the page
+  was once invisible in `explorer.exe` while every other test passed: the template was
+  compiled by a *library's* build script, and a `rustc-link-arg` from a library never
+  reaches the `cdylib`, so the DLL shipped with no template and no page could be built
+  from it. Asking "is it in the final artifact" is a different question from "is the
+  code correct", and only the artifact is what a user sees.
+
+> * 页面会哈希所选内容，每个文件×每个启用算法一行，匹配与不匹配行用不同颜色区分。这由「把页面
+>   放进真实对话框」的测试覆盖——`cargo test -p rusthashtab-ui --test property_sheet_page`
+>   会打开页面、从列表控件里读回摘要，并与算法对同一批字节的输出比对。
+> * 贡献者文档点明的每一条 COM 不变式都有测试：vtable 槽位处的 panic 收容、`Agile = false`、
+>   模块锁计数与对象计数彼此独立且饱和、不使用全局线程池。
+> * 注册是**真实**的 `HKCU` 往返：注册、读回、注销、确认已删除。而且它是按用户的，
+>   安装不需要提权。
+> * **对话框模板「在不在发行 DLL 里」是被检查的。**
+>   `the_dll_contains_the_pages_dialog_template` 把构建出的 DLL 当数据文件打开，
+>   断言 `RT_DIALOG 101` 能从中取到。这条检查之所以存在，是因为页面曾经在
+>   `explorer.exe` 里完全不可见、而其它所有测试都通过：模板由一个**库**的构建脚本编译，
+>   而库发出的 `rustc-link-arg` 永远到不了 `cdylib`，于是 DLL 里没有模板，
+>   也就永远建不出页面。「它在最终产物里吗」和「代码对不对」是两个不同的问题，
+>   而用户能看到的只有最终产物。
+
 ### Phase 4 — checksum files and settings / 校验和文件与设置
 
 Wire `rusthashtab-sumfile` and `rusthashtab-settings` into the UI: read a checksum file,
@@ -406,7 +451,8 @@ identifier in any shipped file.
 | Workspace, CI matrix, licence, verification harness / 工作区、CI 矩阵、许可证、校验工具 | ✅ done |
 | Phase 1 algorithms — 31 of 31 verified / 第一阶段算法 —— 31 个全部已验证 | ✅ done / 已完成 |
 | Phase 2 scan pipeline / 第二阶段扫描管线 | ✅ done / 已完成 |
-| Phases 3–6 | ⬜ not started / 未开始 |
+| Phase 3 property sheet page / 第三阶段属性页 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
+| Phases 4–6 | ⬜ not started / 未开始 |
 
 ## Contributing / 贡献
 

@@ -15,6 +15,7 @@
 
 mod bench;
 mod coverage;
+mod shell;
 mod verify;
 
 use std::process::{Command, ExitCode};
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
         "verify" => verify::run(&args[1..]),
         "bench" => bench::run(&args[1..]),
         "audit" => audit(),
+        "shell-check" => shell::run(&args[1..]),
         "reference-check" => check_reference_untracked(),
         "internal-docs" => check_internal_docs(),
         "scratch-check" => check_no_scratch_tracked(),
@@ -121,6 +123,14 @@ cargo xtask <command>
   audit     Print the correctness-coverage map: which algorithm is validated by
             what, and which have no authority attached yet.
 
+  shell-check
+            Build the shell extension DLL and print where it is. Nothing is
+            registered unless you ask:
+              --register     register it for the current user (HKCU, no elevation)
+              --unregister   remove that registration
+            Registering changes what every Properties dialog on this machine
+            shows, so it is never done implicitly.
+
   reference-check
             Fail if anything from the local reference checkout has become tracked
             by git. Covers what .gitignore cannot (`git add -f`, a merge). Run in
@@ -193,6 +203,48 @@ fn target_is_runnable(target: &str, host: &str) -> bool {
 /// rather than silently treating it as runnable.
 fn arch_of(triple: &str) -> &str {
     triple.split('-').next().unwrap_or(triple)
+}
+
+/// The name of every package in this workspace.
+///
+/// Read out of `cargo metadata` rather than kept as a list here: a hand-written
+/// list is one more thing to forget when a crate is added, and the check that uses
+/// this exists precisely to stop a crate from being quietly left out.
+///
+/// The names come from the **directory** in each member id, which has the shape
+/// `path+file:///<path>#<version>`, so everything after the last `/` and before the
+/// `#` is that crate's directory -- which in this workspace is its name.
+///
+/// Scanning the JSON for `"name":"` instead was tried and is wrong: it also picks
+/// up every dependency name, 83 of them against 9 members here.
+fn workspace_packages() -> Vec<String> {
+    let out = match Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => {
+            eprintln!("could not read `cargo metadata`; skipping the per-package build");
+            return Vec::new();
+        }
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names: Vec<String> = text
+        .split('"')
+        .filter(|token| token.starts_with("path+file:///"))
+        .filter_map(|id| {
+            let directory = id.split('#').next()?.rsplit('/').next()?;
+            (!directory.is_empty()).then(|| directory.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+
+    if names.is_empty() {
+        eprintln!("`cargo metadata` returned no members; skipping the per-package build");
+    }
+    names
 }
 
 /// Ask rustc for the host triple, so `check` reports which toolchain it used.
@@ -305,6 +357,24 @@ fn check(args: &[String]) -> ExitCode {
                 "cargo",
                 &["test", "--workspace", "--target", target],
             );
+
+            // Then build each crate's tests **on its own**. `cargo test --workspace`
+            // unifies features across the whole graph, so a crate that forgot to
+            // enable a feature its own tests need still compiles -- as long as some
+            // sibling needs it too. Measured: `rusthashtab-settings` passed the
+            // workspace run while `cargo test -p rusthashtab-settings` failed
+            // outright, because `RegCreateKeyExW` needs `Win32_Security` and was
+            // only getting it transitively.
+            //
+            // `--no-run` and not a test run: this is about whether the crate builds
+            // in isolation, and the tests themselves have just been run.
+            for package in workspace_packages() {
+                ok &= step(
+                    &format!("cargo test -p {package} --no-run --target {target}"),
+                    "cargo",
+                    &["test", "-p", &package, "--no-run", "--target", target],
+                );
+            }
         } else {
             // Still build the test harness for this triple: `clippy --all-targets`
             // type-checks it, but `cargo test --no-run` links it, and link errors

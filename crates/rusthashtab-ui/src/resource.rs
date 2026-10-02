@@ -105,6 +105,15 @@ mod tests {
     use super::*;
 
     /// The dialog template, read at compile time so it cannot go missing.
+    ///
+    /// Note what this is and is not. It is the **text** of `ui.rc`, which lets the
+    /// test below check that the identifiers here and the declarations there agree.
+    /// It says nothing about whether the file was compiled into anything -- that is
+    /// a different question, and one that went unasked for a while: the template was
+    /// compiled by this crate's build script, and a `.res` from a **library's**
+    /// build script never reaches the `cdylib`, so the DLL had no template and the
+    /// page could not be shown. `rusthashtab-shell/build.rs` compiles it into the
+    /// DLL now, and `tests/page_in_sheet.rs` asserts it is reachable there.
     const TEMPLATE: &str = include_str!("ui.rc");
 
     #[test]

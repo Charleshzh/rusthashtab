@@ -41,6 +41,7 @@ rusthashtab-settings = { path = "crates/rusthashtab-settings" }
 rusthashtab-scan = { path = "crates/rusthashtab-scan" }
 rusthashtab-net = { path = "crates/rusthashtab-net" }
 rusthashtab-ui = { path = "crates/rusthashtab-ui" }
+rusthashtab-shell = { path = "crates/rusthashtab-shell" }
 
 # ---- hashing primitives -------------------------------------------------
 digest = "0.11"

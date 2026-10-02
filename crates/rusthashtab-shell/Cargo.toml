@@ -1,0 +1,48 @@
+[package]
+name = "rusthashtab-shell"
+description = "The rustHashTab shell extension DLL: COM plumbing and the property sheet handler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Deliberately cdylib only, with the logic in this crate as a normal rlib module
+# tree reached through `rusthashtab-ui`. A crate that is both `cdylib` and `rlib`
+# hits an intermittent link collision (cargo#6313), which is why the shell layer
+# ships as a wrapper. A standalone-module EXE in a later phase should get its own
+# wrapper crate rather than making this one dual-purpose.
+[lib]
+name = "rusthashtab_shell"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+rusthashtab-abi.workspace = true
+rusthashtab-settings.workspace = true
+rusthashtab-ui.workspace = true
+windows-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    # `STGMEDIUM` and `ReleaseStgMedium` are gated behind this: without it a
+    # `CF_HDROP` medium can be obtained but never released, which would leak the
+    # clipboard's shared memory on every property dialog.
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    # `IShellExtInit_Impl` and `ITEMIDLIST` are both gated behind this feature, so
+    # it is load-bearing even though nothing here names it directly.
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }

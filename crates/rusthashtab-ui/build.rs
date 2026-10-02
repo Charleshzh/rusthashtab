@@ -1,5 +1,30 @@
 //! Resource compilation for the property sheet page.
 //!
+//! # What this is for, and what it is not
+//!
+//! This compiles a copy of the dialog template into **this crate's own artifacts**,
+//! which in practice means the test binaries. That is the only way a test can build
+//! a dialog from the page's real template: a test runs from its own module and
+//! cannot reach into the DLL's resources, so `tests/property_sheet_page.rs` needs a
+//! template in the module `GetModuleHandleW(None)` returns.
+//!
+//! **This copy is not what ships.** The template that `explorer.exe` uses is the one
+//! `rusthashtab-shell/build.rs` compiles into the DLL, because the `hInstance` the
+//! page passes to `CreatePropertySheetPageW` is the DLL's. Two things follow, and
+//! both cost time to learn:
+//!
+//!   * The `rustc-link-arg` below does **not** reach the `cdylib`. A link argument
+//!     from a library's build script applies to that library's own artifact, and a
+//!     `.res` in an `.rlib` has no symbols, so the linker drops it. The DLL shipped
+//!     with no template and the page was invisible while every test passed.
+//!   * Deleting this file to remove the duplication breaks the tests instead. The
+//!     copy is not redundant; it is for a different consumer.
+//!
+//! So the duplication is real and deliberate, and the two copies are checked
+//! separately: `tests/property_sheet_page.rs` for this one,
+//! `tests/page_in_sheet.rs::the_dll_contains_the_pages_dialog_template` for the
+//! DLL's.
+//!
 //! # Why this calls `rc.exe` directly
 //!
 //! The page is a `PROPSHEETPAGEW` whose child controls come from a dialog
