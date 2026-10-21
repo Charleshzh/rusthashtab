@@ -22,13 +22,15 @@ hash quickly.
 > **本文档为中英双语。** 每节先英文、后中文。以英文为准；两者若有出入，以英文为准。
 > **改动一种语言时，必须在同一次提交中同步另一种。**
 
-> **Status: pre-alpha.** All 31 hash algorithms are implemented and externally verified, and
-> the scan pipeline — asynchronous block reads, bounded buffers, cancellation and progress —
-> is done. The shell extension, UI and installer are being built. See [Roadmap](#roadmap--路线图).
+> **Status: alpha.** All 31 hash algorithms are implemented and externally verified, the
+> scan pipeline is done, and the Shell Properties page now verifies against pasted digests
+> and checksum files, exports them in every supported format, and has a settings dialog.
+> The context menu, localization, standalone mode and the installer are still to come.
+> See [Roadmap](#roadmap--路线图).
 >
-> **状态：pre-alpha。** 全部 31 种哈希算法已实现并通过外部校验，扫描管线（异步分块读取、
-> 有界缓冲、可取消、进度上报）也已完成。shell 扩展、界面与安装器正在开发中。
-> 见[路线图](#roadmap--路线图)。
+> **状态：alpha。** 全部 31 种哈希算法已实现并通过外部校验，扫描管线已完成；Shell 属性页
+> 现在支持用粘贴的摘要或校验和文件进行校验、按所有支持格式导出，并有设置对话框。
+> 右键菜单、本地化、独立模式与安装器仍待开发。见[路线图](#roadmap--路线图)。
 
 ---
 
@@ -97,6 +99,7 @@ each architecture.
 | Rust | **1.98.1** or newer (`rust-toolchain.toml` pins it; `rustup` fetches it) / **1.98.1** 或更新（`rust-toolchain.toml` 已钉版本，`rustup` 会自动拉取） |
 | Visual Studio 2022 | The **C++ build tools** workload — `rustc` locates the Windows SDK itself, so no Developer Command Prompt is needed / 需勾选 **C++ 生成工具**工作负载——`rustc` 会自行定位 Windows SDK，**不需要**开发者命令提示符 |
 | Targets / 目标平台 | `rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc aarch64-pc-windows-msvc` |
+| Verification tools / 校验工具 | `openssl` 3.x and `sha256sum` (from Git for Windows) for `cargo xtask verify --require-tools`; 7-Zip is optional and only supplies CRC32 values / `cargo xtask verify --require-tools` 需要 `openssl` 3.x 与 `sha256sum`（Git for Windows 自带）；7-Zip 可选，只用于提供 CRC32 数值 |
 
 **Do not use Rust 1.98.0.** It miscompiles trait-object vtables — it can emit a null function
 pointer where a real one belongs ([rust-lang/rust#161441](https://github.com/rust-lang/rust/issues/161441),
@@ -212,6 +215,7 @@ from the start. So correctness rests on **independent authorities**:
 | Vendored upstream vector files / 上游向量文件（vendored） | BLAKE3, BLAKE2sp, KangarooTwelve, GOST (gost-engine etalon), QuickXorHash (rclone) |
 | Upstream reference implementations / 上游参考实现 | xxHash, ParallelHash (XKCP), eD2k |
 | CRC catalogue check values / CRC 目录校验值 | CRC32, CRC64/XZ |
+| Real checksum files produced by other tools / 其他工具真实产出的校验和文件 | `sha256sum`, `openssl dgst` (parsing), `sha256sum -c` (our export), `7z` (SFV CRC32 values) |
 
 ```powershell
 cargo xtask check     # everything that must pass before a commit
@@ -230,6 +234,18 @@ rather than silently checking nothing.
 > 刻意落在分块与填充边界上的载荷长度（包括恰好 2 MiB——扫描器的读取块大小）；另外 434
 > 次对照 `vectors/` 下从上游权威 vendored 的向量文件。CI 中 OpenSSL 缺失时它会让构建
 > 失败，而不是静默地什么都不检查。
+
+It then crosses the checksum-file layer with the same tools: real files written by
+`sha256sum` and `openssl dgst` must parse to the digests the algorithms compute,
+`sha256sum -c` must accept the file our exporter writes, and the CRC32 values in our
+SFV export are compared against `7z h -scrcCRC32`. corz `.hash` has no external producer,
+so for it the check is export→parse round-tripping, and the output says so rather than
+pretending otherwise.
+
+> 随后它用同一批工具交叉检查校验和文件层：`sha256sum` 与 `openssl dgst` 写出的真实文件
+> 必须解析出算法算出的摘要；我们导出的 `.sha256` 必须能通过 `sha256sum -c`；我们导出的
+> SFV 里的 CRC32 数值要与 `7z h -scrcCRC32` 比对。corz `.hash` 没有外部生产者，所以对它
+> 的检查是导出→解析往返，输出里会如实说明，而不是假装已经交叉验证。
 
 Also verified:
 
@@ -354,7 +370,7 @@ dropping the scan handle cancels and joins, so no thread outlives it.
 > 才会等待，这正是死锁不可能发生的原因。取消会真正取消 I/O，并在释放缓冲之前等待每一个在飞
 > 操作被收割；丢弃扫描句柄会取消并 join，因此没有任何线程会比扫描活得更久。
 
-### Phase 3 — the property sheet page / 属性页
+### Phase 3 — the property sheet page / 属性页 ✅
 
 `IShellExtInit` + `IShellPropSheetExt`, the results list, DPI awareness.
 
@@ -407,20 +423,38 @@ Properties dialog and hashes the selection there.
 >   也就永远建不出页面。「它在最终产物里吗」和「代码对不对」是两个不同的问题，
 >   而用户能看到的只有最终产物。
 
-### Phase 4 — checksum files and settings / 校验和文件与设置
+### Phase 4 — checksum files, verification and settings / 校验和文件、校验与设置 ✅
 
-Wire `rusthashtab-sumfile` and `rusthashtab-settings` into the UI: read a checksum file,
-verify against it, export in every supported format.
+The page verifies against a pasted digest or a checksum file — one the user picks, or one
+found beside each hashed file when `LookForSumfiles` is on. Matches are coloured green
+(secure), amber (weak) or red (mismatch), and the status line says where the verdicts came
+from. Every supported format can be exported, and the settings dialog persists all 31
+algorithm flags plus the display and export options.
 
-> 把 `rusthashtab-sumfile` 与 `rusthashtab-settings` 接进界面：读取校验和文件、据此校验、
-> 按所有支持格式导出。
+> 属性页现在支持用粘贴的摘要或校验和文件校验——可以显式选择校验和文件，也可以在
+> `LookForSumfiles` 打开时自动读取哈希文件旁边的那个。匹配按绿（安全算法）、琥珀（弱算法）
+> 或红（不匹配）显示，状态行会写明判定来自哪个来源。所有支持格式都可导出，设置对话框会
+> 持久化全部 31 个算法开关以及显示与导出选项。
 
-**Gate / 门禁:** `cargo xtask check`. The parser's correctness is checked against real
-checksum files produced by `sha256sum`, `openssl dgst` and `7z`, not against fixtures this
-repository authored.
+**Gate / 门禁:** `cargo xtask check`, which includes the real-tool checksum-file
+cross-check described under [Correctness](#correctness--正确性). As with Phase 3, a manual
+pass in a real `explorer.exe` Properties dialog is the last step; the checklist and the
+result are recorded in `docs/internal/PHASE4-CHECKSUM-AND-SETTINGS.md`.
 
-> `cargo xtask check`。解析器的正确性对照的是 `sha256sum`、`openssl dgst`、`7z` 真实产出的
-> 校验和文件，而不是本仓库自己造的样例。
+> **门禁：** `cargo xtask check`，其中包含[正确性](#correctness--正确性)一节描述的真实
+> 工具校验和文件交叉检查。与 Phase 3 一样，最后一步是在真实 `explorer.exe` 的属性对话框
+> 里人工过一遍；清单与结果记录在 `docs/internal/PHASE4-CHECKSUM-AND-SETTINGS.md`。
+
+**Status: complete and verified in a real Properties dialog.** The maintainer's manual pass
+in `explorer.exe` succeeded on 2026-10-22, including the two defects that pass found and this
+phase fixed: the settings dialog's algorithm list was blank (a report-mode list view with no
+column draws nothing) and matched rows were not coloured (a dialog procedure must return a
+custom-draw result through `DWLP_MSGRESULT`).
+
+> **状态：已完成，并已在真实属性对话框中验收。** 维护者 2026-10-22 在 `explorer.exe` 中的
+> 人工验收通过，其中包含这次验收发现、并在本阶段修掉的两个缺陷：设置对话框算法列表空白
+> （report 模式列表视图没有列就不绘制），以及匹配行不变色（对话框过程必须通过
+> `DWLP_MSGRESULT` 返回自定义绘制结果）。
 
 ### Phase 5 — context menu, localization, standalone mode / 右键菜单、本地化、独立模式
 
@@ -452,7 +486,8 @@ identifier in any shipped file.
 | Phase 1 algorithms — 31 of 31 verified / 第一阶段算法 —— 31 个全部已验证 | ✅ done / 已完成 |
 | Phase 2 scan pipeline / 第二阶段扫描管线 | ✅ done / 已完成 |
 | Phase 3 property sheet page / 第三阶段属性页 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
-| Phases 4–6 | ⬜ not started / 未开始 |
+| Phase 4 checksum files, verification and settings / 第四阶段 —— 校验和文件、校验与设置 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
+| Phases 5–6 | ⬜ not started / 未开始 |
 
 ## Contributing / 贡献
 
