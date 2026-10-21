@@ -177,6 +177,7 @@ fn start_hashing(hwnd: HWND, state: &mut DialogState) {
     let display = crate::session::Display {
         enabled: state.enabled.clone(),
         uppercase: state.settings.display_uppercase,
+        look_for_sumfiles: state.settings.look_for_sumfiles,
     };
     let shared = Arc::new(Shared::new());
     let session = ReadoutSession::start(

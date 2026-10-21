@@ -45,8 +45,8 @@
 
 #![cfg(windows)]
 
-use crate::{Counters, ListRow, MAX_HASHED_FILES};
-use rusthashtab_scan::{ScanConfig, ScanEvent, ScanOutcome, expand_selection};
+use crate::{Counters, JobSpec, ListRow, MAX_HASHED_FILES};
+use rusthashtab_scan::{FileResult, ScanConfig, ScanEvent, ScanOutcome, expand_selection};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -82,6 +82,25 @@ pub struct Shared {
     pub generation: AtomicU64,
     /// Results waiting to be turned into list rows.
     readouts: Mutex<Vec<Readout>>,
+    /// Every job the scan was given, in job order.
+    ///
+    /// Indexed by the same `job_index` the scan reports, which is what lets a
+    /// result be turned into rows with the job's display path without the sink
+    /// having to remember it.
+    jobs: Mutex<Vec<JobSpec>>,
+    /// Each job's result, once it has finished; `None` while it is still running.
+    ///
+    /// Kept in addition to the [`Readout`] queue because the row list has to be
+    /// rebuildable from the finished results alone: draining the queue must not
+    /// mean forgetting the files that were already shown.
+    results: Mutex<Vec<Option<FileResult>>>,
+    /// Expected digests per job, from the verification source in effect.
+    ///
+    /// Mutable while the scan runs: a pasted digest or a checksum file can arrive
+    /// after hashing has started, and the next result must be judged against it.
+    expected: Mutex<Vec<Vec<Vec<u8>>>>,
+    /// Which verification source produced [`Shared::expected`], if any.
+    verification: Mutex<Option<VerificationInfo>>,
     /// The status line's counters.
     counters: Mutex<Counters>,
     /// How rows are spelled out. See [`Display`].
@@ -106,10 +125,15 @@ impl Shared {
         Self {
             generation: AtomicU64::new(0),
             readouts: Mutex::new(Vec::new()),
+            jobs: Mutex::new(Vec::new()),
+            results: Mutex::new(Vec::new()),
+            expected: Mutex::new(Vec::new()),
+            verification: Mutex::new(None),
             counters: Mutex::new(Counters::default()),
             display: Mutex::new(Display {
                 enabled: Vec::new(),
                 uppercase: true,
+                look_for_sumfiles: false,
             }),
             progress: AtomicU64::new(0),
             files_done: AtomicUsize::new(0),
@@ -139,6 +163,94 @@ impl Shared {
     /// The status line's counters as they stand.
     pub fn counters(&self) -> Counters {
         *self.lock_counters()
+    }
+
+    /// Publish the job list, and reset the per-job result and expected slots.
+    ///
+    /// Called by the session thread after the selection has been expanded and the
+    /// cap applied, before the scan starts. The other two vectors are rebuilt to
+    /// the same length here rather than by the caller, because the three are
+    /// indexed together: a result stored against a job index only means anything
+    /// if the job list and the expected table have that index too.
+    pub fn set_jobs(&self, jobs: Vec<JobSpec>) {
+        let length = jobs.len();
+        *self.lock_jobs() = jobs;
+        *self.lock_results() = vec![None; length];
+        *self.lock_expected() = vec![Vec::new(); length];
+    }
+
+    /// The job at `index`, or `None` when the list is shorter.
+    pub fn job_at(&self, index: usize) -> Option<JobSpec> {
+        self.lock_jobs().get(index).cloned()
+    }
+
+    /// Every job the scan was given, in job order.
+    ///
+    /// A snapshot, because a verification request matches a checksum file
+    /// against the selection as it was after expansion; the scan's job list does
+    /// not change after it is published.
+    pub fn jobs(&self) -> Vec<JobSpec> {
+        self.lock_jobs().clone()
+    }
+
+    /// Record one file's result, by job index.
+    ///
+    /// An index past the end is discarded rather than extending the vector: a
+    /// result for a job the page does not have cannot be displayed, and growing
+    /// the vector would take the job and result lists out of step.
+    pub fn store_result(&self, index: usize, result: FileResult) {
+        if let Some(slot) = self.lock_results().get_mut(index) {
+            *slot = Some(result);
+        }
+    }
+
+    /// Every result stored so far, in job order; `None` while a job is running.
+    pub fn results(&self) -> Vec<Option<FileResult>> {
+        self.lock_results().clone()
+    }
+
+    /// Replace the expected digests, one vector per job.
+    ///
+    /// A shorter vector is legal: a job past its end simply has nothing to compare
+    /// against.
+    pub fn set_expected(&self, expected: Vec<Vec<Vec<u8>>>) {
+        *self.lock_expected() = expected;
+    }
+
+    /// The expected digests for one job, or nothing when the index is past the end.
+    pub fn expected_at(&self, index: usize) -> Vec<Vec<u8>> {
+        self.lock_expected().get(index).cloned().unwrap_or_default()
+    }
+
+    /// Every job's expected digests, in job order.
+    ///
+    /// Used when one job's expectation is replaced (a pasted digest) or the whole
+    /// table is replaced (a checksum file): the caller edits a snapshot and
+    /// publishes it back with [`Shared::set_expected`].
+    pub fn expected_all(&self) -> Vec<Vec<Vec<u8>>> {
+        self.lock_expected().clone()
+    }
+
+    /// Record the verification source in effect, or clear it with `None`.
+    ///
+    /// The source is published with the digests it produced, so the status line can
+    /// always name where the verdicts came from.
+    pub fn set_verification(&self, info: impl Into<Option<VerificationInfo>>) {
+        *self.lock_verification() = info.into();
+    }
+
+    /// The verification source in effect, if any.
+    pub fn verification(&self) -> Option<VerificationInfo> {
+        self.lock_verification().clone()
+    }
+
+    /// Replace the status line's counters.
+    ///
+    /// Used when the whole result set is re-judged -- a new verification source
+    /// changes every verdict -- so the new counts are published in one step and a
+    /// reader never sees half of the old summary and half of the new one.
+    pub fn replace_counters(&self, counters: Counters) {
+        *self.lock_counters() = counters;
     }
 
     /// Progress as a fraction of [`crate::PROGRESS_RESOLUTION`].
@@ -193,6 +305,34 @@ impl Shared {
     /// See [`Shared::lock_readouts`].
     fn lock_counters(&self) -> MutexGuard<'_, Counters> {
         self.counters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// See [`Shared::lock_readouts`].
+    fn lock_jobs(&self) -> MutexGuard<'_, Vec<JobSpec>> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// See [`Shared::lock_readouts`].
+    fn lock_results(&self) -> MutexGuard<'_, Vec<Option<FileResult>>> {
+        self.results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// See [`Shared::lock_readouts`].
+    fn lock_expected(&self) -> MutexGuard<'_, Vec<Vec<Vec<u8>>>> {
+        self.expected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// See [`Shared::lock_readouts`].
+    fn lock_verification(&self) -> MutexGuard<'_, Option<VerificationInfo>> {
+        self.verification
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -350,6 +490,23 @@ pub enum SessionExit {
     Cancelled,
 }
 
+/// What the page knows about the verification source currently in effect.
+///
+/// One value rather than three independent fields: the status line prints the
+/// source, the number of entries that matched no file, and whether any line was
+/// malformed together, and a mix of one source's numbers with another source's
+/// name would be a lie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationInfo {
+    /// Where the expected digests came from, spelled the way the status line shows
+    /// it (for example `checksum file: a.sha256`).
+    pub source: String,
+    /// Entries in the source that matched no file in the selection.
+    pub unmatched: usize,
+    /// Whether the source had lines that could not be parsed.
+    pub had_error: bool,
+}
+
 /// How the page wants rows spelled out.
 ///
 /// Carried on [`Shared`] because the row builder is reached from the scan's
@@ -363,6 +520,12 @@ pub struct Display {
     pub enabled: Vec<bool>,
     /// Upper-case hex.
     pub uppercase: bool,
+    /// Use a checksum file beside each hashed file as a verification source.
+    ///
+    /// Part of the session snapshot rather than read from the settings when the
+    /// scan starts: the page can change settings while a scan runs, and the
+    /// running scan must keep the behaviour it was given.
+    pub look_for_sumfiles: bool,
 }
 
 /// A running hashing thread, and the state the page reads.
@@ -561,6 +724,39 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
         shared.skipped.store(skipped, Ordering::Release);
     }
 
+    // A checksum file beside each hashed file is an automatic verification
+    // source when the setting asks for one. It is read here, on the session
+    // thread, because it is file-system work and the dialog's thread must not
+    // wait on it.
+    if display.look_for_sumfiles {
+        let attached = crate::verify::attach_sidecars(&mut jobs);
+        if attached > 0 {
+            // Say where the verdicts came from. The exact per-file accounting is
+            // not available here (a sidecar covers one file, so "unmatched" has
+            // no meaning); the label is still better than an unexplained green.
+            shared.set_verification(VerificationInfo {
+                source: String::from("checksum files beside the hashed files"),
+                unmatched: 0,
+                had_error: false,
+            });
+        }
+    }
+
+    // Publish what is about to be scanned, before the scan starts: the sink needs
+    // each job's display path to build the file column, and the result slots have
+    // to exist before the first result arrives. The expected digests are the ones
+    // the sidecar scan just attached (usually none); a source that arrives during
+    // the scan replaces them through `set_expected`.
+    shared.set_jobs(
+        jobs.iter()
+            .map(|job| JobSpec {
+                path: job.path.clone(),
+                display_path: job.display_path.clone(),
+            })
+            .collect(),
+    );
+    shared.set_expected(jobs.iter().map(|job| job.expected.clone()).collect());
+
     shared.files_total.store(jobs.len(), Ordering::Release);
 
     let config = ScanConfig {
@@ -629,20 +825,44 @@ impl Collector {
                 self.sink.progress(self.shared.progress());
             }
             ScanEvent::FileFinished {
-                job_index,
-                result,
-                match_state,
+                job_index, result, ..
             } => {
+                // The result is stored before the rows are built, so a reader that
+                // sees the rows can also look the result up; draining the row queue
+                // must not be the only place a finished file is remembered.
+                self.shared.store_result(job_index, result.clone());
+
+                // The event's own verdict is deliberately ignored: it was computed
+                // against the expected digests the scan was started with, and a
+                // verification source can arrive *while* the scan runs. Recomputing
+                // against the digests stored on `Shared` is what keeps a row's
+                // colour consistent with the source the dialog currently shows.
+                let expected = self.shared.expected_at(job_index);
+                let verdict =
+                    rusthashtab_scan::match_state(&result, &expected, &self.display.enabled);
+
+                // The job list was published before the scan started, so the job is
+                // there. The empty fallback only matters if that contract is broken,
+                // and an empty path is still displayed honestly.
+                let display_path = self
+                    .shared
+                    .job_at(job_index)
+                    .map(|job| job.display_path)
+                    .unwrap_or_default();
+
                 let rows = crate::readout::rows_for(
                     job_index,
+                    &display_path,
                     &result,
                     &self.display.enabled,
                     self.display.uppercase,
+                    verdict,
+                    &expected,
                 );
                 self.shared.accept(Readout {
                     job_index,
                     rows,
-                    match_state,
+                    match_state: verdict,
                     error: result.error,
                 });
                 self.sink.rows_ready();
@@ -738,5 +958,120 @@ mod tests {
         let counters = shared.counters();
         assert_eq!(counters.error, 1);
         assert_eq!(counters.mismatched, 0);
+    }
+
+    fn job(display_path: &str) -> crate::JobSpec {
+        crate::JobSpec {
+            path: PathBuf::from(format!(r"C:\dir\{display_path}")),
+            display_path: display_path.to_string(),
+        }
+    }
+
+    fn result_for(path: &str, error: Option<u32>) -> FileResult {
+        FileResult {
+            path: PathBuf::from(path),
+            digests: Vec::new(),
+            size: 0,
+            error,
+        }
+    }
+
+    /// Publishing a job list sizes the result and expected tables with it: the
+    /// three are indexed by the same job index, so a shorter table would silently
+    /// route a result to the wrong slot.
+    #[test]
+    fn set_jobs_sizes_the_result_and_expected_tables() {
+        let shared = Shared::new();
+        shared.set_jobs(vec![job("a.bin"), job("b.bin")]);
+
+        assert_eq!(
+            shared.job_at(0),
+            Some(job("a.bin")),
+            "the job is readable back"
+        );
+        assert_eq!(shared.job_at(1), Some(job("b.bin")));
+        assert_eq!(shared.job_at(2), None, "past the end is no job");
+        assert_eq!(shared.results(), vec![None, None]);
+        assert!(shared.expected_at(0).is_empty());
+        assert!(shared.expected_at(1).is_empty());
+
+        // Replacing the list with a shorter one must shrink the other tables too,
+        // or a stale result would stay addressable past the end.
+        shared.set_jobs(vec![job("c.bin")]);
+        assert_eq!(shared.results().len(), 1);
+        assert_eq!(shared.job_at(1), None);
+    }
+
+    /// A result is stored under the job index the scan reported, and an index the
+    /// page does not have is discarded rather than growing the vector.
+    #[test]
+    fn results_are_stored_and_read_back_by_job_index() {
+        let shared = Shared::new();
+        shared.set_jobs(vec![job("a.bin"), job("b.bin")]);
+
+        shared.store_result(1, result_for(r"C:\dir\b.bin", None));
+        let results = shared.results();
+        assert_eq!(results[0], None, "a running job has no result");
+        assert_eq!(
+            results[1],
+            Some(result_for(r"C:\dir\b.bin", None)),
+            "the result is stored under its job index"
+        );
+
+        shared.store_result(9, result_for(r"C:\dir\gone.bin", None));
+        assert_eq!(
+            shared.results().len(),
+            2,
+            "an out-of-range result must not extend the table"
+        );
+    }
+
+    /// Expected digests are per job, and an index past the end has nothing to
+    /// compare against rather than an error.
+    #[test]
+    fn expected_digests_are_per_job() {
+        let shared = Shared::new();
+        shared.set_jobs(vec![job("a.bin"), job("b.bin")]);
+        shared.set_expected(vec![vec![vec![0xAA, 0xBB]], Vec::new()]);
+
+        assert_eq!(shared.expected_at(0), vec![vec![0xAA, 0xBB]]);
+        assert!(shared.expected_at(1).is_empty());
+        assert!(
+            shared.expected_at(9).is_empty(),
+            "a job past the expected table has nothing to check"
+        );
+    }
+
+    /// The verification source is published with its counts, and can be cleared
+    /// when the source goes away.
+    #[test]
+    fn verification_info_round_trips_and_can_be_cleared() {
+        let shared = Shared::new();
+        assert_eq!(shared.verification(), None);
+
+        let info = VerificationInfo {
+            source: "checksum file: a.sha256".to_string(),
+            unmatched: 2,
+            had_error: true,
+        };
+        shared.set_verification(info.clone());
+        assert_eq!(shared.verification(), Some(info));
+
+        shared.set_verification(None);
+        assert_eq!(shared.verification(), None);
+    }
+
+    /// Re-judging the result set publishes the whole counter summary at once.
+    #[test]
+    fn counters_can_be_replaced() {
+        let shared = Shared::new();
+        let counters = Counters {
+            matched: 3,
+            mismatched: 1,
+            nothing_to_check: 2,
+            error: 4,
+        };
+        shared.replace_counters(counters);
+        assert_eq!(shared.counters(), counters);
     }
 }

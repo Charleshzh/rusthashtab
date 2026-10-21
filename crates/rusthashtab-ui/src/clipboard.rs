@@ -39,6 +39,11 @@ struct HandedOver;
 
 /// Render rows as the tab-separated text that goes on the clipboard.
 ///
+/// One line per selected row, four columns: algorithm, digest, verdict, and the
+/// file's display path. The last column is what makes a pasted table usable when
+/// the user copied several files: a list of digests with no file names is a list
+/// nobody can check anything against.
+///
 /// A header line is deliberately **not** emitted: the selection is what the user
 /// asked for, and adding a line they did not select makes a paste into a
 /// spreadsheet land one row off.
@@ -87,6 +92,8 @@ pub fn render(rows: &[ListRow], selected: &[usize]) -> Option<String> {
         text.push_str(&digest);
         text.push('\t');
         text.push_str(verdict);
+        text.push('\t');
+        text.push_str(&row.display_path);
     }
 
     (!text.is_empty()).then_some(text)
@@ -202,13 +209,20 @@ mod tests {
     use super::*;
     use rusthashtab_scan::MatchState;
 
-    fn row(algorithm: usize, digest: &str, state: MatchState, error: Option<u32>) -> ListRow {
+    fn row(
+        algorithm: usize,
+        digest: &str,
+        state: MatchState,
+        error: Option<u32>,
+        path: &str,
+    ) -> ListRow {
         ListRow {
             job_index: 0,
             algorithm,
             digest_hex: digest.to_string(),
             match_state: state,
             error,
+            display_path: path.to_string(),
         }
     }
 
@@ -224,7 +238,13 @@ mod tests {
     /// lose it.
     #[test]
     fn nothing_selected_renders_nothing() {
-        let rows = vec![row(sha256_index(), "AB", MatchState::NotChecked, None)];
+        let rows = vec![row(
+            sha256_index(),
+            "AB",
+            MatchState::NotChecked,
+            None,
+            "file.bin",
+        )];
         assert_eq!(render(&rows, &[]), None);
     }
 
@@ -234,15 +254,27 @@ mod tests {
     #[test]
     fn a_selection_renders_one_tab_separated_line_per_row() {
         let rows = vec![
-            row(sha256_index(), "AABB", MatchState::NotChecked, None),
-            row(sha256_index(), "CCDD", MatchState::Mismatched, None),
+            row(
+                sha256_index(),
+                "AABB",
+                MatchState::NotChecked,
+                None,
+                "first.bin",
+            ),
+            row(
+                sha256_index(),
+                "CCDD",
+                MatchState::Mismatched,
+                None,
+                "second.bin",
+            ),
         ];
 
         let text = render(&rows, &[0, 1]).expect("two rows render");
 
         assert_eq!(
             text,
-            "SHA-256\tAABB\tnot checked\r\nSHA-256\tCCDD\tmismatch"
+            "SHA-256\tAABB\tnot checked\tfirst.bin\r\nSHA-256\tCCDD\tmismatch\tsecond.bin"
         );
         assert!(!text.starts_with('\n'));
     }
@@ -252,8 +284,20 @@ mod tests {
     #[test]
     fn the_selected_order_is_preserved() {
         let rows = vec![
-            row(sha256_index(), "FIRST", MatchState::NotChecked, None),
-            row(sha256_index(), "SECOND", MatchState::NotChecked, None),
+            row(
+                sha256_index(),
+                "FIRST",
+                MatchState::NotChecked,
+                None,
+                "first.bin",
+            ),
+            row(
+                sha256_index(),
+                "SECOND",
+                MatchState::NotChecked,
+                None,
+                "second.bin",
+            ),
         ];
         let text = render(&rows, &[1, 0]).expect("both rows render");
         let lines: Vec<&str> = text.split("\r\n").collect();
@@ -261,19 +305,48 @@ mod tests {
         assert!(lines[1].contains("FIRST"));
     }
 
+    /// The file's display path is the fourth column: a pasted table has to say
+    /// which file each digest belongs to.
+    #[test]
+    fn the_display_path_is_the_fourth_column() {
+        let rows = vec![row(
+            sha256_index(),
+            "AABB",
+            MatchState::NotChecked,
+            None,
+            r"nested\a.bin",
+        )];
+        let text = render(&rows, &[0]).expect("one row renders");
+
+        assert_eq!(text, "SHA-256\tAABB\tnot checked\tnested\\a.bin");
+        assert_eq!(text.split('\t').count(), 4, "one tab per column boundary");
+    }
+
     /// An unreadable file says so in the digest column, where the answer belongs.
     #[test]
     fn a_read_error_is_rendered_where_the_digest_belongs() {
-        let rows = vec![row(usize::MAX, "", MatchState::NotChecked, Some(5))];
+        let rows = vec![row(
+            usize::MAX,
+            "",
+            MatchState::NotChecked,
+            Some(5),
+            "broken.bin",
+        )];
         let text = render(&rows, &[0]).expect("the error row renders");
-        assert_eq!(text, "-\tError 5\tnot checked");
+        assert_eq!(text, "-\tError 5\tnot checked\tbroken.bin");
     }
 
     /// A selection naming a row the page no longer has must skip it rather than
     /// producing a blank line that would paste as an empty record.
     #[test]
     fn a_stale_selection_index_is_skipped() {
-        let rows = vec![row(sha256_index(), "AABB", MatchState::NotChecked, None)];
+        let rows = vec![row(
+            sha256_index(),
+            "AABB",
+            MatchState::NotChecked,
+            None,
+            "file.bin",
+        )];
         let text = render(&rows, &[0, 99]).expect("the live row renders");
         assert_eq!(text.lines().count(), 1);
     }
@@ -299,9 +372,22 @@ mod tests {
                     secure: true,
                 },
                 None,
+                "file.bin",
             ),
-            row(sha256_index(), "BB", MatchState::Mismatched, None),
-            row(sha256_index(), "CC", MatchState::NotChecked, None),
+            row(
+                sha256_index(),
+                "BB",
+                MatchState::Mismatched,
+                None,
+                "file.bin",
+            ),
+            row(
+                sha256_index(),
+                "CC",
+                MatchState::NotChecked,
+                None,
+                "file.bin",
+            ),
         ];
         let text = render(&rows, &[0, 1, 2]).expect("three rows render");
         assert!(text.contains("matched"));

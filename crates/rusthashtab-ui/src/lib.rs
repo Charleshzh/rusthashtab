@@ -87,13 +87,16 @@ pub struct ListRow {
     /// [`usize::MAX`] on a row that stands for a whole file rather than for one
     /// algorithm, which is the row an unreadable file produces.
     pub algorithm: usize,
-    /// Uppercase or lowercase hex, per the display setting -- already formatted,
+    /// Upper-case or lower-case hex, per the display setting -- already formatted,
     /// because the list is owner-drawn and must not format on the paint path.
     pub digest_hex: String,
     /// How this digest compares to any expected value.
     pub match_state: MatchState,
     /// Set when the file could not be read; shown in place of the digest.
     pub error: Option<u32>,
+    /// The file's display path, copied from the job so a row can be shown and
+    /// copied without a lookup that could disagree with the list.
+    pub display_path: String,
 }
 
 /// Counters shown in the status line, in the order the UI displays them.

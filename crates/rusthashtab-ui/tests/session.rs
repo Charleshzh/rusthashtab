@@ -103,6 +103,7 @@ fn display_all() -> Display {
     Display {
         enabled: vec![true; ALGORITHMS.len()],
         uppercase: true,
+        look_for_sumfiles: false,
     }
 }
 
@@ -118,6 +119,7 @@ fn display_one(name: &str) -> Display {
     Display {
         enabled,
         uppercase: true,
+        look_for_sumfiles: false,
     }
 }
 
@@ -232,6 +234,13 @@ fn a_hashed_file_produces_the_rows_the_scan_produced() {
     // Every enabled algorithm produced a row, and the digest in it is the one the
     // algorithm produces for the bytes on disk.
     assert_eq!(readout.rows.len(), ALGORITHMS.len());
+    assert!(
+        readout
+            .rows
+            .iter()
+            .all(|row| row.display_path == "payload.bin"),
+        "each row must carry the job's display path, so the File column needs no lookup"
+    );
     let sha256 = digest_for(&file, "SHA-256");
     let expected = rusthashtab_sumfile::export::to_hex(&sha256, true);
     let row = readout
