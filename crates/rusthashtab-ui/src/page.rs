@@ -82,6 +82,15 @@ pub extern "system" fn test_dlg_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
+    // Only `WM_INITDIALOG` needs the `PROPSHEETPAGEW` wrapper: that is the message
+    // whose `lparam` is the state pointer. Every other message must receive the
+    // real `lparam`, because `WM_NOTIFY` carries the custom-draw structure and
+    // reinterpreting it as a page would make the notification unreadable -- the
+    // test harness would then be exercising a path the shell never takes.
+    if message != windows::Win32::UI::WindowsAndMessaging::WM_INITDIALOG {
+        return crate::dialog::dlg_proc(hwnd, message, wparam, lparam);
+    }
+
     let mut page = PROPSHEETPAGEW {
         lParam: lparam,
         ..Default::default()
@@ -125,7 +134,14 @@ pub fn add_page(
         return Err(UiError::MissingResource(IDD_HASH_PROPPAGE));
     }
 
-    let state = Box::new(DialogState::new(roots, settings.clone()));
+    let mut state = Box::new(DialogState::new(roots, settings.clone()));
+    // The dialog template and the settings dialog live in this module. The page
+    // cannot discover that later: inside `explorer.exe` the process module is the
+    // shell, so the handle has to travel with the page.
+    #[cfg(windows)]
+    {
+        state.instance = Some(hinstance);
+    }
     let state_pointer = Box::into_raw(state);
 
     let mut template = PROPSHEETPAGEW {

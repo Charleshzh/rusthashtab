@@ -35,6 +35,13 @@ pub enum Route {
     Progress(u64),
     /// The scan is over, successfully or not.
     Finished,
+    /// A verification request finished; the payload is its sequence number.
+    ///
+    /// The sequence matters: a user who picks one checksum file and then another
+    /// must not see the first one's verdict applied to the second.
+    Verification(u32),
+    /// An export request finished; the payload is its sequence number.
+    ExportDone(u32),
     /// This window has no state: `WM_NCDESTROY` already ran, and the page is
     /// about to be freed. Nothing may be touched.
     NoState,
@@ -59,6 +66,8 @@ pub fn route(message: u32, wparam: usize, lparam: isize, hwnd_has_state: bool) -
         crate::WM_FILE_FINISHED => Route::Results,
         crate::WM_FILE_PROGRESS => Route::Progress(decode_progress(lparam)),
         crate::WM_SCAN_FINISHED => Route::Finished,
+        crate::WM_VERIFY_READY => Route::Verification(decode_sequence(lparam)),
+        crate::WM_EXPORT_DONE => Route::ExportDone(decode_sequence(lparam)),
         _ => Route::NotOurs,
     }
 }
@@ -71,8 +80,22 @@ pub fn route(message: u32, wparam: usize, lparam: isize, hwnd_has_state: bool) -
 fn is_ours(message: u32, wparam: usize) -> bool {
     matches!(
         message,
-        crate::WM_FILE_FINISHED | crate::WM_FILE_PROGRESS | crate::WM_SCAN_FINISHED
+        crate::WM_FILE_FINISHED
+            | crate::WM_FILE_PROGRESS
+            | crate::WM_SCAN_FINISHED
+            | crate::WM_VERIFY_READY
+            | crate::WM_EXPORT_DONE
     ) && wparam == MESSAGE_MAGIC
+}
+
+/// Turn the `lParam` of a completion message back into its request sequence.
+///
+/// A sequence is a `u32` assigned on the dialog thread. `LPARAM` is signed and
+/// pointer-width, but values we produce are non-negative and fit, so a negative
+/// payload can only be a stray message; it maps to zero, which matches no issued
+/// request and is therefore ignored.
+fn decode_sequence(lparam: isize) -> u32 {
+    lparam.max(0) as u64 as u32
 }
 
 /// Turn the `lParam` of a progress message back into a step count.
@@ -116,7 +139,9 @@ pub fn quantise(done: u64, total: u64) -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::{WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_SCAN_FINISHED};
+    use crate::{
+        WM_EXPORT_DONE, WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_SCAN_FINISHED, WM_VERIFY_READY,
+    };
 
     /// The whole point of the module: a message that is not ours is passed on,
     /// not swallowed. Swallowing it would break every other handler in the
@@ -154,6 +179,33 @@ mod tests {
         assert_eq!(
             route(WM_SCAN_FINISHED, MESSAGE_MAGIC, 0, true),
             Route::Finished
+        );
+        assert_eq!(
+            route(WM_VERIFY_READY, MESSAGE_MAGIC, 3, true),
+            Route::Verification(3)
+        );
+        assert_eq!(
+            route(WM_EXPORT_DONE, MESSAGE_MAGIC, 9, true),
+            Route::ExportDone(9)
+        );
+    }
+
+    /// A completion message carries the request's sequence so a superseded
+    /// request can be ignored. Negative payloads are stray, not requests.
+    #[test]
+    fn a_completion_sequence_is_decoded_and_stray_values_are_zero() {
+        assert_eq!(
+            route(WM_VERIFY_READY, MESSAGE_MAGIC, -1, true),
+            Route::Verification(0)
+        );
+        assert_eq!(
+            route(WM_EXPORT_DONE, MESSAGE_MAGIC, -5, true),
+            Route::ExportDone(0)
+        );
+        assert_eq!(
+            route(WM_VERIFY_READY, MESSAGE_MAGIC ^ 1, 3, true),
+            Route::NotOurs,
+            "a completion message without the magic must not be acted on"
         );
     }
 

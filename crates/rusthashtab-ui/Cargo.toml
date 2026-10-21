@@ -43,6 +43,9 @@ windows = { workspace = true, features = [
     "Win32_System_Ole",
     "Win32_System_Registry",
     "Win32_UI_Controls",
+    # `GetOpenFileNameW` / `GetSaveFileNameW` and `OPENFILENAMEW` live in
+    # `Win32::UI::Controls::Dialogs`, which is gated behind this feature.
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_Shell",
     # `ITEMIDLIST` lives behind this feature, and `IShellExtInit_Impl`'s signature
     # names it.

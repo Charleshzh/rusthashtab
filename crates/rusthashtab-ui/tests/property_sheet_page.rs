@@ -37,7 +37,8 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{LVITEMW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateDialogParamW, DestroyWindow, GetDlgItem, IsWindow, SendMessageW, WM_CLOSE,
+    BM_CLICK, CreateDialogParamW, DestroyWindow, GetDlgItem, IsWindow, SendMessageW,
+    SetWindowTextW, WM_CLOSE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -185,6 +186,39 @@ impl HostedPage {
         String::from_utf16_lossy(&buffer[..end])
     }
 
+    /// Replace the text in one of the page's controls.
+    fn set_text(&self, id: i32, text: &str) {
+        let control = self.control(id);
+        let wide: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
+        // SAFETY: `control` belongs to this dialog and the string outlives the call,
+        // which copies it.
+        unsafe {
+            let _ = SetWindowTextW(control, PCWSTR(wide.as_ptr()));
+        }
+    }
+
+    /// Click one of the page's buttons, the way a user does.
+    fn click(&self, id: i32) {
+        let control = self.control(id);
+        // SAFETY: `control` is a button in this dialog; `BM_CLICK` takes no payload
+        // and the control sends the resulting `WM_COMMAND` to its parent.
+        unsafe {
+            SendMessageW(control, BM_CLICK, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+    }
+
+    /// The text of the page's status line.
+    fn status_text(&self) -> String {
+        let status = self.control(resource::IDC_HASH_STATUS);
+        let mut buffer = [0u16; 512];
+        // SAFETY: `status` is the page's static control, and `buffer` is a live
+        // array of the declared length.
+        let length =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(status, &mut buffer) };
+        let length = length.max(0) as usize;
+        String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
+    }
+
     /// Wait until the list has at least `expected` rows.
     fn wait_for_rows(&self, expected: usize) {
         let deadline = Instant::now() + DEADLINE;
@@ -288,6 +322,14 @@ fn a_page_shows_its_controls() {
     assert!(page.control(resource::IDC_HASH_STATUS).0 as isize != 0);
     assert!(page.control(resource::IDC_HASH_PROGRESS).0 as isize != 0);
     assert!(page.control(resource::IDC_HASH_COPY).0 as isize != 0);
+    // The Phase 4 controls: expected-hash box, its button, and the three
+    // actions. A missing one would make the corresponding feature unreachable
+    // without any other test failing.
+    assert!(page.control(resource::IDC_HASH_EXPECTED).0 as isize != 0);
+    assert!(page.control(resource::IDC_HASH_CHECK).0 as isize != 0);
+    assert!(page.control(resource::IDC_HASH_VERIFY).0 as isize != 0);
+    assert!(page.control(resource::IDC_HASH_EXPORT).0 as isize != 0);
+    assert!(page.control(resource::IDC_HASH_SETTINGS).0 as isize != 0);
 
     // The columns are the page's own, added at `WM_INITDIALOG`.
     let list = page.control(resource::IDC_HASH_LIST);
@@ -523,9 +565,314 @@ fn the_page_survives_a_close_request() {
     page.close();
 }
 
+/// A checksum file beside the hashed file is an automatic verification source
+/// when the setting asks for one.
+#[test]
+fn a_sidecar_checksum_file_makes_the_row_match() {
+    let dir = TempDir::new("sidecar-match");
+    let contents = b"the bytes the checksum file describes";
+    let file = dir.file("payload.bin", contents);
+    std::fs::write(
+        dir.path().join("payload.bin.sha256"),
+        sumfile_body("SHA-256", contents, "payload.bin"),
+    )
+    .expect("the sidecar checksum file must be writable");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+
+    assert_eq!(
+        page.cell(0, 2),
+        "matched",
+        "the sidecar digest was not used"
+    );
+    assert_eq!(
+        page.cell(0, 3),
+        "payload.bin",
+        "the File column must show the display path"
+    );
+    page.close();
+}
+
+/// The same path, with a digest that disagrees, must say so instead of quietly
+/// treating the file as unchecked.
+#[test]
+fn a_sidecar_checksum_file_with_a_wrong_digest_is_a_mismatch() {
+    let dir = TempDir::new("sidecar-mismatch");
+    let contents = b"bytes";
+    let file = dir.file("payload.bin", contents);
+    std::fs::write(
+        dir.path().join("payload.bin.sha256"),
+        format!("{}  payload.bin\n", "0".repeat(64)),
+    )
+    .expect("the sidecar checksum file must be writable");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+
+    assert_eq!(page.cell(0, 2), "mismatch");
+    page.close();
+}
+
+/// A pasted digest is checked against the row that is selected; with one file
+/// there is no selection to make.
+#[test]
+fn pasting_the_right_digest_marks_the_row_matched() {
+    let dir = TempDir::new("paste-right");
+    let contents = b"pasted digest target";
+    let file = dir.file("payload.bin", contents);
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    assert_eq!(page.cell(0, 2), "not checked");
+
+    page.set_text(
+        resource::IDC_HASH_EXPECTED,
+        &digest_hex("SHA-256", contents),
+    );
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(page.cell(0, 2), "matched");
+    page.close();
+}
+
+/// A pasted digest names one algorithm's output; only that algorithm's row is
+/// marked. The other rows of the same file were hashed but not compared, so they
+/// stay "not checked" rather than inheriting the file's verdict.
+#[test]
+fn pasting_a_digest_marks_only_the_matching_algorithm_row() {
+    let dir = TempDir::new("paste-row");
+    let contents = b"row specific bytes";
+    let file = dir.file("payload.bin", contents);
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only_many(&["MD5", "SHA-256"]),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(2);
+    // Table order: MD5 comes before SHA-256.
+    assert_eq!(page.cell(0, 0), "MD5");
+    assert_eq!(page.cell(1, 0), "SHA-256");
+
+    page.set_text(
+        resource::IDC_HASH_EXPECTED,
+        &digest_hex("SHA-256", contents),
+    );
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(
+        page.cell(0, 2),
+        "not checked",
+        "the MD5 row was never compared against the pasted digest"
+    );
+    assert_eq!(page.cell(1, 2), "matched", "the SHA-256 row must match");
+    page.close();
+}
+
+/// A pasted digest that does not match is a mismatch, not silence.
+#[test]
+fn pasting_a_wrong_digest_is_a_mismatch() {
+    let dir = TempDir::new("paste-wrong");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.set_text(resource::IDC_HASH_EXPECTED, &"AB".repeat(32));
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(page.cell(0, 2), "mismatch");
+    page.close();
+}
+
+/// Text that is not a digest is refused with a status line, and the row's
+/// verdict is left alone: turning "not a digest" into a mismatch would accuse
+/// the file.
+#[test]
+fn pasting_something_that_is_not_a_digest_changes_nothing() {
+    let dir = TempDir::new("paste-invalid");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.set_text(resource::IDC_HASH_EXPECTED, "this is not a digest");
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(
+        page.status_text().contains("Not a hex digest"),
+        "the status line must say why nothing happened, got {:?}",
+        page.status_text()
+    );
+    page.close();
+}
+
+/// A digest no enabled algorithm can produce is refused rather than applied: the
+/// comparison layer would have nothing to compare it with and would report a
+/// mismatch against a perfectly good file.
+#[test]
+fn pasting_a_digest_of_the_wrong_length_is_refused() {
+    let dir = TempDir::new("paste-length");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    // An MD5-shaped digest while only SHA-256 is enabled.
+    page.set_text(resource::IDC_HASH_EXPECTED, &"AB".repeat(16));
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(
+        page.status_text()
+            .contains("No enabled algorithm produces that digest length"),
+        "got {:?}",
+        page.status_text()
+    );
+    page.close();
+}
+
+/// The custom-draw answer must be delivered through `DWLP_MSGRESULT`.
+///
+/// A dialog procedure's return value is a BOOL. Returning `CDRF_NOTIFYITEMDRAW`
+/// from the procedure makes the dialog manager tell the control "handled", and
+/// the control never sees the bit that asks for item notifications -- so no row
+/// is coloured while every colour-mapping test still passes.
+///
+/// This sends the notification to the **window**, not to the procedure, so the
+/// return value is what the dialog manager hands the control: exactly what
+/// comctl32 would read.
+#[test]
+fn the_custom_draw_answer_travels_through_the_dialog_message_result() {
+    use windows::Win32::UI::Controls::{
+        CDDS_PREPAINT, CDRF_NOTIFYITEMDRAW, NM_CUSTOMDRAW, NMCUSTOMDRAW_DRAW_STAGE, NMLVCUSTOMDRAW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_NOTIFY;
+
+    let dir = TempDir::new("custom-draw");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("CRC32"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+
+    let mut draw = NMLVCUSTOMDRAW::default();
+    draw.nmcd.hdr.idFrom = resource::IDC_HASH_LIST as usize;
+    draw.nmcd.hdr.code = NM_CUSTOMDRAW;
+    draw.nmcd.dwDrawStage = NMCUSTOMDRAW_DRAW_STAGE(CDDS_PREPAINT.0);
+
+    // SAFETY: `page.hwnd` is a live dialog whose procedure is the page's, and
+    // `draw` outlives the call. This is the message comctl32 sends for the list.
+    let answer = unsafe {
+        SendMessageW(
+            page.hwnd,
+            WM_NOTIFY,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut draw as *mut NMLVCUSTOMDRAW as isize)),
+        )
+    };
+    assert_eq!(
+        answer.0, CDRF_NOTIFYITEMDRAW as isize,
+        "the control must receive CDRF_NOTIFYITEMDRAW as the message result; \
+         a BOOL returned by the dialog procedure would be lost"
+    );
+
+    page.close();
+}
+
+/// The finished status line must count every file exactly once, with the verdict
+/// each file got from its own sidecar -- one match, one mismatch.
+#[test]
+fn the_finished_status_counts_each_file_once() {
+    let dir = TempDir::new("counters");
+    let good = b"good bytes";
+    let bad = b"bad bytes";
+    dir.file("good.bin", good);
+    dir.file("bad.bin", bad);
+    std::fs::write(
+        dir.path().join("good.bin.sha256"),
+        sumfile_body("SHA-256", good, "good.bin"),
+    )
+    .expect("the sidecar must be writable");
+    std::fs::write(
+        dir.path().join("bad.bin.sha256"),
+        format!("{}  bad.bin\n", "0".repeat(64)),
+    )
+    .expect("the sidecar must be writable");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![dir.path().to_path_buf()], settings);
+    page.wait_for_rows(2);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let status = page.status_text();
+        if status.contains("1 matched") && status.contains("1 mismatched") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the finished status never counted the files: {status:?}"
+        );
+        pump();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    page.close();
+}
+
 /// A settings-shaped vector with exactly one algorithm enabled.
 fn enabled_only(name: &str) -> Vec<bool> {
     enabled_only_many(&[name])
+}
+
+/// The digest of `bytes` under one algorithm, as the page displays it.
+fn digest_hex(algorithm: &str, bytes: &[u8]) -> String {
+    let mut hasher =
+        rusthashtab_hash::registry::make(algorithm).expect("the algorithm has a context");
+    hasher.update(bytes);
+    rusthashtab_sumfile::export::to_hex(&hasher.finalize(), true)
+}
+
+/// A checksum file's body for one file, in the GNU two-space style.
+fn sumfile_body(algorithm: &str, bytes: &[u8], file_name: &str) -> String {
+    format!("{}  {}\n", digest_hex(algorithm, bytes), file_name)
 }
 
 /// A settings-shaped vector with `names` enabled and nothing else.

@@ -47,6 +47,8 @@ mod route;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]
+pub mod settings_dialog;
+#[cfg(windows)]
 pub mod task;
 pub mod verify;
 #[cfg(windows)]
@@ -151,6 +153,34 @@ pub struct DialogState {
     /// The page's window handle, or `None` before `WM_INITDIALOG`.
     #[cfg(windows)]
     pub hwnd: Option<windows::Win32::Foundation::HWND>,
+    /// The module the page's resources -- including the settings dialog template
+    /// -- live in.
+    ///
+    /// The page cannot find this on its own: inside `explorer.exe` the process
+    /// module is the shell, not this DLL, so `GetModuleHandleW(None)` would hand
+    /// `DialogBoxParamW` a module with no template in it. `page::add_page` copies
+    /// it here from the `HINSTANCE` the shell supplied.
+    #[cfg(windows)]
+    pub instance: Option<windows::Win32::Foundation::HINSTANCE>,
+    /// The checksum-file read and match in flight, if any.
+    #[cfg(windows)]
+    pub verify_task: Option<task::Background<Result<crate::verify::SumfileMatch, String>>>,
+    /// The export in flight, if any.
+    #[cfg(windows)]
+    pub export_task: Option<task::Background<Result<usize, String>>>,
+    /// Sequence of the newest verification request; a completion with any other
+    /// sequence is stale and is ignored.
+    #[cfg(windows)]
+    pub verify_seq: u32,
+    /// Sequence of the newest export request.
+    #[cfg(windows)]
+    pub export_seq: u32,
+    /// The status-line label of the verification source currently being loaded.
+    ///
+    /// Stored on the dialog because the worker owns the file read; the label is
+    /// what the status line will show once the match lands.
+    #[cfg(windows)]
+    pub verify_source: Option<String>,
 }
 
 impl DialogState {
@@ -170,6 +200,18 @@ impl DialogState {
             status: None,
             #[cfg(windows)]
             hwnd: None,
+            #[cfg(windows)]
+            instance: None,
+            #[cfg(windows)]
+            verify_task: None,
+            #[cfg(windows)]
+            export_task: None,
+            #[cfg(windows)]
+            verify_seq: 0,
+            #[cfg(windows)]
+            export_seq: 0,
+            #[cfg(windows)]
+            verify_source: None,
         }
     }
 
@@ -282,7 +324,9 @@ impl UiError {
 /// stray message from an unrelated control is ignored rather than misinterpreted
 /// as progress. [`route::route`] is the only place that decision is made, and it
 /// is a pure function so it can be tested without a window.
-pub use dialog::{WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_SCAN_FINISHED};
+pub use dialog::{
+    WM_EXPORT_DONE, WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_SCAN_FINISHED, WM_VERIFY_READY,
+};
 
 /// Progress is quantised to this many steps, so a 10 GB scan does not post a
 /// message per byte.

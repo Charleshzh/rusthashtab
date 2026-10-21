@@ -32,10 +32,10 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject,
 };
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDRF_DODEFAULT, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_TEXT,
-    LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVS_EX_FULLROWSELECT, NMLVCUSTOMDRAW,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_GETNEXTITEM,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_FULLROWSELECT, NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_SETFONT};
 
@@ -45,6 +45,14 @@ const MATCHED_COLOR: ColorDef = ColorDef(0x0000_8B00);
 /// The colour a row is drawn in when a digest had an expected value and missed it:
 /// a dark red, `#C00000`, in `COLORREF` order.
 const MISMATCHED_COLOR: ColorDef = ColorDef(0x0000_00C0);
+/// The colour a row is drawn in when an expected value matched only under an
+/// algorithm that is not cryptographically secure: dark goldenrod, `#B8860B`, in
+/// `COLORREF` order.
+///
+/// Deliberately neither green nor red. A CRC32 collision is evidence, not proof,
+/// and painting it like a SHA-256 match would let a weak check pass for a strong
+/// one -- which is the whole reason the comparison layer reports `secure`.
+const WEAK_MATCH_COLOR: ColorDef = ColorDef(0x000B_86B8);
 
 /// A `COLORREF`, spelled `0x00BBGGRR`.
 ///
@@ -256,10 +264,15 @@ pub fn insert_row(list: HWND, row_index: usize, row: &ListRow) -> i32 {
     let mut algorithm_wide = wide(&algorithm);
     let mut digest_wide = wide(&digest);
     let mut matched_wide = wide(matched);
-    let mut file_wide = wide(&format!("#{}", row.job_index));
+    let mut file_wide = wide(&file_column_text(row));
 
     let mut item = LVITEMW {
         mask: LVIF_TEXT | LVIF_PARAM,
+        // The position in the list. `LVM_INSERTITEMW` takes its index from
+        // `iItem` (the `ListView_InsertItem` macro passes `wParam` as zero), so
+        // leaving this at zero inserted every row at the front and reversed the
+        // list.
+        iItem: row_index as i32,
         // The row's index in the page's list, which is how a selection is turned
         // back into rows. Not the item index: the two are the same only while rows
         // are appended in order, and that is not a property to rely on.
@@ -271,11 +284,16 @@ pub fn insert_row(list: HWND, row_index: usize, row: &ListRow) -> i32 {
     // SAFETY: `list` is the page's list view, `item` and every string it points at
     // live for the duration of the call, and `LVM_INSERTITEMW` copies what it needs.
     // The column index is carried in `iSubItem` between the two calls below.
+    //
+    // `wParam` is the item's position, not zero: zero inserts at the *front*, which
+    // silently reversed the list. The row's index in the page's list is the
+    // position it must occupy, and an index past the end is appended by the
+    // control anyway.
     let inserted = unsafe {
         SendMessageW(
             list,
             LVM_INSERTITEMW,
-            Some(WPARAM(0)),
+            Some(WPARAM(row_index)),
             Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
         )
     };
@@ -292,6 +310,24 @@ pub fn insert_row(list: HWND, row_index: usize, row: &ListRow) -> i32 {
     set_sub_item(list, index, 3, &mut file_wide);
 
     index as i32
+}
+
+/// What the File column shows for one row.
+///
+/// The job's display path, which is relative to the scan root when the scan could
+/// make it so -- the same name the user saw in the selection, and the same name an
+/// exported checksum file records.
+///
+/// Falls back to `#index` when the path is empty. That only happens before the job
+/// list has been published, but an empty cell would read as "this row belongs to no
+/// file" rather than as "this row belongs to job zero", and the index is at least
+/// true.
+fn file_column_text(row: &ListRow) -> String {
+    if row.display_path.is_empty() {
+        format!("#{}", row.job_index)
+    } else {
+        row.display_path.clone()
+    }
 }
 
 /// Set one cell of an existing item.
@@ -368,8 +404,11 @@ pub fn selected_rows(list: HWND) -> Vec<usize> {
 /// How a row should be drawn, given what its digest compared to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowColour {
-    /// An expected digest matched.
+    /// An expected digest matched under a cryptographically secure algorithm.
     Matched,
+    /// An expected digest matched, but only under a weak algorithm: a warning, not
+    /// a confirmation.
+    MatchedWeak,
     /// An expected digest did not match.
     Mismatched,
     /// Nothing to compare against, or no result.
@@ -385,50 +424,60 @@ pub fn colour_for(state: rusthashtab_scan::MatchState, failed: bool) -> RowColou
         return RowColour::Neutral;
     }
     match state {
-        rusthashtab_scan::MatchState::Matched { .. } => RowColour::Matched,
+        rusthashtab_scan::MatchState::Matched { secure: true, .. } => RowColour::Matched,
+        rusthashtab_scan::MatchState::Matched { secure: false, .. } => RowColour::MatchedWeak,
         rusthashtab_scan::MatchState::Mismatched => RowColour::Mismatched,
         rusthashtab_scan::MatchState::NotChecked => RowColour::Neutral,
     }
 }
 
-/// Apply the per-row colour while the control draws.
+/// Handle a custom-draw notification from the results list.
 ///
-/// Returns `true` when the structure was ours to alter, so the dialog procedure can
-/// answer the notification correctly. A `false` return means the caller must let the
-/// default handling continue -- swallowing someone else's custom-draw notification
-/// would leave a control that never paints.
+/// Returns the value the dialog procedure must return, or `None` when the
+/// notification did not come from this list view (the caller then answers zero,
+/// which leaves the control's default handling alone).
+///
+/// # Why `CDDS_PREPAINT` must answer `CDRF_NOTIFYITEMDRAW`
+///
+/// A common control only sends `CDDS_ITEMPREPAINT` to a parent that asked for item
+/// notifications at the prepaint stage. Answering `CDRF_DODEFAULT` there draws the
+/// list correctly but means the item stage never arrives, so `clrText` is never
+/// set and every row stays black -- a failure that no unit test of [`colour_for`]
+/// can see, because it happens before the code under test is called at all.
 ///
 /// # Safety
 ///
-/// `lparam` must be the `NMHDR` of an `NM_CUSTOMDRAW` notification sent by the list
-/// view, which is what the dialog procedure is handed for that message.
-pub unsafe fn colour_row(lparam: LPARAM, rows: &[ListRow]) -> bool {
-    // SAFETY: the caller promises this is our list view's custom-draw structure.
+/// `lparam` must be the `NMHDR` of an `NM_CUSTOMDRAW` notification, which is what
+/// the dialog procedure is handed for that message.
+pub unsafe fn custom_draw(lparam: LPARAM, rows: &[ListRow]) -> Option<isize> {
+    // SAFETY: the caller promises this is an `NM_CUSTOMDRAW` notification.
     let custom = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
-    if custom.nmcd.dwDrawStage.0 != CDDS_ITEMPREPAINT.0 {
-        return false;
+
+    // The notification carries the control id. Anything else in the page that
+    // custom-draws must be left to the default handler.
+    if custom.nmcd.hdr.idFrom != resource::IDC_HASH_LIST as usize {
+        return None;
     }
 
-    let row_index = custom.nmcd.lItemlParam.0 as usize;
-    let Some(row) = rows.get(row_index) else {
-        return false;
-    };
-
-    match colour_for(row.match_state, row.error.is_some()) {
-        RowColour::Matched => custom.clrText = MATCHED_COLOR.colorref(),
-        RowColour::Mismatched => custom.clrText = MISMATCHED_COLOR.colorref(),
-        RowColour::Neutral => {}
+    if custom.nmcd.dwDrawStage.0 == CDDS_PREPAINT.0 {
+        return Some(CDRF_NOTIFYITEMDRAW as isize);
     }
 
-    true
-}
+    if custom.nmcd.dwDrawStage.0 == CDDS_ITEMPREPAINT.0 {
+        let row_index = custom.nmcd.lItemlParam.0 as usize;
+        if let Some(row) = rows.get(row_index) {
+            match colour_for(row.match_state, row.error.is_some()) {
+                RowColour::Matched => custom.clrText = MATCHED_COLOR.colorref(),
+                RowColour::MatchedWeak => custom.clrText = WEAK_MATCH_COLOR.colorref(),
+                RowColour::Mismatched => custom.clrText = MISMATCHED_COLOR.colorref(),
+                RowColour::Neutral => {}
+            }
+        }
+    }
 
-/// Whether a custom-draw notification should call for the default painting.
-///
-/// The dialog procedure answers `NM_CUSTOMDRAW` with this: the control still has to
-/// draw the text, and returning anything else would let it stop.
-pub const fn custom_draw_result() -> isize {
-    CDRF_DODEFAULT as isize
+    // Every other stage still has to be painted. Returning zero here would let the
+    // control stop after the notification.
+    Some(CDRF_DODEFAULT as isize)
 }
 
 /// NUL-terminate a string for a Win32 parameter.
@@ -487,6 +536,76 @@ mod tests {
         assert_ne!(MATCHED_COLOR, MISMATCHED_COLOR);
     }
 
+    /// The weak-match colour is decoded the same way, and has to be a colour that
+    /// reads as neither "good" nor "bad": red and green both high, blue low.
+    #[test]
+    fn the_weak_match_colour_is_a_distinct_goldenrod() {
+        let red = (WEAK_MATCH_COLOR.0 & 0xFF) as u8;
+        let green = ((WEAK_MATCH_COLOR.0 >> 8) & 0xFF) as u8;
+        let blue = ((WEAK_MATCH_COLOR.0 >> 16) & 0xFF) as u8;
+        let reserved = (WEAK_MATCH_COLOR.0 >> 24) as u8;
+
+        assert_eq!(reserved, 0, "the reserved byte must be clear");
+        assert!(red > 0x40, "dark goldenrod has a strong red channel");
+        assert!(green > 0x40, "dark goldenrod has a strong green channel");
+        assert!(blue < 0x40, "dark goldenrod has almost no blue");
+        assert_ne!(WEAK_MATCH_COLOR, MATCHED_COLOR);
+        assert_ne!(WEAK_MATCH_COLOR, MISMATCHED_COLOR);
+    }
+
+    /// A weak match and a secure match must be visibly different: conflating them
+    /// would let a CRC32 collision read as a SHA-256 verification.
+    #[test]
+    fn a_weak_match_is_not_coloured_like_a_secure_one() {
+        let crc32 = rusthashtab_hash::ALGORITHMS
+            .iter()
+            .position(|algorithm| algorithm.name == "CRC32")
+            .expect("CRC32 is in the table");
+        let sha256 = rusthashtab_hash::ALGORITHMS
+            .iter()
+            .position(|algorithm| algorithm.name == "SHA-256")
+            .expect("SHA-256 is in the table");
+
+        assert_eq!(
+            colour_for(
+                MatchState::Matched {
+                    algorithm: crc32,
+                    secure: false
+                },
+                false
+            ),
+            RowColour::MatchedWeak
+        );
+        assert_eq!(
+            colour_for(
+                MatchState::Matched {
+                    algorithm: sha256,
+                    secure: true
+                },
+                false
+            ),
+            RowColour::Matched
+        );
+    }
+
+    /// The File column shows the job's display path, and falls back to the job index
+    /// only when there is no path to show.
+    #[test]
+    fn the_file_column_shows_the_display_path_with_an_index_fallback() {
+        let mut row = ListRow {
+            job_index: 7,
+            algorithm: usize::MAX,
+            digest_hex: String::new(),
+            match_state: MatchState::NotChecked,
+            error: Some(5),
+            display_path: String::new(),
+        };
+        assert_eq!(file_column_text(&row), "#7");
+
+        row.display_path = "nested\\file.bin".to_string();
+        assert_eq!(file_column_text(&row), "nested\\file.bin");
+    }
+
     /// A file that could not be read must not be shown as a mismatch. That
     /// distinction is made deliberately in the comparison layer, and the display
     /// undoing it would tell the user their file is corrupt.
@@ -524,9 +643,120 @@ mod tests {
     }
 
     /// The custom-draw answer must be the one that lets the control keep painting.
+    ///
+    /// This is a regression test with a specific failure behind it: answering
+    /// `CDRF_DODEFAULT` at `CDDS_PREPAINT` draws the list but suppresses
+    /// `CDDS_ITEMPREPAINT`, so no row ever gets a `clrText` and the whole colouring
+    /// feature is invisible in the real dialog while every colour-mapping unit
+    /// test still passes.
     #[test]
-    fn the_custom_draw_answer_asks_for_default_painting() {
-        assert_eq!(custom_draw_result(), CDRF_DODEFAULT as isize);
+    fn the_prepaint_stage_asks_for_item_notifications() {
+        let mut draw = custom_draw_at(CDDS_PREPAINT.0, None);
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[]) };
+        assert_eq!(answer, Some(CDRF_NOTIFYITEMDRAW as isize));
+    }
+
+    /// At the item stage the matched row gets the match colour; the answer still
+    /// has to ask for default painting or the row's text would not be drawn.
+    #[test]
+    fn the_item_stage_sets_the_text_colour() {
+        let rows = vec![
+            row_for(
+                MatchState::Matched {
+                    algorithm: 0,
+                    secure: true,
+                },
+                None,
+            ),
+            row_for(
+                MatchState::Matched {
+                    algorithm: 0,
+                    secure: false,
+                },
+                None,
+            ),
+            row_for(MatchState::Mismatched, None),
+            row_for(MatchState::NotChecked, None),
+        ];
+
+        let expected = [
+            (0usize, MATCHED_COLOR),
+            (1, WEAK_MATCH_COLOR),
+            (2, MISMATCHED_COLOR),
+            (3, ColorDef(0)),
+        ];
+        for (row, colour) in expected {
+            let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0, Some(row));
+            // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+            let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows) };
+            assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
+            assert_eq!(
+                draw.clrText,
+                colour.colorref(),
+                "row {row} was not given its colour"
+            );
+        }
+    }
+
+    /// A custom draw from another control must not be answered: answering for it
+    /// would paint someone else's control with our colours.
+    #[test]
+    fn a_notification_from_another_control_is_not_ours() {
+        let mut draw = custom_draw_at(CDDS_PREPAINT.0, None);
+        draw.nmcd.hdr.idFrom = 0x1234;
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[]) };
+        assert_eq!(answer, None);
+    }
+
+    /// A row index that no longer exists must not be coloured and must not stop
+    /// the control from painting.
+    #[test]
+    fn a_stale_row_index_is_ignored_but_still_paints() {
+        let rows = vec![row_for(MatchState::Mismatched, None)];
+        let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0, Some(99));
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows) };
+        assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
+        assert_eq!(draw.clrText, ColorDef(0).colorref());
+    }
+
+    /// Stages we do not colour must still be answered with default painting.
+    #[test]
+    fn a_stage_we_do_not_colour_still_paints() {
+        let mut draw = custom_draw_at(CDDS_PREPAINT.0 + 1, None);
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[]) };
+        assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
+    }
+
+    /// A row shaped the way the page stores it.
+    fn row_for(state: MatchState, error: Option<u32>) -> ListRow {
+        ListRow {
+            job_index: 0,
+            algorithm: 0,
+            digest_hex: String::new(),
+            match_state: state,
+            error,
+            display_path: String::from("file.bin"),
+        }
+    }
+
+    /// A custom-draw structure for one stage and one row.
+    fn custom_draw_at(stage: u32, row: Option<usize>) -> NMLVCUSTOMDRAW {
+        let mut draw = NMLVCUSTOMDRAW::default();
+        draw.nmcd.hdr.idFrom = resource::IDC_HASH_LIST as usize;
+        draw.nmcd.dwDrawStage = windows::Win32::UI::Controls::NMCUSTOMDRAW_DRAW_STAGE(stage);
+        if let Some(index) = row {
+            draw.nmcd.lItemlParam = LPARAM(index as isize);
+        }
+        draw
+    }
+
+    /// The pointer the notification's `lParam` would carry.
+    fn draw_ptr(draw: &mut NMLVCUSTOMDRAW) -> LPARAM {
+        LPARAM(draw as *mut NMLVCUSTOMDRAW as isize)
     }
 
     /// `wide` terminates exactly once, so a cell cannot run into the next one.

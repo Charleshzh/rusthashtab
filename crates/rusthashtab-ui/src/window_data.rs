@@ -102,6 +102,31 @@ pub(super) fn holds_address(value: isize) -> bool {
     }
 }
 
+/// Store the result a **dialog procedure** returns for the current message.
+///
+/// A dialog procedure's return value is a BOOL that says "handled". Messages
+/// whose result is a richer value must put that value in `DWLP_MSGRESULT` and
+/// return TRUE; otherwise the dialog manager hands the control a BOOL, not the
+/// value. Custom draw is exactly such a message: `CDRF_NOTIFYITEMDRAW` returned
+/// as the procedure's return value reaches the control as `TRUE`, so the item
+/// stage is never requested and no row is ever coloured.
+///
+/// This lives next to [`store`] because `SetWindowLongPtrW`'s value type is the
+/// same pointer-width problem, handled by [`narrow`].
+pub(super) fn set_message_result(hwnd: HWND, value: isize) {
+    // SAFETY: `hwnd` is a dialog box (only dialogs have the `DWLP_*` slots), and
+    // `narrow` is lossless for every value a message result can carry.
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(
+                windows::Win32::UI::WindowsAndMessaging::DWLP_MSGRESULT as i32,
+            ),
+            narrow(value),
+        );
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
