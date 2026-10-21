@@ -22,7 +22,9 @@ workspace = true
 
 [dependencies]
 rusthashtab-abi.workspace = true
-rusthashtab-settings.workspace = true
+# Settings are loaded through `rusthashtab_ui::load_settings`, which passes the
+# real algorithm-name table; this crate no longer names the settings crate
+# directly.
 rusthashtab-ui.workspace = true
 windows-core.workspace = true
 windows = { workspace = true, features = [

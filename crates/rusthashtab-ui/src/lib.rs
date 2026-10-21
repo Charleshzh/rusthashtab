@@ -194,6 +194,30 @@ pub(crate) fn enabled_algorithms(settings: &rusthashtab_settings::Settings) -> V
         .collect()
 }
 
+/// The algorithm table's names, in table order.
+///
+/// The one place that turns [`rusthashtab_hash::ALGORITHMS`] into the name list
+/// the settings layer indexes by. Loading settings and the settings dialog both
+/// need it, and a second spelling of the list would let them disagree about
+/// which registry value belongs to which algorithm -- the exact failure that
+/// misplaced the default algorithms once already.
+pub fn algorithm_names() -> Vec<&'static str> {
+    rusthashtab_hash::ALGORITHMS
+        .iter()
+        .map(|algorithm| algorithm.name)
+        .collect()
+}
+
+/// The persisted settings, with every algorithm flag loaded.
+///
+/// The table's names are passed in explicitly because the settings layer
+/// deliberately does not depend on the hash crate. Loading with a shorter list
+/// is the bug this function exists to prevent: it would map flags onto the wrong
+/// algorithms.
+pub fn load_settings() -> rusthashtab_settings::Settings {
+    rusthashtab_settings::Settings::default().load_with(&algorithm_names())
+}
+
 /// Errors the UI layer can produce.
 #[derive(Debug, thiserror::Error)]
 pub enum UiError {
@@ -309,6 +333,85 @@ mod tests {
             .map(|(_, algorithm)| algorithm.name)
             .collect();
         assert_eq!(names, vec!["MD5", "SHA-1", "SHA-256", "SHA-512"]);
+    }
+
+    /// The loader must map the stored flags onto **table positions**, with the
+    /// missing-value default decided per name.
+    ///
+    /// This is a regression guard with a specific history: the loader once read
+    /// the four default names in `DEFAULT_ALGORITHMS` order and put their flags
+    /// in the first four slots of an algorithm-indexed vector. On a fresh install
+    /// that enabled CRC32/CRC64/XXH32/XXH3-64 and left MD5/SHA-1/SHA-256/SHA-512
+    /// off -- the opposite of the documented default -- and every test that used
+    /// a four-name table still passed.
+    #[cfg(windows)]
+    #[test]
+    fn the_real_algorithm_table_loads_the_documented_defaults() {
+        let names = algorithm_names();
+        // A key that does not exist: the load must fall back per name and must
+        // not create anything.
+        let scratch = format!(
+            r"Software\rustHashTab-test-ui-defaults-{}",
+            std::process::id()
+        );
+        let loaded = rusthashtab_settings::Settings::default()
+            .with_key(scratch)
+            .load_with(&names);
+
+        let enabled = enabled_algorithms(&loaded);
+        let enabled_names: Vec<&str> = names
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| enabled[*index])
+            .map(|(_, name)| *name)
+            .collect();
+        assert_eq!(
+            enabled_names,
+            vec!["MD5", "SHA-1", "SHA-256", "SHA-512"],
+            "the default flags are not on the default algorithms' table positions"
+        );
+    }
+
+    /// A flag written for an algorithm that is not one of the four defaults must
+    /// come back on that same algorithm after a round trip.
+    #[cfg(windows)]
+    #[test]
+    fn every_algorithm_flag_round_trips_through_the_registry() {
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
+        use windows::core::PCWSTR;
+
+        let names = algorithm_names();
+        let scratch = format!(r"Software\rustHashTab-test-ui-flags-{}", std::process::id());
+        let wide: Vec<u16> = scratch.encode_utf16().chain(core::iter::once(0)).collect();
+
+        let mut settings = rusthashtab_settings::Settings::default().with_key(&scratch);
+        settings.algorithms = vec![false; names.len()];
+        for wanted in ["CRC32", "BLAKE3", "GOST 2012 (512)"] {
+            let index = names
+                .iter()
+                .position(|name| *name == wanted)
+                .expect("the algorithm is in the table");
+            settings.algorithms[index] = true;
+        }
+
+        settings
+            .save(&names)
+            .expect("a scratch settings key must be writable");
+        let loaded = rusthashtab_settings::Settings::default()
+            .with_key(&scratch)
+            .load_with(&names);
+
+        // SAFETY: the key is a NUL-terminated scratch key under HKCU, and the
+        // buffer outlives the call; deleting a key that exists is what this is
+        // for. The result is checked below rather than ignored.
+        let deleted = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide.as_ptr())) };
+        assert_eq!(deleted, ERROR_SUCCESS, "left a scratch settings key behind");
+
+        assert_eq!(
+            loaded.algorithms, settings.algorithms,
+            "algorithm flags did not round-trip through their own registry values"
+        );
     }
 
     /// Every algorithm this page turns on must have a context, or the scan would

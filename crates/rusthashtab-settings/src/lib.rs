@@ -20,11 +20,19 @@
 //!
 //! # Reading is total
 //!
-//! [`Settings::load`] never fails. A missing key, a value of the wrong type, a
+//! [`Settings::load_with`] never fails. A missing key, a value of the wrong type, a
 //! truncated value, a registry that cannot be opened -- every one of them yields
 //! the default for that field and nothing else. This runs while the shell is
 //! building a property sheet, and the user's view of their files must not depend
 //! on whether a registry read succeeded.
+//!
+//! # Writing reports failures
+//!
+//! [`Settings::save`] is the opposite of a read: it returns an error naming the
+//! value and the Win32 code, because a user who changes an option and is told
+//! nothing must not be left believing it stuck. Reading stays total because no
+//! answer the user could give would make a failed read more useful than the
+//! default.
 
 #![warn(missing_docs)]
 
@@ -110,6 +118,45 @@ impl Default for Settings {
 /// empty — must agree.
 pub const DEFAULT_ALGORITHMS: [&str; 4] = ["MD5", "SHA-1", "SHA-256", "SHA-512"];
 
+/// Why [`Settings::save`] could not write the settings block.
+///
+/// Saving is the one operation in this crate that can fail visibly: a settings
+/// dialog that silently loses a change is worse than one that says it could not
+/// keep it.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveError {
+    /// Registry value name that could not be written.
+    ///
+    /// Empty when the settings key itself could not be created, since in that
+    /// case no particular value was reached.
+    pub value: String,
+    /// Win32 error code returned by the failing registry call.
+    pub code: u32,
+}
+
+#[cfg(windows)]
+impl core::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.value.is_empty() {
+            write!(
+                f,
+                "could not create the settings registry key (Win32 error {})",
+                self.code
+            )
+        } else {
+            write!(
+                f,
+                "could not write the `{}` setting (Win32 error {})",
+                self.value, self.code
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+impl core::error::Error for SaveError {}
+
 impl Settings {
     /// Registry value name for a given field, for `RegGetValueW`/`RegSetKeyValueW`.
     ///
@@ -139,19 +186,47 @@ impl Settings {
         self
     }
 
-    /// Read every setting from the registry, falling back per field.
+    /// Read every setting from the registry, with one algorithm flag per name in
+    /// `algorithm_names`.
+    ///
+    /// [`Settings::algorithms`] comes back with exactly one entry per name, in
+    /// the same order, so the caller can index it with algorithm-table
+    /// positions. A name with no stored value keeps its default: membership in
+    /// [`DEFAULT_ALGORITHMS`], not `false`. That is the whole point of doing the
+    /// fallback by name rather than by position -- an algorithm table that
+    /// reorders or inserts entries must not silently switch an algorithm on or
+    /// off for an existing install.
     ///
     /// Never fails: see the module documentation.
     #[must_use]
-    pub fn load(self) -> Self {
+    pub fn load_with(self, algorithm_names: &[&str]) -> Self {
         #[cfg(windows)]
         {
-            registry::load(self)
+            registry::load(self, algorithm_names)
         }
         #[cfg(not(windows))]
         {
+            let _ = algorithm_names;
             self
         }
+    }
+
+    /// Write every setting to the registry.
+    ///
+    /// Creates the key when it does not exist. The ten non-algorithm options are
+    /// written first as `DWORD`s, then one `DWORD` per entry in
+    /// `algorithm_names`, holding whether that position is enabled according to
+    /// [`Settings::is_enabled`]. `is_enabled` is what the write goes through so
+    /// that a settings object which was never loaded still persists the default
+    /// set rather than an empty one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SaveError`], naming the value that could not be written (empty
+    /// when the key itself could not be created) and the Win32 error code.
+    #[cfg(windows)]
+    pub fn save(&self, algorithm_names: &[&str]) -> Result<(), SaveError> {
+        registry::save(self, algorithm_names)
     }
 
     /// Whether the algorithm at `index` is enabled.
@@ -189,9 +264,12 @@ mod registry {
     //! The Win32 half, kept in one module so the data model above stays testable
     //! and dependency-free.
 
-    use super::{DEFAULT_ALGORITHMS, Settings};
+    use super::{DEFAULT_ALGORITHMS, SaveError, Settings};
     use windows::Win32::Foundation::ERROR_SUCCESS;
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+        RRF_RT_REG_DWORD, RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW,
+    };
     use windows::core::PCWSTR;
 
     /// Read one `DWORD`, or `None` when it is absent, of the wrong type, or the
@@ -240,7 +318,11 @@ mod registry {
 
     /// Read every field, leaving `settings`' current value in place for any that
     /// could not be read.
-    pub(super) fn load(mut settings: Settings) -> Settings {
+    ///
+    /// `algorithm_names` is repeated from the caller rather than being a
+    /// constant because the algorithm table lives in `rusthashtab-hash`, which
+    /// this crate deliberately does not depend on.
+    pub(super) fn load(mut settings: Settings, algorithm_names: &[&str]) -> Settings {
         let key = settings.key.clone();
 
         settings.display_uppercase =
@@ -268,13 +350,122 @@ mod registry {
             read_bool(&key, "SumfileBannerDate", settings.sumfile_banner_date);
 
         // The algorithm flags are named after the algorithms themselves, so the
-        // list can only be built by asking for each name in turn.
-        settings.algorithms = DEFAULT_ALGORITHMS
+        // list can only be built by asking for each name in turn. The fallback
+        // is "is this one of the defaults", looked up *by name*: matching by
+        // position would flip a user's setting the day the table is reordered.
+        settings.algorithms = algorithm_names
             .iter()
-            .map(|name| read_bool(&key, name, true))
+            .map(|name| read_bool(&key, name, DEFAULT_ALGORITHMS.contains(name)))
             .collect();
 
         settings
+    }
+
+    /// Write one `DWORD`, naming the value in the error if the write fails.
+    fn write_dword(key: HKEY, name: &str, value: u32) -> Result<(), SaveError> {
+        let name_wide = wide(name);
+        let bytes = value.to_ne_bytes();
+
+        // SAFETY: `key` was opened by the caller and is still open; `name_wide`
+        // is NUL-terminated and outlives the call, and `bytes` is a live array
+        // exactly four bytes long, so the API cannot read past it.
+        let status = unsafe {
+            RegSetValueExW(
+                key,
+                PCWSTR(name_wide.as_ptr()),
+                None,
+                REG_DWORD,
+                Some(&bytes),
+            )
+        };
+
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(SaveError {
+                value: name.to_string(),
+                code: status.0,
+            })
+        }
+    }
+
+    /// A bool as the `DWORD` the settings model stores it as.
+    fn write_bool(key: HKEY, name: &str, enabled: bool) -> Result<(), SaveError> {
+        write_dword(key, name, u32::from(enabled))
+    }
+
+    /// Write every setting, one value at a time, so the first failure can be
+    /// attributed to the value that caused it.
+    fn write_all(
+        key: HKEY,
+        settings: &Settings,
+        algorithm_names: &[&str],
+    ) -> Result<(), SaveError> {
+        write_bool(key, "DisplayUppercase", settings.display_uppercase)?;
+        write_bool(key, "DisplayMonospace", settings.display_monospace)?;
+        write_bool(key, "LookForSumfiles", settings.look_for_sumfiles)?;
+        write_bool(key, "SumfileUppercase", settings.sumfile_uppercase)?;
+        write_bool(key, "SumfileLF", settings.sumfile_unix_endings)?;
+        write_bool(key, "SumfileDoubleSpace", settings.sumfile_double_space)?;
+        write_bool(key, "SumfileForwardSlash", settings.sumfile_forward_slashes)?;
+        write_bool(
+            key,
+            "SumfileDotHashCompat",
+            settings.sumfile_dot_hash_compatible,
+        )?;
+        write_bool(key, "SumfileBanner", settings.sumfile_banner)?;
+        write_bool(key, "SumfileBannerDate", settings.sumfile_banner_date)?;
+
+        // Going through `is_enabled` (rather than indexing the vector directly)
+        // means a settings object that was never loaded persists the default set
+        // instead of an empty one, which is what a fresh install must do.
+        for (index, name) in algorithm_names.iter().enumerate() {
+            write_bool(key, name, settings.is_enabled(index, algorithm_names))?;
+        }
+
+        Ok(())
+    }
+
+    /// Create the key if needed, write every value, and close the key on every
+    /// path -- including the failing ones, so a failed save does not leak a
+    /// handle into the property-sheet thread.
+    pub(super) fn save(settings: &Settings, algorithm_names: &[&str]) -> Result<(), SaveError> {
+        let key_wide = wide(&settings.key);
+        let mut key = HKEY::default();
+
+        // SAFETY: `key_wide` is NUL-terminated and outlives the call; `key` is a
+        // live local written by the API only on success. `None` is allowed for
+        // the class and the disposition, neither of which is used here.
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key_wide.as_ptr()),
+                None,
+                PCWSTR::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                None,
+                &mut key,
+                None,
+            )
+        };
+
+        if status != ERROR_SUCCESS {
+            return Err(SaveError {
+                value: String::new(),
+                code: status.0,
+            });
+        }
+
+        let result = write_all(key, settings, algorithm_names);
+
+        // SAFETY: `key` was opened by `RegCreateKeyExW` above and is closed
+        // exactly once here; the handle is never used after this call.
+        unsafe {
+            let _ = RegCloseKey(key);
+        }
+
+        result
     }
 
     /// NUL-terminate a Rust string for a `PCWSTR` parameter.
@@ -287,6 +478,13 @@ mod registry {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    #[cfg(windows)]
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    #[cfg(windows)]
+    use windows::core::PCWSTR;
 
     /// A names list shaped like the algorithm table, for the tests that need one
     /// without depending on the hash crate.
@@ -402,30 +600,253 @@ mod tests {
     /// zeroes or an error: this runs while the shell builds a property sheet.
     ///
     /// The algorithm vector is compared separately because a successful load
-    /// spells the default set out explicitly -- `[true; 4]` rather than the empty
-    /// "never chosen" vector -- and both are read the same way by
-    /// [`Settings::is_enabled`]. That difference is deliberate: the loader records
+    /// spells the default set out explicitly -- one entry per name, with the four
+    /// documented defaults on and everything else off -- rather than the empty
+    /// "never chosen" vector. Both are read the same way by
+    /// [`Settings::is_enabled`]; the difference is deliberate: the loader records
     /// what it actually found, and the "never chosen" state only exists for a
     /// settings object that was never loaded.
     #[cfg(windows)]
     #[test]
     fn a_missing_key_yields_the_defaults() {
-        let scratch = format!(r"Software\rustHashTab-test-missing-{}", std::process::id());
-        let loaded = Settings::default().with_key(scratch).load();
+        let names = ["CRC32", "MD5", "SHA-1", "SHA-256", "SHA-512", "BLAKE3"];
+        let scratch = scratch_key("missing-key");
+        let loaded = Settings::default().with_key(scratch).load_with(&names);
 
         let expected = Settings {
-            algorithms: vec![true; DEFAULT_ALGORITHMS.len()],
+            algorithms: vec![false, true, true, true, true, false],
             key: loaded.key.clone(),
             ..Settings::default()
         };
         assert_eq!(loaded, expected);
 
         // And the enabled set is the default one either way.
-        let names = ["MD5", "SHA-1", "SHA-256", "SHA-512", "BLAKE3"];
         assert_eq!(
             loaded.enabled_indices(&names),
             Settings::default().enabled_indices(&names)
         );
+    }
+
+    /// The default set is matched by *name*. With the four defaults scattered
+    /// through the table rather than leading it, the flags must still land on
+    /// MD5/SHA-1/SHA-256/SHA-512 and nowhere else -- reading flags positionally
+    /// would switch CRC32 on and SHA-512 off on an install that never chose.
+    #[cfg(windows)]
+    #[test]
+    fn the_default_set_is_matched_by_name_not_position() {
+        let names = ["CRC32", "BLAKE3-512", "MD5", "SHA-1", "SHA-256", "SHA-512"];
+        let loaded = Settings::default()
+            .with_key(scratch_key("defaults-by-name"))
+            .load_with(&names);
+
+        assert_eq!(
+            loaded.algorithms,
+            vec![false, false, true, true, true, true]
+        );
+        assert_eq!(loaded.enabled_indices(&names), vec![2, 3, 4, 5]);
+    }
+
+    /// 31 distinct names, shaped like an algorithm table. The real names live in
+    /// `rusthashtab-hash` and this crate deliberately does not depend on it:
+    /// settings storage only cares that names are unique and stable.
+    #[cfg(windows)]
+    fn algorithm_names(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("Algo{index}")).collect()
+    }
+
+    /// Borrow a name table as the `&[&str]` the public API takes.
+    #[cfg(windows)]
+    fn name_refs(names: &[String]) -> Vec<&str> {
+        names.iter().map(String::as_str).collect()
+    }
+
+    /// A scratch key unique to this process *and* test, so the registry tests
+    /// can run in parallel without ever seeing each other's values.
+    #[cfg(windows)]
+    fn scratch_key(test: &str) -> String {
+        format!(r"Software\rustHashTab-test-{}-{test}", std::process::id())
+    }
+
+    /// NUL-terminate a Rust string for a `PCWSTR` parameter.
+    #[cfg(windows)]
+    fn wide_nul(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(core::iter::once(0)).collect()
+    }
+
+    /// A scratch key that deletes itself when the test ends, including when it
+    /// ends in a panic.
+    #[cfg(windows)]
+    struct ScratchKey {
+        path: String,
+    }
+
+    #[cfg(windows)]
+    impl ScratchKey {
+        fn new(test: &str) -> Self {
+            Self {
+                path: scratch_key(test),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ScratchKey {
+        fn drop(&mut self) {
+            let wide = wide_nul(&self.path);
+            // SAFETY: the key name is NUL-terminated and outlives the call.
+            // Deleting a key that was never created reports
+            // `ERROR_FILE_NOT_FOUND`, which is not a leak.
+            let status = unsafe {
+                windows::Win32::System::Registry::RegDeleteTreeW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(wide.as_ptr()),
+                )
+            };
+
+            // Do not panic while already unwinding: that would abort the whole
+            // test process instead of preserving the original failure.
+            if !std::thread::panicking() {
+                assert!(
+                    status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND,
+                    "left scratch key `{}` behind (Win32 error {})",
+                    self.path,
+                    status.0
+                );
+            }
+        }
+    }
+
+    /// Read one `DWORD` straight out of a scratch key, so a test can check what
+    /// `save` wrote rather than only what `load` can recover.
+    #[cfg(windows)]
+    fn scratch_dword(key: &str, name: &str) -> Option<u32> {
+        use windows::Win32::System::Registry::{RRF_RT_REG_DWORD, RegGetValueW};
+
+        let key_wide = wide_nul(key);
+        let name_wide = wide_nul(name);
+        let mut value: u32 = 0;
+        let mut size = core::mem::size_of::<u32>() as u32;
+
+        // SAFETY: both wide strings are NUL-terminated and outlive the call;
+        // `value` and `size` are live locals and `size` describes the buffer
+        // `value` provides.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key_wide.as_ptr()),
+                PCWSTR(name_wide.as_ptr()),
+                RRF_RT_REG_DWORD,
+                None,
+                Some((&mut value as *mut u32).cast()),
+                Some(&mut size),
+            )
+        };
+
+        (status == ERROR_SUCCESS && size == core::mem::size_of::<u32>() as u32).then_some(value)
+    }
+
+    /// A full save/load round trip over every field, with 31 algorithms all
+    /// switched off. That combination is the one a positional reader or an
+    /// "empty means default" writer gets wrong, so it is the one pinned here.
+    #[cfg(windows)]
+    #[test]
+    fn save_then_load_round_trips_every_field() {
+        let names = algorithm_names(31);
+        let name_refs = name_refs(&names);
+        let scratch = ScratchKey::new("round-trip");
+
+        // Every non-algorithm field is moved away from its default, so a writer
+        // that skipped one cannot be hidden by the read fallback.
+        let saved = Settings {
+            display_uppercase: false,
+            display_monospace: false,
+            look_for_sumfiles: true,
+            sumfile_uppercase: false,
+            sumfile_unix_endings: false,
+            sumfile_double_space: true,
+            sumfile_forward_slashes: false,
+            sumfile_dot_hash_compatible: false,
+            sumfile_banner: false,
+            sumfile_banner_date: true,
+            algorithms: vec![false; name_refs.len()],
+            key: scratch.path.clone(),
+        };
+
+        saved.save(&name_refs).expect("save must succeed");
+
+        let loaded = Settings::default()
+            .with_key(scratch.path.clone())
+            .load_with(&name_refs);
+
+        assert_eq!(
+            loaded.algorithms.len(),
+            name_refs.len(),
+            "one flag per name, in name-table order"
+        );
+        assert_eq!(
+            loaded.algorithms,
+            vec![false; name_refs.len()],
+            "all 31 flags must stay off"
+        );
+        for index in 0..name_refs.len() {
+            assert!(
+                !loaded.is_enabled(index, &name_refs),
+                "algorithm {index} came back enabled"
+            );
+        }
+
+        assert_eq!(loaded, saved);
+    }
+
+    /// `save` must write a value for *every* name, including the ones that end
+    /// up false: a missing value would silently re-enable a default algorithm on
+    /// the next load, which is exactly what a read fallback hides.
+    #[cfg(windows)]
+    #[test]
+    fn save_writes_one_dword_per_algorithm_name() {
+        let names = algorithm_names(31);
+        let name_refs = name_refs(&names);
+        let scratch = ScratchKey::new("algorithm-values");
+
+        let enabled: Vec<bool> = (0..names.len()).map(|index| index % 3 == 0).collect();
+        let saved = Settings {
+            algorithms: enabled,
+            key: scratch.path.clone(),
+            ..Settings::default()
+        };
+
+        saved.save(&name_refs).expect("save must succeed");
+
+        for (index, name) in name_refs.iter().enumerate() {
+            let expected = u32::from(saved.is_enabled(index, &name_refs));
+            assert_eq!(
+                scratch_dword(&scratch.path, name),
+                Some(expected),
+                "`{name}` was not written with the expected value"
+            );
+        }
+    }
+
+    /// The message has to name the setting: the settings dialog has nowhere
+    /// else to learn which write failed.
+    #[cfg(windows)]
+    #[test]
+    fn the_save_error_names_the_failing_setting() {
+        let error = SaveError {
+            value: "DisplayUppercase".to_string(),
+            code: 5,
+        };
+        let message = error.to_string();
+        assert!(message.contains("DisplayUppercase"), "{message}");
+        assert!(message.contains('5'), "{message}");
+
+        // A key-creation failure has no value name, so the message must not
+        // look like a write of a value called "" failed.
+        let key_error = SaveError {
+            value: String::new(),
+            code: 5,
+        };
+        assert!(key_error.to_string().contains("key"), "{key_error}");
     }
 
     /// The real round trip: write values, read them back, and remove the scratch
@@ -433,17 +854,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn written_values_are_read_back_and_a_wrong_type_falls_back() {
-        use windows::Win32::Foundation::ERROR_SUCCESS;
         use windows::Win32::System::Registry::{
-            HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
-            RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+            HKEY, KEY_ALL_ACCESS, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+            RegCreateKeyExW, RegSetValueExW,
         };
-        use windows::core::{PCWSTR, w};
-
-        /// NUL-terminate a Rust string for a `PCWSTR` parameter.
-        fn wide(text: &str) -> Vec<u16> {
-            text.encode_utf16().chain(core::iter::once(0)).collect()
-        }
+        use windows::core::w;
 
         /// Write one value, panicking on failure: a test that cannot write what
         /// it intends to read is not testing the reader.
@@ -459,8 +874,8 @@ mod tests {
             assert_eq!(status, ERROR_SUCCESS, "could not write a scratch value");
         }
 
-        let scratch = format!(r"Software\rustHashTab-test-{}", std::process::id());
-        let scratch_wide = wide(&scratch);
+        let scratch = ScratchKey::new("wrong-type");
+        let scratch_wide = wide_nul(&scratch.path);
 
         let mut key = HKEY::default();
         // SAFETY: the key name is NUL-terminated and outlives the call, and both
@@ -485,21 +900,21 @@ mod tests {
         write(key, w!("SHA-256"), REG_DWORD, &1u32.to_ne_bytes());
         // A string where a `DWORD` belongs: the loader has to refuse it rather
         // than reinterpret its first four bytes as a number.
-        let wrong_type: Vec<u8> = wide("not a number")
+        let wrong_type: Vec<u8> = wide_nul("not a number")
             .iter()
             .flat_map(|unit| unit.to_ne_bytes())
             .collect();
         write(key, w!("DisplayMonospace"), REG_SZ, &wrong_type);
 
-        let loaded = Settings::default().with_key(&scratch).load();
+        let names = ["CRC32", "MD5", "SHA-1", "SHA-256", "SHA-512", "BLAKE3"];
+        let loaded = Settings::default()
+            .with_key(&scratch.path)
+            .load_with(&names);
 
         // SAFETY: `key` was opened above and is closed exactly once.
         unsafe {
             let _ = RegCloseKey(key);
         }
-        // SAFETY: the key name is NUL-terminated and outlives the call.
-        let deleted = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(scratch_wide.as_ptr())) };
-        assert_eq!(deleted, ERROR_SUCCESS, "left a scratch key behind");
 
         // The written values came back...
         assert!(
@@ -518,7 +933,11 @@ mod tests {
         );
 
         // The algorithm flags are read from a known list of names, so a key with
-        // no algorithm values at all leaves every one of them at its fallback.
-        assert_eq!(loaded.algorithms, vec![true, true, true, true]);
+        // no algorithm values at all leaves every one of them at its fallback:
+        // the four documented defaults on, and the rest off.
+        assert_eq!(
+            loaded.algorithms,
+            vec![false, true, true, true, true, false]
+        );
     }
 }

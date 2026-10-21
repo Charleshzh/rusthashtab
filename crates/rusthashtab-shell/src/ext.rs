@@ -142,8 +142,11 @@ impl IShellPropSheetExt_Impl for HashPropSheet_Impl {
             // Read once, here, on the dialog's thread: `RegGetValueW` is a
             // handful of microseconds and the alternative -- loading settings on
             // the hashing thread -- would let the user's first view of the page
-            // show defaults that then change under them.
-            let settings = rusthashtab_settings::Settings::default().load();
+            // show defaults that then change under them. The UI loads with the
+            // real algorithm table's names, because the settings layer
+            // deliberately does not depend on the hash crate and a shorter list
+            // would map flags onto the wrong algorithms.
+            let settings = rusthashtab_ui::load_settings();
             let instance = crate::module::instance()
                 .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
 
