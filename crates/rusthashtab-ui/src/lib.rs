@@ -35,6 +35,7 @@
 pub mod clipboard;
 #[cfg(windows)]
 pub mod dialog;
+pub mod export;
 #[cfg(windows)]
 pub mod listview;
 #[cfg(windows)]
@@ -46,10 +47,29 @@ mod route;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]
+pub mod task;
+pub mod verify;
+#[cfg(windows)]
 mod window_data;
 
 use rusthashtab_hash::Algorithm;
 use rusthashtab_scan::MatchState;
+
+/// One file the page is hashing, as the parts of it the UI needs.
+///
+/// The scanner's [`rusthashtab_scan::FileJob`] carries the same information plus
+/// a size and the expected digests, none of which the page retains: the expected
+/// digests change while the page is open (a pasted hash, a checksum file), and
+/// the size is only used by the scan. Keeping a display path next to the
+/// absolute path is what lets the File column and an exported checksum file agree
+/// on the name the user saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobSpec {
+    /// Absolute, normalized path, as the scanner opened it.
+    pub path: std::path::PathBuf,
+    /// How the file is shown: relative to the scan root when possible.
+    pub display_path: String,
+}
 
 /// One row in the results list.
 #[derive(Debug, Clone, PartialEq, Eq)]
