@@ -63,9 +63,15 @@ mod patterns {
     }
 
     /// SFV: filename, whitespace, 8 hex digits.
+    ///
+    /// `(.*\S)` is deliberately greedy and allows spaces inside the filename —
+    /// SFV has no quoting, so the *last* whitespace-separated token is the
+    /// checksum and everything before it is the name. Anchoring the checksum at
+    /// `$` is what makes "last token" unambiguous instead of guessing where the
+    /// name ends.
     pub(super) fn sfv_re() -> &'static regex::Regex {
         static RE: OnceLock<regex::Regex> = OnceLock::new();
-        RE.get_or_init(|| regex::Regex::new(r"^([^ ]++)\s++([0-9a-fA-F]{8})").expect("literal"))
+        RE.get_or_init(|| regex::Regex::new(r"^(.*\S)\s+([0-9a-fA-F]{8})\s*$").expect("literal"))
     }
 }
 
@@ -133,16 +139,11 @@ impl SumFileParser {
             return None;
         }
 
-        if matches!(self.style, ParseStyle::Unknown | ParseStyle::Sfv)
-            && let Some(c) = sfv_re().captures(trimmed)
-        {
-            let file = c[1].trim_end().to_string();
-            if let Some(digest) = hex_to_bytes(&c[2]) {
-                self.style = ParseStyle::Sfv;
-                return Some(FileSum { path: file, digest });
-            }
-        }
-
+        // Hex first: it is the dominant format, and when a line could be read
+        // either way the hex rule wins. `abcdef12  deadbeef`, for example, is a
+        // hex digest plus a filename under the GNU rule and a filename plus a
+        // CRC32 under the SFV rule. Deferring SFV to the second position means
+        // it only ever sees lines hex could not parse.
         if matches!(self.style, ParseStyle::Unknown | ParseStyle::Hex)
             && let Some(c) = hex_re().captures(trimmed)
             && let Some(digest) = hex_to_bytes(&c[1])
@@ -152,6 +153,16 @@ impl SumFileParser {
                 path: c[2].to_string(),
                 digest,
             });
+        }
+
+        if matches!(self.style, ParseStyle::Unknown | ParseStyle::Sfv)
+            && let Some(c) = sfv_re().captures(trimmed)
+        {
+            let file = c[1].trim_end().to_string();
+            if let Some(digest) = hex_to_bytes(&c[2]) {
+                self.style = ParseStyle::Sfv;
+                return Some(FileSum { path: file, digest });
+            }
         }
 
         if matches!(self.style, ParseStyle::Unknown | ParseStyle::Base64)
@@ -273,6 +284,41 @@ mod tests {
         // Filename comes first in SFV.
         assert_eq!(out.entries[0].path, "file.txt");
         assert_eq!(out.entries[0].digest, vec![0x5B, 0x72, 0x1D, 0x06]);
+    }
+
+    /// SFV has no quoting, so a filename containing spaces is everything before
+    /// the final whitespace-separated checksum.
+    #[test]
+    fn parses_sfv_with_spaces_in_the_filename() {
+        let out = parse_all("my archive file.7z 5B721D06\n");
+        assert_eq!(out.style, ParseStyle::Sfv);
+        assert!(!out.had_error);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].path, "my archive file.7z");
+        assert_eq!(out.entries[0].digest, vec![0x5B, 0x72, 0x1D, 0x06]);
+    }
+
+    /// GNU-style lines put the checksum first. SFV's "last token is the
+    /// checksum" rule would also match one of these, reading the digest as the
+    /// filename; hex is tried first so that cannot happen.
+    #[test]
+    fn a_gnu_hex_line_is_not_misread_as_sfv() {
+        let out = parse_all("5B721D06  file.txt\n");
+        assert_eq!(out.style, ParseStyle::Hex);
+        assert!(!out.had_error);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].path, "file.txt");
+        assert_eq!(out.entries[0].digest, vec![0x5B, 0x72, 0x1D, 0x06]);
+    }
+
+    /// An SFV filename may itself start with hex-looking characters; only a
+    /// trailing 8-hex token is a checksum, so the whole name must be kept.
+    #[test]
+    fn an_sfv_name_that_looks_hex_is_still_a_name() {
+        let out = parse_all("deadbeef.txt 5B721D06\n");
+        assert_eq!(out.style, ParseStyle::Sfv);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].path, "deadbeef.txt");
     }
 
     #[test]
