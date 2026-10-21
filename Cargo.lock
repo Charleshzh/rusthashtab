@@ -472,7 +472,6 @@ name = "rusthashtab-shell"
 version = "0.1.0"
 dependencies = [
  "rusthashtab-abi",
- "rusthashtab-settings",
  "rusthashtab-ui",
  "windows",
  "windows-core",
@@ -807,6 +806,7 @@ dependencies = [
  "hex",
  "regex",
  "rusthashtab-hash",
+ "rusthashtab-sumfile",
  "serde_json",
 ]
 

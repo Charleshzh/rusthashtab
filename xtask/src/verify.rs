@@ -16,6 +16,10 @@
 //!   publishes machine-readable vectors (BLAKE3, BLAKE2). Each directory's
 //!   `PROVENANCE.md` records where the file came from; a missing or malformed
 //!   file is a hard failure, not a skip.
+//! * **Real checksum files** for the sumfile layer: `sha256sum` and `openssl`
+//!   write files that our parser must read, and `sha256sum -c` must accept the
+//!   file our exporter wrote. That is checked by [`crate::sumfile_check`] after
+//!   the digest differentials below.
 //!
 //! # Payload sizes
 //!
@@ -74,7 +78,10 @@ fn payload(n: usize) -> Vec<u8> {
 }
 
 /// Locate a tool on `PATH`.
-fn find(tool: &str) -> Option<PathBuf> {
+///
+/// Shared with [`crate::sumfile_check`], whose `sha256sum` and `7z` lookups
+/// start here and fall back to their well-known install directories.
+pub(crate) fn find(tool: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exts: &[&str] = if cfg!(windows) {
         &["", ".exe", ".cmd", ".bat"]
@@ -274,6 +281,11 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
     let _ = std::fs::remove_dir_all(&tmp);
 
+    // The checksum-file layer, after the digest differentials: real files
+    // produced by tools we do not control, in the shapes users actually have.
+    // Running it first would bury a digest mismatch under sumfile output.
+    let sumfile_ok = crate::sumfile_check::run(require_tools, openssl.as_deref());
+
     if !skipped.is_empty() {
         println!("\nSkipped (tool could not supply this algorithm):");
         for (name, why) in &skipped {
@@ -300,7 +312,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         COVERAGE.len()
     );
 
-    if failed > 0 {
+    if failed > 0 || !sumfile_ok {
         eprintln!("\nVERIFICATION FAILED");
         ExitCode::FAILURE
     } else {

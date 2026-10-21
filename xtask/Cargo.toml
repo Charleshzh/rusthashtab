@@ -13,6 +13,9 @@ workspace = true
 
 [dependencies]
 rusthashtab-hash.workspace = true
+# The parser and exporter under test: `verify` feeds them files produced by
+# real checksum tools and hands their output back to those tools.
+rusthashtab-sumfile.workspace = true
 hex.workspace = true
 serde_json.workspace = true
 base64.workspace = true

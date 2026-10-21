@@ -16,6 +16,7 @@
 mod bench;
 mod coverage;
 mod shell;
+mod sumfile_check;
 mod verify;
 
 use std::process::{Command, ExitCode};
@@ -114,7 +115,10 @@ cargo xtask <command>
             all three triples so a 32-bit-only compile error cannot hide.
             --target <triple>   Check only that target.
 
-  verify    Check digests against external authorities (OpenSSL, frozen vectors).
+  verify    Check digests against external authorities (OpenSSL, frozen vectors),
+            then cross-check real checksum files: sha256sum and openssl write
+            files our sumfile parser must read, and sha256sum -c must accept our
+            export. 7z is the external authority for SFV's CRC32 values.
             --require-tools   Fail instead of skipping when a tool is missing.
 
   bench     Measure throughput per algorithm.
