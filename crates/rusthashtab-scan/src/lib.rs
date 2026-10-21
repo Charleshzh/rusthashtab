@@ -59,7 +59,6 @@ pub mod path;
 
 #[cfg(windows)]
 mod cancel;
-#[cfg(windows)]
 mod compare;
 #[cfg(windows)]
 mod engine;
@@ -70,6 +69,7 @@ mod reader;
 
 use std::path::PathBuf;
 
+pub use compare::match_state;
 pub use path::{FILE_ATTRIBUTE_REPARSE_POINT, expand_selection, normalize_path};
 
 #[cfg(windows)]

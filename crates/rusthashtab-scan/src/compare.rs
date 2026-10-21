@@ -19,12 +19,32 @@ use rusthashtab_hash::ALGORITHMS;
 /// and also when the file could not be read: a read failure is reported through
 /// [`FileResult::error`], and counting it as a mismatch would tell the user their
 /// file is corrupt when in fact it was merely unreadable.
-pub(crate) fn match_state(
-    result: &FileResult,
-    expected: &[Vec<u8>],
-    enabled: &[bool],
-) -> MatchState {
-    if result.error.is_some() || expected.is_empty() {
+///
+/// Expected digests whose length is not the output length of any *enabled*
+/// algorithm are dropped before anything is compared. A sumfile can list the
+/// same file under several algorithms, and a digest from an algorithm that is
+/// currently disabled says nothing about whether the file matches: comparing its
+/// bytes against a different algorithm's digest would report a mismatch for a
+/// file that is actually fine. If every expected digest is dropped this way,
+/// there was nothing to check and the answer is [`MatchState::NotChecked`].
+pub fn match_state(result: &FileResult, expected: &[Vec<u8>], enabled: &[bool]) -> MatchState {
+    if result.error.is_some() {
+        return MatchState::NotChecked;
+    }
+
+    // Whether a digest of this length could belong to any enabled algorithm. A
+    // plain length check, not a content check: the point is only to discard
+    // expected digests that cannot be the output of anything we hashed.
+    let length_is_checkable = |len: usize| {
+        ALGORITHMS.iter().enumerate().any(|(index, algorithm)| {
+            enabled.get(index).copied().unwrap_or(false) && algorithm.output_len == len
+        })
+    };
+
+    if !expected
+        .iter()
+        .any(|candidate| length_is_checkable(candidate.len()))
+    {
         return MatchState::NotChecked;
     }
 
@@ -39,7 +59,7 @@ pub(crate) fn match_state(
             _ => continue,
         };
         for candidate in expected {
-            if candidate.as_slice() != digest {
+            if !length_is_checkable(candidate.len()) || candidate.as_slice() != digest {
                 continue;
             }
             if algorithm.secure {
@@ -184,6 +204,60 @@ mod tests {
         assert_eq!(
             match_state(&result, &[vec![0x42; 32]], &enabled_all()),
             MatchState::NotChecked
+        );
+    }
+
+    /// A digest whose length no enabled algorithm produces cannot have come
+    /// from this scan, so it is not evidence of a mismatch. With only
+    /// BLAKE3-512 enabled (64-byte digests), a 16-byte expected digest is
+    /// dropped and there is nothing left to check.
+    #[test]
+    fn a_digest_of_no_enabled_length_is_not_checked() {
+        let blake3_512 = index_of("BLAKE3-512");
+        let mut enabled = vec![false; ALGORITHMS.len()];
+        enabled[blake3_512] = true;
+
+        let result = result_with(blake3_512, vec![0x77; 64]);
+        assert_eq!(
+            match_state(&result, &[vec![0x77; 16]], &enabled),
+            MatchState::NotChecked
+        );
+    }
+
+    /// Dropping the wrong-length candidate must not drop the right-length one:
+    /// a plausible digest that does not match is still a mismatch, not
+    /// "not checked".
+    #[test]
+    fn a_wrong_length_candidate_does_not_hide_a_real_mismatch() {
+        let sha256 = index_of("SHA-256");
+        let mut enabled = vec![false; ALGORITHMS.len()];
+        enabled[sha256] = true;
+
+        let result = result_with(sha256, vec![0x00; 32]);
+        assert_eq!(
+            match_state(&result, &[vec![0x11; 16], vec![0xFF; 32]], &enabled),
+            MatchState::Mismatched
+        );
+    }
+
+    /// The same file may be listed under several algorithms in one sumfile; the
+    /// candidate that cannot belong to an enabled algorithm must be skipped
+    /// rather than allowed to break the match that can.
+    #[test]
+    fn a_right_length_match_survives_a_wrong_length_candidate() {
+        let sha256 = index_of("SHA-256");
+        let mut enabled = vec![false; ALGORITHMS.len()];
+        enabled[sha256] = true;
+
+        let digest = vec![0x42; 32];
+        let result = result_with(sha256, digest.clone());
+        let expected = [vec![0x42; 16], digest];
+        assert_eq!(
+            match_state(&result, &expected, &enabled),
+            MatchState::Matched {
+                algorithm: sha256,
+                secure: true
+            }
         );
     }
 }
