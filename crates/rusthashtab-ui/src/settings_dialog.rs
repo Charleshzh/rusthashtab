@@ -31,7 +31,9 @@
 
 use crate::{algorithm_names, resource};
 use rusthashtab_settings::Settings;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor};
+use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked, LIST_VIEW_ITEM_STATE_FLAGS,
     LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS,
@@ -40,8 +42,9 @@ use windows::Win32::UI::Controls::{
     LVSCW_AUTOSIZE_USEHEADER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DialogBoxParamW, EndDialog, GetDlgItem, MB_ICONWARNING, MB_OK, MessageBoxW, SendMessageW,
-    WM_COMMAND, WM_INITDIALOG, WM_NCDESTROY,
+    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, DialogBoxParamW, EndDialog,
+    GetDlgItem, MB_ICONWARNING, MB_OK, MessageBoxW, SendMessageW, SetWindowTextW, WM_COMMAND,
+    WM_INITDIALOG, WM_NCDESTROY,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -244,6 +247,156 @@ fn on_init(hwnd: HWND, lparam: LPARAM) {
     // algorithm name rather than the initial guess.
     autosize_algorithm_column(list);
     fill_options(hwnd, &state.form);
+    fill_colour_classes(hwnd);
+    update_colour_preview(hwnd, &state.form);
+}
+
+/// The five colour classes, in the order the selector lists them.
+const COLOUR_CLASSES: [rusthashtab_settings::ColourClass; 5] = [
+    rusthashtab_settings::ColourClass::Matched,
+    rusthashtab_settings::ColourClass::Weak,
+    rusthashtab_settings::ColourClass::Mismatched,
+    rusthashtab_settings::ColourClass::Error,
+    rusthashtab_settings::ColourClass::Neutral,
+];
+
+/// Human-readable name for one class.
+fn class_label(class: rusthashtab_settings::ColourClass) -> &'static str {
+    use rusthashtab_settings::ColourClass;
+    match class {
+        ColourClass::Matched => crate::strings::text(crate::strings::Key::ColourMatched),
+        ColourClass::Weak => crate::strings::text(crate::strings::Key::ColourWeakMatch),
+        ColourClass::Mismatched => crate::strings::text(crate::strings::Key::ColourMismatch),
+        ColourClass::Error => crate::strings::text(crate::strings::Key::ColourError),
+        ColourClass::Neutral => crate::strings::text(crate::strings::Key::ColourUnchecked),
+    }
+}
+
+/// Fill the colour-class selector.
+fn fill_colour_classes(hwnd: HWND) {
+    let Some(combo) = control(hwnd, resource::IDC_SETTINGS_COLOUR_CLASS) else {
+        return;
+    };
+    // SAFETY: `combo` is the dialog's combo box; every message copies the string
+    // it is given and no pointer outlives the call.
+    unsafe {
+        SendMessageW(combo, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+        for (index, class) in COLOUR_CLASSES.iter().enumerate() {
+            let mut text = class_label(*class)
+                .encode_utf16()
+                .chain(core::iter::once(0))
+                .collect::<Vec<u16>>();
+            SendMessageW(
+                combo,
+                CB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(text.as_mut_ptr() as isize)),
+            );
+            let _ = index;
+        }
+        let _ = SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
+}
+
+/// The class the selector is showing, defaulting to Matched.
+fn selected_class(hwnd: HWND) -> rusthashtab_settings::ColourClass {
+    let Some(combo) = control(hwnd, resource::IDC_SETTINGS_COLOUR_CLASS) else {
+        return rusthashtab_settings::ColourClass::Matched;
+    };
+    // SAFETY: `combo` is the dialog's combo box; the message takes no pointers.
+    let selected = unsafe { SendMessageW(combo, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0 };
+    COLOUR_CLASSES
+        .get(selected.max(0) as usize)
+        .copied()
+        .unwrap_or(rusthashtab_settings::ColourClass::Matched)
+}
+
+/// One class's colour pair.
+fn colour_of(
+    settings: &Settings,
+    class: rusthashtab_settings::ColourClass,
+) -> rusthashtab_settings::RowColour {
+    use rusthashtab_settings::ColourClass;
+    match class {
+        ColourClass::Matched => settings.colours.matched,
+        ColourClass::Weak => settings.colours.weak,
+        ColourClass::Mismatched => settings.colours.mismatched,
+        ColourClass::Error => settings.colours.error,
+        ColourClass::Neutral => settings.colours.neutral,
+    }
+}
+
+/// One class's colour pair, mutably.
+fn colour_of_mut(
+    settings: &mut Settings,
+    class: rusthashtab_settings::ColourClass,
+) -> &mut rusthashtab_settings::RowColour {
+    use rusthashtab_settings::ColourClass;
+    match class {
+        ColourClass::Matched => &mut settings.colours.matched,
+        ColourClass::Weak => &mut settings.colours.weak,
+        ColourClass::Mismatched => &mut settings.colours.mismatched,
+        ColourClass::Error => &mut settings.colours.error,
+        ColourClass::Neutral => &mut settings.colours.neutral,
+    }
+}
+
+/// Render one colour as `#RRGGBB`, or `system` for the sentinel.
+fn colour_text(colour: u32) -> String {
+    if colour == rusthashtab_settings::SYSTEM_COLOUR {
+        return String::from("system");
+    }
+    let red = colour & 0xFF;
+    let green = (colour >> 8) & 0xFF;
+    let blue = (colour >> 16) & 0xFF;
+    format!("#{red:02X}{green:02X}{blue:02X}")
+}
+
+/// Update the text preview for the selected class.
+fn update_colour_preview(hwnd: HWND, form: &SettingsForm) {
+    let Some(preview) = control(hwnd, resource::IDC_SETTINGS_COLOUR_PREVIEW) else {
+        return;
+    };
+    let class = selected_class(hwnd);
+    let colour = colour_of(&form.settings, class);
+    let text = format!(
+        "{} / {}",
+        colour_text(colour.text),
+        colour_text(colour.background)
+    );
+    let wide: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
+    // SAFETY: `preview` is the dialog's static and the string outlives the call.
+    unsafe {
+        let _ = SetWindowTextW(preview, PCWSTR(wide.as_ptr()));
+    }
+}
+
+/// Show the colour picker and return the chosen `COLORREF`.
+fn pick_colour(
+    hwnd: HWND,
+    initial: u32,
+    system_index: windows::Win32::Graphics::Gdi::SYS_COLOR_INDEX,
+) -> Option<u32> {
+    let initial = if initial == rusthashtab_settings::SYSTEM_COLOUR {
+        // SAFETY: `GetSysColor` reads a system colour table entry.
+        unsafe { GetSysColor(system_index) }
+    } else {
+        initial
+    };
+    let mut custom = [COLORREF(0); 16];
+    let mut chooser = CHOOSECOLORW {
+        lStructSize: core::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: hwnd,
+        rgbResult: COLORREF(initial),
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN,
+        ..Default::default()
+    };
+    // SAFETY: `chooser` declares its own size, every pointer in it refers to a
+    // live local, and the call is modal on this thread exactly like the other
+    // user-initiated dialogs.
+    let chosen = unsafe { ChooseColorW(&mut chooser) }.as_bool();
+    chosen.then_some(chooser.rgbResult.0)
 }
 
 /// Give the checklist its one column.
@@ -295,9 +448,17 @@ fn autosize_algorithm_column(list: HWND) {
 /// `WM_COMMAND`: OK, Cancel, or Defaults.
 fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
     let id = (wparam.0 & 0xFFFF) as i32;
+    let code = ((wparam.0 >> 16) & 0xFFFF) as u16;
     let Some(state) = state(hwnd) else {
         return false;
     };
+
+    // `CBN_SELCHANGE` is 1. The class selector only changes the preview; the
+    // settings object is updated when a colour is actually picked.
+    if id == resource::IDC_SETTINGS_COLOUR_CLASS && code == 1 {
+        update_colour_preview(hwnd, &state.form);
+        return true;
+    }
 
     match id {
         ID_OK => {
@@ -338,6 +499,30 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
                 fill_algorithms(list, &state.form);
             }
             fill_options(hwnd, &state.form);
+            update_colour_preview(hwnd, &state.form);
+            true
+        }
+        resource::IDC_SETTINGS_COLOUR_TEXT => {
+            let class = selected_class(hwnd);
+            let current = colour_of(&state.form.settings, class);
+            if let Some(colour) = pick_colour(hwnd, current.text, COLOR_WINDOWTEXT) {
+                colour_of_mut(&mut state.form.settings, class).text = colour;
+                update_colour_preview(hwnd, &state.form);
+            }
+            true
+        }
+        resource::IDC_SETTINGS_COLOUR_BG => {
+            let class = selected_class(hwnd);
+            let current = colour_of(&state.form.settings, class);
+            if let Some(colour) = pick_colour(hwnd, current.background, COLOR_WINDOW) {
+                colour_of_mut(&mut state.form.settings, class).background = colour;
+                update_colour_preview(hwnd, &state.form);
+            }
+            true
+        }
+        resource::IDC_SETTINGS_COLOUR_DEFAULTS => {
+            state.form.settings.colours = rusthashtab_settings::RowColours::default();
+            update_colour_preview(hwnd, &state.form);
             true
         }
         _ => false,
@@ -441,12 +626,17 @@ fn is_checked(list: HWND, row: usize) -> bool {
 /// Tick the option check boxes from the form.
 fn fill_options(hwnd: HWND, form: &SettingsForm) {
     let settings = &form.settings;
-    let boxes: [(i32, bool); 10] = [
+    let boxes: [(i32, bool); 12] = [
         (resource::IDC_SETTINGS_UPPERCASE, settings.display_uppercase),
         (resource::IDC_SETTINGS_MONOSPACE, settings.display_monospace),
         (
             resource::IDC_SETTINGS_LOOK_FOR_SUMFILES,
             settings.look_for_sumfiles,
+        ),
+        (resource::IDC_SETTINGS_VERIFY_STRICT, settings.verify_strict),
+        (
+            resource::IDC_SETTINGS_VERIFY_AUTO_FORMAT,
+            settings.verify_auto_format,
         ),
         (
             resource::IDC_SETTINGS_SUMFILE_UPPERCASE,
@@ -497,6 +687,8 @@ fn read_options(hwnd: HWND, form: &mut SettingsForm) {
     settings.display_uppercase = checked(resource::IDC_SETTINGS_UPPERCASE);
     settings.display_monospace = checked(resource::IDC_SETTINGS_MONOSPACE);
     settings.look_for_sumfiles = checked(resource::IDC_SETTINGS_LOOK_FOR_SUMFILES);
+    settings.verify_strict = checked(resource::IDC_SETTINGS_VERIFY_STRICT);
+    settings.verify_auto_format = checked(resource::IDC_SETTINGS_VERIFY_AUTO_FORMAT);
     settings.sumfile_uppercase = checked(resource::IDC_SETTINGS_SUMFILE_UPPERCASE);
     settings.sumfile_unix_endings = checked(resource::IDC_SETTINGS_SUMFILE_LF);
     settings.sumfile_double_space = checked(resource::IDC_SETTINGS_SUMFILE_DOUBLE_SPACE);

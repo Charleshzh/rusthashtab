@@ -53,18 +53,27 @@ use crate::task::{Background, TaskError};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::{
-    PBM_SETPOS, PBM_SETRANGE32, PROPSHEETPAGEW, PSPCB_MESSAGE, PSPCB_RELEASE,
+    BST_CHECKED, HDHITTESTINFO, HDM_HITTEST, IsDlgButtonChecked, LVKF_CONTROL, LVM_GETHEADER,
+    LVN_GETDISPINFOW, LVN_KEYDOWN, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NMHDR, NMLISTVIEW,
+    NMLVDISPINFOW, NMLVKEYDOWN, PBM_SETPOS, PBM_SETRANGE32, PROPSHEETPAGEW, PSPCB_MESSAGE,
+    PSPCB_RELEASE, TOOLTIP_FLAGS, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW,
+    TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTTOOLINFOW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetDlgItem, GetParent, GetWindowTextW, MB_ICONERROR, MB_OK, MessageBoxW, SendMessageW,
-    SetWindowTextW, WM_APP, WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY,
-    WM_SETFONT,
+    AppendMenuW, CB_ADDSTRING, CB_GETCURSEL, CB_GETITEMDATA, CB_RESETCONTENT, CB_SETCURSEL,
+    CB_SETITEMDATA, CreatePopupMenu, CreateWindowExW, DestroyMenu, GetCursorPos, GetDlgItem,
+    GetParent, GetWindowTextW, MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MessageBoxW, SendMessageW, SetWindowTextW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY, WM_SETFONT, WS_POPUP,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -87,6 +96,16 @@ pub const WM_SCAN_FINISHED: u32 = WM_APP + 3;
 pub const WM_VERIFY_READY: u32 = WM_APP + 4;
 /// An export has been written (or failed); `lParam` is the request's sequence.
 pub const WM_EXPORT_DONE: u32 = WM_APP + 5;
+/// Discovery found more files; `lParam` is the number found so far.
+pub const WM_DISCOVERY_PROGRESS: u32 = WM_APP + 6;
+/// The header was clicked; `wParam` is [`crate::MESSAGE_MAGIC`], `lParam` the column.
+///
+/// Posted by the header subclass rather than handled in its notification, because
+/// the header sends `HDN_ITEMCLICKW` to the list view and the list view does not
+/// forward it to the page.
+pub const WM_SORT_COLUMN: u32 = WM_APP + 7;
+/// The job list has been published; `lParam` is the job count.
+pub const WM_JOBS_READY: u32 = WM_APP + 8;
 
 /// The page's dialog procedure.
 ///
@@ -116,15 +135,32 @@ pub extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam
             on_set_font(hwnd, wparam);
             1
         }
+        WM_DPICHANGED => {
+            on_dpi_changed(hwnd);
+            1
+        }
         WM_COMMAND => {
             on_command(hwnd, wparam);
             1
         }
         WM_NOTIFY => on_notify(hwnd, lparam),
-        WM_FILE_FINISHED | WM_FILE_PROGRESS | WM_SCAN_FINISHED | WM_VERIFY_READY
-        | WM_EXPORT_DONE => {
+        WM_FILE_FINISHED
+        | WM_FILE_PROGRESS
+        | WM_SCAN_FINISHED
+        | WM_VERIFY_READY
+        | WM_EXPORT_DONE
+        | WM_DISCOVERY_PROGRESS
+        | WM_JOBS_READY => {
             on_scan_message(hwnd, message, wparam, lparam);
             1
+        }
+        WM_SORT_COLUMN => {
+            if wparam.0 != crate::MESSAGE_MAGIC {
+                0
+            } else {
+                sort_by_column(hwnd, lparam.0);
+                1
+            }
         }
         _ => 0,
     }
@@ -164,6 +200,8 @@ fn on_init(hwnd: HWND, lparam: LPARAM) -> isize {
     let font = dialog_font(hwnd);
     state.mono_font = crate::listview::create_monospace_font(font);
     build_controls(hwnd, state, font);
+    state.scan_phase = crate::ScanPhase::Discovering;
+    set_control_state(hwnd, state);
     start_hashing(hwnd, state);
 
     // TRUE, so the dialog manager keeps the window. Returning FALSE here would let
@@ -179,7 +217,14 @@ fn build_controls(hwnd: HWND, state: &mut DialogState, font: isize) {
         if let Some(list) = control(hwnd, resource::IDC_HASH_LIST) {
             crate::listview::adopt_font(list, font);
             crate::listview::add_columns(list);
+            // Screen readers take a control's window text as its accessible name;
+            // the column headers alone do not name the table.
+            set_control_text(
+                list,
+                crate::strings::text(crate::strings::Key::ResultsListLabel),
+            );
             state.list = Some(list);
+            install_header_subclass(hwnd, list);
         }
         if let Some(status) = control(hwnd, resource::IDC_HASH_STATUS) {
             crate::listview::adopt_font(status, font);
@@ -197,6 +242,257 @@ fn build_controls(hwnd: HWND, state: &mut DialogState, font: isize) {
             );
         }
     }
+    fill_export_choices(hwnd, state);
+    install_tooltips(hwnd, state);
+}
+
+/// Create the page's tooltip control and attach the controls that need one.
+///
+/// The status line is a single row and a long source label can overflow it; the
+/// tooltip carries the full text. The other tools explain controls whose purpose
+/// is not obvious from a short label (the format selector, Cancel).
+fn install_tooltips(hwnd: HWND, state: &mut DialogState) {
+    // SAFETY: the tooltip class is registered by comctl32, the owner is the page,
+    // and every optional handle is null. The window is a popup, never shown
+    // directly.
+    let Ok(tooltip) = (unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            TOOLTIPS_CLASSW,
+            PCWSTR::null(),
+            WINDOW_STYLE(WS_POPUP.0 | TTS_ALWAYSTIP),
+            0,
+            0,
+            0,
+            0,
+            Some(hwnd),
+            None,
+            None,
+            None,
+        )
+    }) else {
+        return;
+    };
+    state.tooltip = Some(tooltip);
+
+    // Long status text should wrap rather than run off the screen.
+    // SAFETY: `tooltip` is the control just created; the message takes integers.
+    unsafe {
+        SendMessageW(
+            tooltip,
+            TTM_SETMAXTIPWIDTH,
+            Some(WPARAM(0)),
+            Some(LPARAM(420)),
+        );
+    }
+
+    let starting: Vec<u16> = resource::STATUS_STARTING
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+    state.tooltip_status = starting;
+    add_tool(
+        tooltip,
+        hwnd,
+        resource::IDC_HASH_STATUS,
+        PWSTR(state.tooltip_status.as_mut_ptr()),
+    );
+    add_tool(
+        tooltip,
+        hwnd,
+        resource::IDC_HASH_LIST,
+        PWSTR(w!("Hash results").0 as *mut u16),
+    );
+    add_tool(
+        tooltip,
+        hwnd,
+        resource::IDC_HASH_EXPECTED,
+        PWSTR(w!("Digest or checksum line to compare").0 as *mut u16),
+    );
+    add_tool(
+        tooltip,
+        hwnd,
+        resource::IDC_HASH_EXPORT_FORMAT,
+        PWSTR(w!("Checksum file format").0 as *mut u16),
+    );
+    add_tool(
+        tooltip,
+        hwnd,
+        resource::IDC_HASH_CANCEL,
+        PWSTR(w!("Stop hashing and keep the results so far").0 as *mut u16),
+    );
+}
+
+/// Attach one control to the tooltip.
+fn add_tool(tooltip: HWND, owner: HWND, control_id: i32, text: PWSTR) {
+    // SAFETY: `owner` is the page dialog and `control_id` is one its template
+    // declares; a missing control is handled by the `let-else`.
+    let Some(control) = (unsafe { control(owner, control_id) }) else {
+        return;
+    };
+    let mut info = TTTOOLINFOW {
+        cbSize: core::mem::size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TOOLTIP_FLAGS(TTF_IDISHWND.0 | TTF_SUBCLASS.0),
+        hwnd: owner,
+        uId: control.0 as usize,
+        lpszText: text,
+        ..Default::default()
+    };
+    // SAFETY: `tooltip` is the live tooltip control and `info` lives for the
+    // call; the tooltip stores the control handle and the text pointer.
+    unsafe {
+        SendMessageW(
+            tooltip,
+            TTM_ADDTOOLW,
+            Some(WPARAM(0)),
+            Some(LPARAM((&mut info as *mut TTTOOLINFOW) as isize)),
+        );
+    }
+}
+
+/// Subclass id for the list view's header. One page has one header.
+const HEADER_SUBCLASS_ID: usize = 1;
+
+/// The header's window procedure.
+///
+/// `HDN_ITEMCLICKW` is sent to the header's parent -- the list view -- and the
+/// list view does not forward it to the page. Subclassing the header is the
+/// supported way to see the click; the page then receives a private message,
+/// which keeps the sort decision on the dialog's own thread.
+unsafe extern "system" fn header_subclass(
+    header: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    page: usize,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_NCDESTROY};
+
+    if message == WM_LBUTTONUP {
+        let x = (lparam.0 & 0xffff) as i16 as i32;
+        let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+        let mut hit = HDHITTESTINFO {
+            pt: POINT { x, y },
+            ..Default::default()
+        };
+        // SAFETY: `header` is the header being subclassed and `hit` lives for
+        // the call; `HDM_HITTEST` writes only into it.
+        let found = unsafe {
+            SendMessageW(
+                header,
+                HDM_HITTEST,
+                Some(WPARAM(0)),
+                Some(LPARAM((&mut hit as *mut HDHITTESTINFO) as isize)),
+            )
+        };
+        if found.0 >= 0 && page != 0 {
+            // SAFETY: `page` is the HWND this subclass was installed for, and
+            // the message carries only integers.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(page as *mut core::ffi::c_void)),
+                    crate::WM_SORT_COLUMN,
+                    WPARAM(crate::MESSAGE_MAGIC),
+                    LPARAM(hit.iItem as isize),
+                );
+            }
+        }
+    }
+
+    // SAFETY: every message the subclass does not consume is passed back to the
+    // header's original procedure, with the original parameters.
+    unsafe {
+        if message == WM_NCDESTROY {
+            let _ = RemoveWindowSubclass(header, Some(header_subclass), HEADER_SUBCLASS_ID);
+        }
+        DefSubclassProc(header, message, wparam, lparam)
+    }
+}
+
+/// Install the header subclass once the columns exist.
+fn install_header_subclass(page: HWND, list: HWND) {
+    // SAFETY: `list` is the page's list view and `LVM_GETHEADER` returns its
+    // header control or null.
+    let header = unsafe { SendMessageW(list, LVM_GETHEADER, Some(WPARAM(0)), Some(LPARAM(0))) };
+    if header.0 == 0 {
+        return;
+    }
+    let header = HWND(header.0 as *mut core::ffi::c_void);
+    // SAFETY: `header` is a live child window, the callback is a plain
+    // `extern "system"` function with the signature comctl32 calls, and `page`
+    // is the dialog that owns the header for as long as it lives.
+    unsafe {
+        let _ = SetWindowSubclass(
+            header,
+            Some(header_subclass),
+            HEADER_SUBCLASS_ID,
+            page.0 as usize,
+        );
+    }
+}
+
+/// Fill the export selector with the formats the enabled algorithms can produce.
+fn fill_export_choices(hwnd: HWND, state: &mut DialogState) {
+    // SAFETY: `hwnd` is the page dialog and the identifier is one its template
+    // declares; a missing control is handled by the `if let`.
+    let Some(combo) = (unsafe { control(hwnd, resource::IDC_HASH_EXPORT_FORMAT) }) else {
+        return;
+    };
+
+    state.export_choices = crate::export::choices(&state.enabled);
+    // SAFETY: `combo` is the page's combo box; every message below copies the
+    // string it is given, and no pointer outlives the call.
+    unsafe {
+        SendMessageW(combo, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+        for (index, choice) in state.export_choices.iter().enumerate() {
+            let mut text = crate::export::label(*choice)
+                .encode_utf16()
+                .chain(core::iter::once(0))
+                .collect::<Vec<u16>>();
+            SendMessageW(
+                combo,
+                CB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(text.as_mut_ptr() as isize)),
+            );
+            SendMessageW(
+                combo,
+                CB_SETITEMDATA,
+                Some(WPARAM(index)),
+                Some(LPARAM(index as isize)),
+            );
+        }
+        if state.export_choices.is_empty() {
+            state.export_choice = None;
+        } else {
+            let _ = SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+            state.export_choice = state.export_choices.first().copied();
+        }
+    }
+}
+
+/// The export choice currently selected in the combo box.
+fn selected_export_choice(hwnd: HWND, state: &DialogState) -> Option<crate::export::ExportChoice> {
+    // SAFETY: `hwnd` is the page dialog and the identifier names a combo box its
+    // template declares.
+    let combo = unsafe { control(hwnd, resource::IDC_HASH_EXPORT_FORMAT) }?;
+    // SAFETY: `combo` is the page's combo box and the two messages take integers.
+    let selected = unsafe { SendMessageW(combo, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0 };
+    if selected < 0 {
+        return state.export_choice;
+    }
+    // SAFETY: as above; `CB_GETITEMDATA` returns what `CB_SETITEMDATA` stored.
+    let data = unsafe {
+        SendMessageW(
+            combo,
+            CB_GETITEMDATA,
+            Some(WPARAM(selected as usize)),
+            Some(LPARAM(0)),
+        )
+        .0
+    };
+    state.export_choices.get(data as usize).copied()
 }
 
 /// Start the scan on the page's own thread.
@@ -252,6 +548,12 @@ fn on_destroy(hwnd: HWND) {
         crate::listview::destroy_font(state.mono_font);
         state.mono_font = 0;
     }
+    if let Some(tooltip) = state.tooltip.take() {
+        // SAFETY: the tooltip was created by this page and is destroyed once.
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(tooltip);
+        }
+    }
 }
 
 /// `WM_SETFONT` from the property sheet manager.
@@ -289,6 +591,40 @@ fn on_set_font(hwnd: HWND, wparam: WPARAM) {
     }
 }
 
+/// `WM_DPICHANGED`: re-measure the columns against the new font.
+///
+/// A property page is a child of the shell's sheet, so the host usually does the
+/// scaling and this message may never arrive. Handling it costs nothing and keeps
+/// the future standalone window from shipping a table measured for the old DPI.
+fn on_dpi_changed(hwnd: HWND) {
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let font = dialog_font(hwnd);
+    if font == 0 {
+        return;
+    }
+
+    // SAFETY: the controls belong to this dialog and the font is the one the
+    // sheet selected for it.
+    unsafe {
+        for id in [resource::IDC_HASH_LIST, resource::IDC_HASH_STATUS] {
+            if let Some(control) = control(hwnd, id) {
+                crate::listview::adopt_font(control, font);
+            }
+        }
+    }
+    if state.mono_font != 0 {
+        crate::listview::destroy_font(state.mono_font);
+    }
+    state.mono_font = crate::listview::create_monospace_font(font);
+    if let Some(list) = state.list {
+        crate::listview::remeasure_columns(list);
+        crate::listview::set_file_column_for_jobs(state.list, state.job_count);
+    }
+}
+
 /// `WM_COMMAND`: the page's buttons.
 fn on_command(hwnd: HWND, wparam: WPARAM) {
     let id = (wparam.0 & 0xFFFF) as i32;
@@ -297,8 +633,99 @@ fn on_command(hwnd: HWND, wparam: WPARAM) {
         resource::IDC_HASH_CHECK => check_pasted(hwnd),
         resource::IDC_HASH_VERIFY => choose_verification(hwnd),
         resource::IDC_HASH_EXPORT => export_hashes(hwnd),
+        resource::IDC_HASH_EXPORT_CLIPBOARD => copy_checksums(hwnd),
         resource::IDC_HASH_SETTINGS => open_settings(hwnd),
+        resource::IDC_HASH_CANCEL => cancel_scan(hwnd),
         _ => {}
+    }
+}
+
+/// Stop the running scan without blocking the dialog thread.
+///
+/// The flag is set immediately and the button is disabled; the session thread
+/// notices at its next block or directory entry, joins its own workers, and
+/// posts `WM_SCAN_FINISHED`. Nothing here waits for that, which is the whole
+/// difference between this and the upstream behaviour of sleeping on the UI
+/// thread until every task has ended.
+fn cancel_scan(hwnd: HWND) {
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    if !matches!(
+        state.scan_phase,
+        crate::ScanPhase::Discovering | crate::ScanPhase::Hashing
+    ) {
+        return;
+    }
+
+    state.cancelling = true;
+    if let Some(session) = state.session.as_ref() {
+        session.cancel();
+    }
+    set_status_on(
+        state.status,
+        crate::strings::text(crate::strings::Key::Cancelling),
+    );
+    set_control_state(hwnd, state);
+}
+
+/// Handle a column-header click.
+///
+/// Sorting is disabled while the scan is running: rows are being inserted into
+/// job order, and re-sorting behind each insertion would both cost more and make
+/// the list jump. The status line says so rather than silently doing nothing.
+fn sort_by_column(hwnd: HWND, column: isize) {
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+
+    if matches!(
+        state.scan_phase,
+        crate::ScanPhase::Discovering | crate::ScanPhase::Hashing
+    ) {
+        set_status_on(
+            state.status,
+            crate::strings::text(crate::strings::Key::SortAfterHashing),
+        );
+        return;
+    }
+
+    let Some(column) = crate::listview::Column::from_index(column as usize) else {
+        return;
+    };
+
+    let next = match state.sort {
+        Some(current) if current.column == column && current.ascending => {
+            Some(crate::listview::SortState {
+                column,
+                ascending: false,
+            })
+        }
+        Some(current) if current.column == column => None,
+        _ => Some(crate::listview::SortState {
+            column,
+            ascending: true,
+        }),
+    };
+    state.sort = next;
+    let selected = state
+        .list
+        .map(|list| crate::listview::selected_ids(list, &state.rows))
+        .unwrap_or_default();
+
+    match next {
+        Some(sort) => crate::listview::sort_rows(&mut state.rows, sort),
+        None => state
+            .rows
+            .sort_by_key(|row| (row.job_index, row.algorithm, row.id)),
+    }
+
+    if let Some(list) = state.list {
+        crate::listview::set_rows(list, &state.rows);
+        crate::listview::set_sort_indicator(list, next);
+        crate::listview::select_ids(list, &selected, &state.rows);
     }
 }
 
@@ -312,15 +739,45 @@ fn copy_selection(hwnd: HWND) {
         return;
     };
 
-    let selected = crate::listview::selected_rows(list);
-    let Some(text) = crate::clipboard::render(&state.rows, &selected) else {
-        // Nothing selected. Deliberately not an error, and deliberately not an empty
-        // string: replacing the clipboard would destroy whatever the user copied
-        // before.
-        return;
+    let selected = crate::listview::selected_ids(list, &state.rows);
+    // Nothing selected is deliberately not an error, and deliberately not an
+    // empty string: replacing the clipboard would destroy whatever the user
+    // copied before.
+    copy_ids(hwnd, &selected, crate::clipboard::CopyKind::Selection);
+}
+
+/// Apply the current [`crate::ScanPhase`] to every result action.
+///
+/// One function so a new control cannot be added and forgotten: the phase decides
+/// what is safe to do, and the same table is used everywhere. Export is the only
+/// action that becomes safe only when the scan is *complete*: a file written from
+/// partial results looks exactly like a complete checksum file.
+fn set_control_state(hwnd: HWND, state: &DialogState) {
+    let (export, copy, check, verify, cancel) = match state.scan_phase {
+        crate::ScanPhase::Discovering => (false, false, false, false, true),
+        crate::ScanPhase::Hashing => (false, true, true, true, true),
+        crate::ScanPhase::Finished => (true, true, true, true, false),
+        crate::ScanPhase::Cancelled => (false, true, true, true, false),
     };
 
-    let _ = crate::clipboard::copy(hwnd, &text);
+    for (id, enabled) in [
+        (resource::IDC_HASH_EXPORT, export),
+        (resource::IDC_HASH_EXPORT_CLIPBOARD, export),
+        (resource::IDC_HASH_EXPORT_FORMAT, export),
+        (resource::IDC_HASH_COPY, copy),
+        (resource::IDC_HASH_CHECK, check),
+        (resource::IDC_HASH_VERIFY, verify),
+        (resource::IDC_HASH_CANCEL, cancel),
+    ] {
+        // SAFETY: `hwnd` is the page dialog and each identifier belongs to a
+        // control its template declares. `EnableWindow` fails rather than faults
+        // for a missing control.
+        unsafe {
+            if let Some(control) = control(hwnd, id) {
+                let _ = EnableWindow(control, enabled);
+            }
+        }
+    }
 }
 
 /// The shared state of the running session, if the page has one.
@@ -333,11 +790,13 @@ fn shared_state(hwnd: HWND) -> Option<Arc<Shared>> {
         .map(|session| Arc::clone(session.shared()))
 }
 
-/// `Check`: parse the pasted digest and apply it to one file.
+/// `Check`: parse the paste box and apply the digest to the requested files.
 ///
-/// The target is the file whose row is selected, because a digest belongs to one
-/// file. With exactly one file in the page and no selection, that file is the
-/// only possible target; with several, guessing would mark unrelated files red.
+/// A bare digest defaults to the whole selection: the user's usual question is
+/// "which of these files has this hash", not "does this one file have it". A line
+/// that names a file targets that file. `Current file only` narrows the scope to
+/// the selected row, and `VerifyStrict` makes a named file resolve by full path
+/// rather than by unique basename.
 fn check_pasted(hwnd: HWND) {
     let Some(shared) = shared_state(hwnd) else {
         return;
@@ -355,9 +814,12 @@ fn check_pasted(hwnd: HWND) {
         return;
     };
     let text = dialog_text(edit);
-    let Some(digest) = crate::verify::parse_pasted(&text) else {
-        set_status_on(status, resource::STATUS_NOT_HEX);
-        return;
+    let pasted = match crate::verify::parse_pasted_line(&text) {
+        Ok(pasted) => pasted,
+        Err(error) => {
+            set_status_on(status, pasted_error_text(error));
+            return;
+        }
     };
 
     // A digest no enabled algorithm can produce is not a mismatch; applying it
@@ -367,43 +829,114 @@ fn check_pasted(hwnd: HWND) {
         *enabled
             && rusthashtab_hash::ALGORITHMS
                 .get(index)
-                .is_some_and(|algorithm| algorithm.output_len == digest.len())
+                .is_some_and(|algorithm| algorithm.output_len == pasted.digest.len())
     });
     if !usable {
-        set_status_on(status, resource::STATUS_NO_MATCHING_LENGTH);
+        set_status_on(
+            status,
+            crate::strings::text(crate::strings::Key::PasteWrongLength),
+        );
         return;
     }
 
     let jobs = shared.jobs();
     let selected = state
         .list
-        .map(crate::listview::selected_rows)
+        .map(|list| crate::listview::selected_ids(list, &state.rows))
         .unwrap_or_default();
-    let target = selected
+    let current_job = selected
         .first()
-        .and_then(|row| state.rows.get(*row))
-        .map(|row| row.job_index)
-        .or(if jobs.len() == 1 { Some(0) } else { None });
-    let Some(target) = target else {
-        set_status_on(status, resource::STATUS_SELECT_FILE);
-        return;
+        .and_then(|id| state.rows.iter().find(|row| row.id == *id))
+        .map(|row| row.job_index);
+
+    // SAFETY: `hwnd` is the page dialog and the identifier names a check box its
+    // template declares.
+    let current_only = unsafe {
+        control(hwnd, resource::IDC_HASH_CURRENT_ONLY).is_some_and(|_| {
+            IsDlgButtonChecked(hwnd, resource::IDC_HASH_CURRENT_ONLY) == BST_CHECKED.0
+        })
+    };
+
+    let scope = if current_only {
+        match current_job.or(if jobs.len() == 1 { Some(0) } else { None }) {
+            Some(index) => crate::verify::PasteScope::Current(index),
+            None => {
+                set_status_on(
+                    status,
+                    crate::strings::text(crate::strings::Key::PasteSelectRow),
+                );
+                return;
+            }
+        }
+    } else {
+        crate::verify::PasteScope::All
+    };
+
+    let targets = match crate::verify::resolve_pasted_targets(
+        &pasted,
+        &jobs,
+        scope,
+        state.settings.verify_strict,
+    ) {
+        Ok(targets) => targets,
+        Err(error) => {
+            set_status_on(status, pasted_error_text(error));
+            return;
+        }
     };
 
     let mut expected = shared.expected_all();
     if expected.len() < jobs.len() {
         expected.resize(jobs.len(), Vec::new());
     }
-    if let Some(slot) = expected.get_mut(target) {
-        *slot = vec![digest];
+    for target in targets {
+        if let Some(slot) = expected.get_mut(target) {
+            *slot = vec![pasted.digest.clone()];
+        }
     }
     shared.set_expected(expected);
     shared.set_verification(VerificationInfo {
-        source: resource::PASTED_SOURCE.to_string(),
+        source: format!(
+            "{} ({})",
+            resource::PASTED_SOURCE,
+            if current_only {
+                "current file"
+            } else {
+                "all files"
+            }
+        ),
         unmatched: 0,
         had_error: false,
     });
 
+    if state.settings.verify_auto_format {
+        let canonical =
+            rusthashtab_sumfile::export::to_hex(&pasted.digest, state.settings.display_uppercase);
+        set_control_text(edit, &canonical);
+    }
+
     rebuild_and_refresh(hwnd);
+}
+
+/// The status line for a paste failure.
+fn pasted_error_text(error: crate::verify::PastedError) -> &'static str {
+    use crate::verify::PastedError;
+    match error {
+        PastedError::Empty | PastedError::NotADigest => {
+            crate::strings::text(crate::strings::Key::PasteNotADigest)
+        }
+        PastedError::MultipleEntries => {
+            crate::strings::text(crate::strings::Key::PasteMultipleEntries)
+        }
+        PastedError::FileNotSelected => {
+            crate::strings::text(crate::strings::Key::PasteFileNotSelected)
+        }
+        PastedError::AmbiguousFile => crate::strings::text(crate::strings::Key::PasteAmbiguousFile),
+        PastedError::LengthNotEnabled => {
+            crate::strings::text(crate::strings::Key::PasteWrongLength)
+        }
+        PastedError::NoCurrentFile => crate::strings::text(crate::strings::Key::PasteSelectRow),
+    }
 }
 
 /// `Verify...`: read a checksum file and match it against the hashed files.
@@ -528,12 +1061,25 @@ fn export_hashes(hwnd: HWND) {
         return;
     }
 
-    let Some(target) = save_checksum_file(hwnd, &state.enabled) else {
+    let Some(choice) = selected_export_choice(hwnd, state) else {
+        set_status_on(
+            state.status,
+            crate::strings::text(crate::strings::Key::ExportFormatMismatch),
+        );
+        return;
+    };
+    let Some(target) = save_checksum_file(hwnd, &state.export_choices, choice, &jobs) else {
         return;
     };
 
-    let plan = match crate::export::plan(&target, &results, &jobs, &state.settings, &state.enabled)
-    {
+    let plan = match crate::export::plan_with_choice(
+        &target,
+        choice,
+        &results,
+        &jobs,
+        &state.settings,
+        &state.enabled,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             set_status_on(state.status, resource::STATUS_EXPORT_FAILED);
@@ -559,6 +1105,64 @@ fn export_hashes(hwnd: HWND) {
 
     state.export_task = Some(task);
     set_status_on(state.status, resource::STATUS_EXPORTING);
+}
+
+/// `Copy checksums`: render the selected format to the clipboard.
+///
+/// Unlike `Export...`, this never opens a file dialog. The target path is
+/// synthetic: it exists only so the planner can validate the extension against
+/// the chosen format, and nothing is written.
+fn copy_checksums(hwnd: HWND) {
+    let Some(shared) = shared_state(hwnd) else {
+        return;
+    };
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+
+    let jobs = shared.jobs();
+    let results = shared.results();
+    if jobs.is_empty() || results.iter().all(Option::is_none) {
+        set_status_on(state.status, resource::STATUS_NOTHING_TO_EXPORT);
+        return;
+    }
+
+    let Some(choice) = selected_export_choice(hwnd, state) else {
+        set_status_on(state.status, resource::STATUS_NOTHING_TO_EXPORT);
+        return;
+    };
+    let extension = crate::export::extension(choice);
+    let target = PathBuf::from(format!("clipboard.{extension}"));
+    let plan = match crate::export::plan_with_choice(
+        &target,
+        choice,
+        &results,
+        &jobs,
+        &state.settings,
+        &state.enabled,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            set_status_on(state.status, resource::STATUS_EXPORT_FAILED);
+            show_error(hwnd, &error.to_string());
+            return;
+        }
+    };
+
+    let text = crate::export::render_clipboard(&plan);
+    if crate::clipboard::copy(hwnd, &text) {
+        set_status_on(
+            state.status,
+            &crate::strings::text(crate::strings::Key::CopiedHashes)
+                .replace("{}", &plan.entries.len().to_string()),
+        );
+    } else {
+        set_status_on(
+            state.status,
+            crate::strings::text(crate::strings::Key::CopyFailed),
+        );
+    }
 }
 
 /// `WM_EXPORT_DONE`: report how the export went.
@@ -617,6 +1221,10 @@ fn open_settings(hwnd: HWND) {
             };
             state.settings = updated;
             state.enabled = crate::enabled_algorithms(&state.settings);
+            state.palette = crate::listview::Palette::from_settings(
+                &state.settings,
+                crate::listview::high_contrast(),
+            );
             restart_hashing(hwnd);
         }
         Err(error) => show_error(
@@ -654,10 +1262,25 @@ fn rebuild_and_refresh(hwnd: HWND) {
         state.settings.display_uppercase,
     );
 
+    let mut rows = rows;
+    if let Some(sort) = state.sort {
+        crate::listview::sort_rows(&mut rows, sort);
+    }
+
+    let old = std::mem::take(&mut state.rows);
+    let selected = state
+        .list
+        .map(|list| crate::listview::selected_ids(list, &old))
+        .unwrap_or_default();
+
     state.rows = rows;
     if let Some(list) = state.list {
         crate::listview::set_rows(list, &state.rows);
+        crate::listview::set_sort_indicator(list, state.sort);
+        crate::listview::set_file_column_for_jobs(state.list, jobs.len());
+        crate::listview::select_ids(list, &selected, &state.rows);
     }
+
     shared.replace_counters(counters);
     refresh_status(hwnd, state, &shared);
 }
@@ -682,11 +1305,18 @@ fn restart_hashing(hwnd: HWND) {
     state.verify_source = None;
 
     state.rows.clear();
+    state.scan_phase = crate::ScanPhase::Discovering;
+    state.job_count = 0;
+    state.discovery_files = 0;
+    state.cancelling = false;
     if let Some(list) = state.list {
         crate::listview::set_rows(list, &[]);
+        crate::listview::set_sort_indicator(list, None);
+        crate::listview::set_file_column_for_jobs(state.list, 0);
     }
     update_progress(hwnd, 0);
     set_status_on(state.status, resource::STATUS_STARTING);
+    set_control_state(hwnd, state);
     start_hashing(hwnd, state);
 }
 
@@ -723,6 +1353,7 @@ fn open_filter_entries() -> Vec<FilterEntry> {
 /// extension the user ends up with is what selects the format -- the filter is a
 /// guide, not the decision -- because a Save dialog cannot stop a user from
 /// typing a different one.
+#[cfg(test)]
 fn save_filter_entries(enabled: &[bool]) -> Vec<FilterEntry> {
     let mut entries: Vec<FilterEntry> = Vec::new();
 
@@ -757,6 +1388,49 @@ fn save_filter_entries(enabled: &[bool]) -> Vec<FilterEntry> {
 
     entries.push((String::from("All files"), vec![String::from("*.*")]));
     entries
+}
+
+/// The filter for `Export...`, ordered by the selector's choices.
+///
+/// The selected choice comes first so the Save dialog's default extension and
+/// first filter agree with what the page is showing. Every other choice is still
+/// offered, because a user may change their mind in the Save dialog; an extension
+/// that disagrees with the selector is refused by the planner, not silently
+/// written.
+fn save_filter_entries_for(
+    choices: &[crate::export::ExportChoice],
+    selected: crate::export::ExportChoice,
+) -> Vec<FilterEntry> {
+    let mut ordered: Vec<crate::export::ExportChoice> = Vec::with_capacity(choices.len());
+    ordered.push(selected);
+    ordered.extend(choices.iter().copied().filter(|choice| *choice != selected));
+
+    let mut entries: Vec<FilterEntry> = ordered
+        .into_iter()
+        .map(|choice| {
+            (
+                format!("{} checksums", crate::export::label(choice)),
+                vec![format!("*.{}", crate::export::extension(choice))],
+            )
+        })
+        .collect();
+    entries.push((String::from("All files"), vec![String::from("*.*")]));
+    entries
+}
+
+/// The name a Save dialog starts with.
+fn initial_export_name(jobs: &[crate::JobSpec], choice: crate::export::ExportChoice) -> String {
+    let extension = crate::export::extension(choice);
+    if jobs.len() == 1 {
+        let stem = std::path::Path::new(&jobs[0].display_path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or_else(|| String::from("checksums"));
+        format!("{stem}.{extension}")
+    } else {
+        format!("checksums.{extension}")
+    }
 }
 
 /// The extension a Save dialog should append when the user types none.
@@ -868,14 +1542,25 @@ fn open_checksum_file(hwnd: HWND) -> Option<PathBuf> {
 }
 
 /// `Export...`'s Save dialog.
-fn save_checksum_file(hwnd: HWND, enabled: &[bool]) -> Option<PathBuf> {
-    run_file_dialog(hwnd, true, &save_filter_entries(enabled), Some("checksums"))
+fn save_checksum_file(
+    hwnd: HWND,
+    choices: &[crate::export::ExportChoice],
+    selected: crate::export::ExportChoice,
+    jobs: &[crate::JobSpec],
+) -> Option<PathBuf> {
+    let entries = save_filter_entries_for(choices, selected);
+    let name = initial_export_name(jobs, selected);
+    run_file_dialog(hwnd, true, &entries, Some(&name))
 }
 
-/// `WM_NOTIFY`: the list view's custom draw.
-fn on_notify(hwnd: HWND, lparam: LPARAM) -> isize {
-    use windows::Win32::UI::Controls::{NM_CUSTOMDRAW, NMHDR};
+/// Context-menu command identifiers. Their values are local to this page.
+const IDM_COPY_DIGEST: usize = 1;
+const IDM_COPY_ROW: usize = 2;
+const IDM_COPY_FILE: usize = 3;
+const IDM_COPY_ALL: usize = 4;
 
+/// `WM_NOTIFY`: the list view's notifications.
+fn on_notify(hwnd: HWND, lparam: LPARAM) -> isize {
     if lparam.0 == 0 {
         return 0;
     }
@@ -883,10 +1568,67 @@ fn on_notify(hwnd: HWND, lparam: LPARAM) -> isize {
     // SAFETY: the sender filled in the `NMHDR` at the start of the structure, and the
     // notification code is the documented way to tell which notification this is.
     let code = unsafe { (*(lparam.0 as *const NMHDR)).code };
-    if code != NM_CUSTOMDRAW {
-        return 0;
+    match code {
+        NM_CUSTOMDRAW => on_custom_draw(hwnd, lparam),
+        LVN_GETDISPINFOW => {
+            on_get_disp_info(hwnd, lparam);
+            0
+        }
+        NM_DBLCLK => {
+            on_double_click(hwnd, lparam);
+            1
+        }
+        LVN_KEYDOWN => {
+            on_list_keydown(hwnd, lparam);
+            1
+        }
+        NM_RCLICK => {
+            on_right_click(hwnd, lparam);
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// `LVN_GETDISPINFOW`: supply one cell of the virtual list.
+///
+/// Owner-data mode has no per-item storage: the page's row list is the data
+/// source, and this is where the control asks for the text it is about to draw.
+fn on_get_disp_info(hwnd: HWND, lparam: LPARAM) {
+    // SAFETY: the notification is an `NMLVDISPINFOW`, which is what
+    // `LVN_GETDISPINFOW` carries.
+    let info = unsafe { &mut *(lparam.0 as *mut NMLVDISPINFOW) };
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let Some(row) = state.rows.get(info.item.iItem as usize) else {
+        return;
+    };
+    let cells = crate::listview::row_cells(row);
+    let Some(text) = cells.get(info.item.iSubItem as usize) else {
+        return;
+    };
+    if info.item.pszText.0.is_null() || info.item.cchTextMax <= 0 {
+        return;
     }
 
+    let capacity = info.item.cchTextMax as usize;
+    let units: Vec<u16> = text
+        .encode_utf16()
+        .take(capacity.saturating_sub(1))
+        .collect();
+    // SAFETY: `pszText` was non-null above, `cchTextMax` is the buffer's length in
+    // UTF-16 units, and `units` plus the terminator fits because the take() above
+    // stopped one short.
+    unsafe {
+        core::ptr::copy_nonoverlapping(units.as_ptr(), info.item.pszText.0, units.len());
+        *info.item.pszText.0.add(units.len()) = 0;
+    }
+}
+
+/// The list view's custom draw.
+fn on_custom_draw(hwnd: HWND, lparam: LPARAM) -> isize {
     // SAFETY: `hwnd` is the page dialog.
     let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
         return 0;
@@ -902,7 +1644,9 @@ fn on_notify(hwnd: HWND, lparam: LPARAM) -> isize {
         0
     };
     // SAFETY: the notification is the one the message carries.
-    match unsafe { crate::listview::custom_draw(lparam, &state.rows, mono_font) } {
+    match unsafe {
+        crate::listview::custom_draw_with_palette(lparam, &state.rows, mono_font, &state.palette)
+    } {
         Some(answer) => {
             // The custom-draw answer is a **message result**, not the dialog
             // procedure's BOOL. A dialog procedure must put it in
@@ -914,6 +1658,170 @@ fn on_notify(hwnd: HWND, lparam: LPARAM) -> isize {
             1
         }
         None => 0,
+    }
+}
+
+/// Double-click: digest column copies the digest, any other column the sumfile line.
+fn on_double_click(hwnd: HWND, lparam: LPARAM) {
+    // SAFETY: an `NM_DBLCLK` notification carries an `NMLISTVIEW` at lparam.
+    let info = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+    if info.iItem < 0 {
+        return;
+    }
+    // SAFETY: `hwnd` is the page dialog; a missing state means the window is
+    // already being torn down.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let Some(list) = state.list else {
+        return;
+    };
+    let Some(id) = crate::listview::item_id(list, info.iItem as usize, &state.rows) else {
+        return;
+    };
+    let kind = if info.iSubItem == 1 {
+        crate::clipboard::CopyKind::Digest
+    } else {
+        crate::clipboard::CopyKind::OneSumfileLine
+    };
+    copy_ids(hwnd, &[id], kind);
+}
+
+/// `Ctrl+C` on the list: copy the selection as TSV.
+fn on_list_keydown(hwnd: HWND, lparam: LPARAM) {
+    // SAFETY: an `LVN_KEYDOWN` notification carries an `NMLVKEYDOWN` at lparam.
+    let key = unsafe { &*(lparam.0 as *const NMLVKEYDOWN) };
+    if key.wVKey != b'C' as u16 || (key.flags & LVKF_CONTROL) == 0 {
+        return;
+    }
+    // SAFETY: `hwnd` is the page dialog; a missing state means the window is
+    // already being torn down.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let Some(list) = state.list else {
+        return;
+    };
+    let selected = crate::listview::selected_ids(list, &state.rows);
+    copy_ids(hwnd, &selected, crate::clipboard::CopyKind::Selection);
+}
+
+/// Right-click: four copy actions, with "Copy all" always available.
+fn on_right_click(hwnd: HWND, lparam: LPARAM) {
+    // SAFETY: an `NM_RCLICK` notification carries an `NMLISTVIEW` at lparam.
+    let info = unsafe { &*(lparam.0 as *const NMLISTVIEW) };
+    let has_row = info.iItem >= 0;
+    // SAFETY: `hwnd` is the page dialog; a missing state means the window is
+    // already being torn down.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let Some(list) = state.list else {
+        return;
+    };
+    let id = has_row
+        .then(|| crate::listview::item_id(list, info.iItem as usize, &state.rows))
+        .flatten();
+
+    // SAFETY: `CreatePopupMenu` returns a menu or null; `hmenu` is checked below.
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+
+    let enabled_flags = |enabled: bool| {
+        if enabled {
+            MF_STRING
+        } else {
+            MENU_ITEM_FLAGS(MF_STRING.0 | MF_GRAYED.0)
+        }
+    };
+    // SAFETY: `menu` is a live popup menu; every string is a static wide literal
+    // and every call copies what it needs.
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            enabled_flags(has_row),
+            IDM_COPY_DIGEST,
+            w!("Copy digest"),
+        );
+        let _ = AppendMenuW(menu, enabled_flags(has_row), IDM_COPY_ROW, w!("Copy row"));
+        let _ = AppendMenuW(
+            menu,
+            enabled_flags(has_row),
+            IDM_COPY_FILE,
+            w!("Copy file name"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, IDM_COPY_ALL, w!("Copy all"));
+    }
+
+    let mut point = POINT::default();
+    // SAFETY: `point` is a live local; `GetCursorPos` writes into it.
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    // SAFETY: `menu` is live and `hwnd` is the page; `TPM_RETURNCMD` makes the
+    // return value the chosen command rather than a BOOL. `None` is a legal null
+    // rectangle pointer.
+    let command = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            Some(0),
+            hwnd,
+            None,
+        )
+    };
+    // SAFETY: `menu` was created above and is destroyed exactly once.
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+
+    match command.0 as usize {
+        IDM_COPY_DIGEST => {
+            if let Some(id) = id {
+                copy_ids(hwnd, &[id], crate::clipboard::CopyKind::Digest);
+            }
+        }
+        IDM_COPY_ROW => {
+            if let Some(id) = id {
+                copy_ids(hwnd, &[id], crate::clipboard::CopyKind::Row);
+            }
+        }
+        IDM_COPY_FILE => {
+            if let Some(id) = id {
+                copy_ids(hwnd, &[id], crate::clipboard::CopyKind::FileName);
+            }
+        }
+        IDM_COPY_ALL => copy_ids(hwnd, &[], crate::clipboard::CopyKind::All),
+        _ => {}
+    }
+}
+
+/// Copy rows and report the outcome on the status line.
+fn copy_ids(hwnd: HWND, ids: &[u64], kind: crate::clipboard::CopyKind) {
+    // SAFETY: `hwnd` is the page dialog; a missing state means the window is
+    // already being torn down.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let Some(text) = crate::clipboard::render(&state.rows, ids, kind) else {
+        return;
+    };
+    let count = text.lines().count();
+    if crate::clipboard::copy(hwnd, &text) {
+        set_status_on(
+            state.status,
+            &crate::strings::text(crate::strings::Key::CopiedRows)
+                .replace("{}", &count.to_string()),
+        );
+    } else {
+        set_status_on(
+            state.status,
+            crate::strings::text(crate::strings::Key::CopyFailed),
+        );
     }
 }
 
@@ -931,7 +1839,43 @@ fn on_scan_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
         crate::route::Route::Finished => on_scan_finished(hwnd),
         crate::route::Route::Verification(sequence) => on_verify_ready(hwnd, sequence),
         crate::route::Route::ExportDone(sequence) => on_export_done(hwnd, sequence),
+        crate::route::Route::Discovery(count) => on_discovery(hwnd, count),
+        crate::route::Route::JobsReady(count) => on_jobs_ready(hwnd, count),
     }
+}
+
+/// Discovery found more files.
+fn on_discovery(hwnd: HWND, count: usize) {
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    state.discovery_files = count;
+    state.scan_phase = crate::ScanPhase::Discovering;
+    refresh_status(hwnd, state, &shared_state_or_empty(hwnd));
+    set_control_state(hwnd, state);
+}
+
+/// The job list is published; hashing is about to start.
+fn on_jobs_ready(hwnd: HWND, count: usize) {
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    state.job_count = count;
+    state.scan_phase = crate::ScanPhase::Hashing;
+    crate::listview::set_file_column_for_jobs(state.list, count);
+    set_control_state(hwnd, state);
+    refresh_status(hwnd, state, &shared_state_or_empty(hwnd));
+}
+
+/// A shared-state handle for status functions that need counters, or an empty one.
+///
+/// `refresh_status` needs a `Shared`; during discovery the session has one, but a
+/// window that has already torn its session down does not. An empty state keeps
+/// that path total instead of returning without writing anything.
+fn shared_state_or_empty(hwnd: HWND) -> Arc<Shared> {
+    shared_state(hwnd).unwrap_or_else(|| Arc::new(Shared::new()))
 }
 
 /// Move the progress bar.
@@ -965,15 +1909,34 @@ fn drain_rows(hwnd: HWND) {
     }
 
     let list = state.list;
-    let first_new_row = state.rows.len();
+    let selected = list
+        .map(|list| crate::listview::selected_ids(list, &state.rows))
+        .unwrap_or_default();
+
     for readout in readouts {
-        state.rows.extend(readout.rows);
+        // Rows are always kept in job order. A file that finishes early appears
+        // where its job belongs, not at the end; a file that finishes later is
+        // inserted above the rows that were already there. The result is that the
+        // list never has to be reordered at the end of the scan.
+        let start = state
+            .rows
+            .partition_point(|row| row.job_index < readout.job_index);
+        let existing = state.rows[start..]
+            .iter()
+            .take_while(|row| row.job_index == readout.job_index)
+            .count();
+
+        if existing > 0 {
+            state.rows.drain(start..start + existing);
+        }
+        state.rows.splice(start..start, readout.rows);
     }
 
     if let Some(list) = list {
-        for (offset, row) in state.rows[first_new_row..].iter().enumerate() {
-            crate::listview::insert_row(list, first_new_row + offset, row);
-        }
+        // The control is virtual: setting the item count is the whole render, and
+        // the cells are asked for through `LVN_GETDISPINFOW`.
+        crate::listview::set_rows(list, &state.rows);
+        crate::listview::select_ids(list, &selected, &state.rows);
     }
 
     refresh_status(hwnd, state, &shared);
@@ -993,11 +1956,27 @@ fn on_scan_finished(hwnd: HWND) {
     // finishing: the rebuild and the worker's own counter update are under
     // different locks, so a result arriving between them could otherwise leave
     // the status line one file short until the next rebuild.
+    let cancelled = shared_state(hwnd)
+        .as_ref()
+        .is_some_and(|shared| shared.is_cancelled());
     if let Some(shared) = shared_state(hwnd) {
         // The rows in the queue would be rendered a second time by the rebuild.
         let _ = shared.drain();
     }
+    // SAFETY: `hwnd` is the page dialog; the session has not been torn down yet.
+    if let Some(state) = unsafe { state(hwnd) } {
+        state.scan_phase = if cancelled {
+            crate::ScanPhase::Cancelled
+        } else {
+            crate::ScanPhase::Finished
+        };
+    }
     rebuild_and_refresh(hwnd);
+    // SAFETY: `hwnd` is still the page dialog; the rebuild above did not destroy
+    // it.
+    if let Some(state) = unsafe { state(hwnd) } {
+        set_control_state(hwnd, state);
+    }
 }
 
 /// Rewrite the status line from what the hashing thread reports.
@@ -1007,13 +1986,35 @@ fn refresh_status(hwnd: HWND, state: &DialogState, shared: &Arc<Shared>) {
         return;
     };
 
-    let mut text = if shared.is_cancelled() && !shared.is_finished() {
-        String::from(resource::STATUS_CANCELLED)
+    let mut text = if shared.is_cancelled() && !shared.is_finished() && state.cancelling {
+        crate::strings::text(crate::strings::Key::Cancelling).to_string()
+    } else if shared.is_cancelled() {
+        // A cancelled scan is not a finished one, however many files it managed
+        // to report. Saying "1 matched" without the qualifier would present a
+        // partial result set as the answer.
+        format!(
+            "{}  \u{2022}  {}  \u{2022}  {}",
+            crate::strings::text(crate::strings::Key::Cancelled),
+            resource::status_finished_with_skipped(&shared.counters(), shared.skipped()),
+            crate::strings::text(crate::strings::Key::ResultsIncomplete)
+        )
     } else if shared.is_finished() {
         resource::status_finished_with_skipped(&shared.counters(), shared.skipped())
+    } else if state.scan_phase == crate::ScanPhase::Discovering {
+        crate::strings::text(crate::strings::Key::Discovering)
+            .replace("{}", &state.discovery_files.to_string())
     } else {
         let (done, total) = shared.file_counts();
-        resource::status_running(done, total, &shared.counters())
+        let mut text = resource::status_running(done, total, &shared.counters());
+        // The counters are real, but more files are still coming. Say so rather
+        // than letting a pasted digest look like a verdict on the whole selection.
+        if shared.verification().is_some() {
+            text.push_str("  \u{2022}  ");
+            text.push_str(crate::strings::text(
+                crate::strings::Key::ResultsMayBePartial,
+            ));
+        }
+        text
     };
 
     // The verdicts' source is part of the summary: "3 matched" against a checksum
@@ -1060,6 +2061,54 @@ fn set_status(status: HWND, text: &str) {
     // call, which copies it.
     unsafe {
         let _ = SetWindowTextW(status, PCWSTR(wide.as_ptr()));
+    }
+
+    update_status_tooltip(status, text);
+}
+
+/// Keep the status tooltip's full text in step with the visible line.
+fn update_status_tooltip(status: HWND, text: &str) {
+    // SAFETY: `status` is a child of the page; `GetParent` returns null if it is
+    // not, which the state lookup below rejects.
+    let Some(page) = (unsafe { GetParent(status) }).ok() else {
+        return;
+    };
+    // SAFETY: `page` is the dialog that owns the status line.
+    let Some(state) = (unsafe { crate::dialog::state(page) }) else {
+        return;
+    };
+    let Some(tooltip) = state.tooltip else {
+        return;
+    };
+
+    state.tooltip_status = text.encode_utf16().chain(core::iter::once(0)).collect();
+    let mut info = TTTOOLINFOW {
+        cbSize: core::mem::size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TOOLTIP_FLAGS(TTF_IDISHWND.0),
+        hwnd: page,
+        uId: status.0 as usize,
+        lpszText: PWSTR(state.tooltip_status.as_mut_ptr()),
+        ..Default::default()
+    };
+    // SAFETY: `tooltip` and `status` are live children of `page`, and `info`
+    // lives for the call; the tooltip copies the text it is given.
+    unsafe {
+        SendMessageW(
+            tooltip,
+            TTM_UPDATETIPTEXTW,
+            Some(WPARAM(0)),
+            Some(LPARAM((&mut info as *mut TTTOOLINFOW) as isize)),
+        );
+    }
+}
+
+/// Replace one control's text.
+fn set_control_text(control: HWND, text: &str) {
+    let wide: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
+    // SAFETY: `control` is one of the page's controls and the string outlives the
+    // call, which copies it.
+    unsafe {
+        let _ = SetWindowTextW(control, PCWSTR(wide.as_ptr()));
     }
 }
 
@@ -1181,12 +2230,15 @@ mod tests {
 
     /// Every message the page posts for itself, in one place, so a new one
     /// cannot be added without the range and distinctness checks below seeing it.
-    const PRIVATE_MESSAGES: [u32; 5] = [
+    const PRIVATE_MESSAGES: [u32; 8] = [
         WM_FILE_FINISHED,
         WM_FILE_PROGRESS,
         WM_SCAN_FINISHED,
         WM_VERIFY_READY,
         WM_EXPORT_DONE,
+        WM_DISCOVERY_PROGRESS,
+        WM_SORT_COLUMN,
+        WM_JOBS_READY,
     ];
 
     #[test]

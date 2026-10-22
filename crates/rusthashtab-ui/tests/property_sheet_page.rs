@@ -32,19 +32,30 @@ use rusthashtab_ui::DialogState;
 use rusthashtab_ui::page::test_dlg_proc;
 use rusthashtab_ui::resource;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::Controls::{LVITEMW, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW};
+use windows::Win32::UI::Controls::{
+    LIST_VIEW_ITEM_STATE_FLAGS, LVIF_STATE, LVIS_SELECTED, LVITEMW, LVKF_CONTROL,
+    LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW, LVM_SETITEMSTATE, LVN_KEYDOWN,
+    NM_DBLCLK, NMHDR, NMLISTVIEW, NMLVKEYDOWN,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_CLICK, CreateDialogParamW, DestroyWindow, GetDlgItem, IsWindow, SendMessageW,
-    SetWindowTextW, WM_CLOSE,
+    BM_CLICK, CreateDialogParamW, DestroyWindow, GetDlgItem, GetNextDlgTabItem, IsWindow,
+    PostMessageW, SendMessageW, SetWindowTextW, WM_CLOSE, WM_NOTIFY,
 };
 use windows::core::{PCWSTR, w};
 
 /// Nothing in this suite should take this long; a page that does is hung, and a hung
 /// test binary reports nothing at all.
 const DEADLINE: Duration = Duration::from_secs(120);
+
+/// The clipboard is a single system-wide resource; two tests that copy at the
+/// same time make one of them fail to open it. Serialising just those tests is
+/// cheaper than retrying and does not hide a real failure.
+static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
 
 /// A uniquely named temporary directory, removed on drop.
 struct TempDir(PathBuf);
@@ -207,6 +218,79 @@ impl HostedPage {
         }
     }
 
+    /// Whether one of the page's controls is enabled.
+    fn is_enabled(&self, id: i32) -> bool {
+        // SAFETY: `id` names a control in this page's template; `IsWindowEnabled`
+        // reads the window's enabled state.
+        unsafe { IsWindowEnabled(self.control(id)).as_bool() }
+    }
+
+    /// One column's width in pixels.
+    fn column_width(&self, column: i32) -> i32 {
+        let list = self.control(resource::IDC_HASH_LIST);
+        // SAFETY: `LVM_GETCOLUMNWIDTH` takes integers only.
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_GETCOLUMNWIDTH,
+                Some(WPARAM(column as usize)),
+                Some(LPARAM(0)),
+            )
+            .0 as i32
+        }
+    }
+
+    /// Select one row, the way a user does.
+    fn select_row(&self, row: usize) {
+        let list = self.control(resource::IDC_HASH_LIST);
+        let mut item = LVITEMW {
+            mask: LVIF_STATE,
+            state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0),
+            stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0),
+            ..Default::default()
+        };
+        // SAFETY: `list` is the page's list view and `item` lives for the call.
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETITEMSTATE,
+                Some(WPARAM(row)),
+                Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
+            );
+        }
+    }
+
+    /// Ask the page to sort by one column, as the header subclass would.
+    fn sort_by(&self, column: usize) {
+        // SAFETY: both parameters are integers; the page validates the magic.
+        unsafe {
+            let _ = PostMessageW(
+                Some(self.hwnd),
+                rusthashtab_ui::WM_SORT_COLUMN,
+                WPARAM(rusthashtab_ui::MESSAGE_MAGIC),
+                LPARAM(column as isize),
+            );
+        }
+        pump();
+    }
+
+    /// Wait until the status line no longer says discovering or hashing.
+    fn wait_for_finished(&self) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let status = self.status_text();
+            if !status.contains("Hashing") && !status.contains("Discovering") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the page never finished hashing: {status:?}"
+            );
+            pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// The text of the page's status line.
     fn status_text(&self) -> String {
         let status = self.control(resource::IDC_HASH_STATUS);
@@ -347,6 +431,25 @@ fn a_page_shows_its_controls() {
     assert!(page.control(resource::IDC_HASH_VERIFY).0 as isize != 0);
     assert!(page.control(resource::IDC_HASH_EXPORT).0 as isize != 0);
     assert!(page.control(resource::IDC_HASH_SETTINGS).0 as isize != 0);
+    assert!(page.control(resource::IDC_HASH_CANCEL).0 as isize != 0);
+    assert!(
+        page.control(resource::IDC_HASH_EXPORT_FORMAT).0 as isize != 0,
+        "the export-format selector is missing"
+    );
+    assert!(
+        page.control(resource::IDC_HASH_EXPORT_CLIPBOARD).0 as isize != 0,
+        "the clipboard export button is missing"
+    );
+    assert!(
+        page.control(resource::IDC_HASH_CURRENT_ONLY).0 as isize != 0,
+        "the current-file checkbox is missing"
+    );
+    // SAFETY: `page` owns this state until `close`.
+    let tooltip = unsafe { (*page.state).tooltip };
+    assert!(tooltip.is_some(), "the tooltip control was not created");
+    // SAFETY: as above; the buffer is a live field.
+    let status_tooltip_is_empty = unsafe { (*page.state).tooltip_status.is_empty() };
+    assert!(!status_tooltip_is_empty, "the status tooltip has no text");
 
     // The columns are the page's own, added at `WM_INITDIALOG`.
     let list = page.control(resource::IDC_HASH_LIST);
@@ -771,7 +874,7 @@ fn pasting_something_that_is_not_a_digest_changes_nothing() {
 
     assert_eq!(page.cell(0, 2), "not checked");
     assert!(
-        page.status_text().contains("Not a hex digest"),
+        page.status_text().contains("Not a digest or checksum line"),
         "the status line must say why nothing happened, got {:?}",
         page.status_text()
     );
@@ -899,6 +1002,351 @@ fn the_finished_status_counts_each_file_once() {
         std::thread::sleep(Duration::from_millis(2));
     }
 
+    page.close();
+}
+
+/// Tab moves through the visible controls in the order the template declares.
+#[test]
+fn tab_order_follows_the_template() {
+    let dir = TempDir::new("tab-order");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    // A disabled control is skipped by `GetNextDlgTabItem`; wait until hashing
+    // has finished so every result action is enabled.
+    page.wait_for_finished();
+
+    let order = [
+        resource::IDC_HASH_LIST,
+        resource::IDC_HASH_EXPECTED,
+        resource::IDC_HASH_CHECK,
+        resource::IDC_HASH_CURRENT_ONLY,
+        resource::IDC_HASH_EXPORT_FORMAT,
+        resource::IDC_HASH_VERIFY,
+        resource::IDC_HASH_EXPORT,
+        resource::IDC_HASH_EXPORT_CLIPBOARD,
+        resource::IDC_HASH_COPY,
+        resource::IDC_HASH_SETTINGS,
+    ];
+    for pair in order.windows(2) {
+        // SAFETY: both handles belong to this page and are live until close.
+        let next = unsafe { GetNextDlgTabItem(page.hwnd, Some(page.control(pair[0])), false) }.ok();
+        assert_eq!(
+            next,
+            Some(page.control(pair[1])),
+            "tab order broke between {:?} and {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // Cancel is disabled after the scan finishes, so it is skipped by the tab
+    // walk; the next control after Settings is the list again.
+    // SAFETY: both handles belong to this page and are live until close.
+    let after_settings = unsafe {
+        GetNextDlgTabItem(
+            page.hwnd,
+            Some(page.control(resource::IDC_HASH_SETTINGS)),
+            false,
+        )
+    }
+    .ok();
+    assert_eq!(after_settings, Some(page.control(resource::IDC_HASH_LIST)));
+    page.close();
+}
+
+/// `Ctrl+C` on the list takes the selection, the same path as the Copy button.
+#[test]
+fn ctrl_c_copies_the_selected_rows() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("ctrl-c");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+    page.select_row(0);
+
+    let mut key = NMLVKEYDOWN {
+        hdr: NMHDR {
+            hwndFrom: page.hwnd,
+            idFrom: resource::IDC_HASH_LIST as usize,
+            code: LVN_KEYDOWN,
+        },
+        wVKey: b'C' as u16,
+        flags: LVKF_CONTROL,
+    };
+    // SAFETY: the page is live and `key` lives for the call.
+    unsafe {
+        SendMessageW(
+            page.hwnd,
+            WM_NOTIFY,
+            Some(WPARAM(0)),
+            Some(LPARAM((&mut key as *mut NMLVKEYDOWN) as isize)),
+        );
+    }
+    pump();
+    assert!(
+        page.status_text().contains("Copied 1 rows"),
+        "got {:?}",
+        page.status_text()
+    );
+    page.close();
+}
+
+/// Double-clicking the digest column copies just the digest.
+#[test]
+fn double_clicking_a_digest_copies_it() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("double-click");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    let mut click = NMLISTVIEW {
+        hdr: NMHDR {
+            hwndFrom: page.hwnd,
+            idFrom: resource::IDC_HASH_LIST as usize,
+            code: NM_DBLCLK,
+        },
+        iItem: 0,
+        iSubItem: 1,
+        ..Default::default()
+    };
+    // SAFETY: the page is live and `click` lives for the call.
+    unsafe {
+        SendMessageW(
+            page.hwnd,
+            WM_NOTIFY,
+            Some(WPARAM(0)),
+            Some(LPARAM((&mut click as *mut NMLISTVIEW) as isize)),
+        );
+    }
+    pump();
+    assert!(
+        page.status_text().contains("Copied 1 rows"),
+        "got {:?}",
+        page.status_text()
+    );
+    page.close();
+}
+
+/// A pasted whole line targets the file it names; the other file stays unchecked.
+#[test]
+fn pasting_a_gnu_line_marks_only_the_named_file() {
+    let dir = TempDir::new("paste-line");
+    dir.file("a.bin", b"aaa");
+    dir.file("b.bin", b"bbb");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![dir.path().to_path_buf()], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+
+    let line = format!("{}  a.bin", digest_hex("SHA-256", b"aaa"));
+    page.set_text(resource::IDC_HASH_EXPECTED, &line);
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(page.cell(0, 3), "a.bin");
+    assert_eq!(page.cell(0, 2), "matched");
+    assert_eq!(page.cell(1, 3), "b.bin");
+    assert_eq!(page.cell(1, 2), "not checked");
+    page.close();
+}
+
+/// The clipboard export uses the selected format without opening a Save dialog.
+#[test]
+fn copying_checksums_reports_the_count() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("copy-checksums");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+    page.click(resource::IDC_HASH_EXPORT_CLIPBOARD);
+    pump();
+    assert!(
+        page.status_text().contains("Copied 1 hashes"),
+        "got {:?}",
+        page.status_text()
+    );
+    page.close();
+}
+
+/// The Copy button copies the selected rows and reports how many it took.
+#[test]
+fn copying_the_selection_is_reported() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("copy-selection");
+    let file = dir.file("payload.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+    page.select_row(0);
+    page.click(resource::IDC_HASH_COPY);
+    pump();
+    assert!(
+        page.status_text().contains("Copied 1 rows"),
+        "got {:?}",
+        page.status_text()
+    );
+    page.close();
+}
+
+/// A single file has no useful File column; hiding it gives the digest more room.
+#[test]
+fn a_single_file_hides_the_file_column() {
+    let dir = TempDir::new("single-file-column");
+    let file = dir.file("only.bin", b"bytes");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+    assert_eq!(
+        page.column_width(3),
+        0,
+        "a single file's path is redundant; the column should be hidden"
+    );
+    page.close();
+}
+
+/// A directory keeps the File column, because the rows belong to different files.
+#[test]
+fn several_files_keep_the_file_column() {
+    let dir = TempDir::new("many-file-column");
+    dir.file("a.bin", b"aaa");
+    dir.file("b.bin", b"bbb");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![dir.path().to_path_buf()], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+    assert!(
+        page.column_width(3) > 0,
+        "the File column must stay visible"
+    );
+    page.close();
+}
+
+/// Export is the one action that becomes safe only when the scan is complete;
+/// Cancel is the one that is safe only while it runs.
+#[test]
+fn the_scan_phase_gates_the_result_actions() {
+    let dir = TempDir::new("phase-gate");
+    let path = dir.path().join("big.bin");
+    std::fs::File::create(&path)
+        .expect("the file must be creatable")
+        .set_len(2 * 1024 * 1024 * 1024)
+        .expect("the file must be extendable");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-512"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![path], settings);
+    // Immediately after opening, the scan is still running (2 GiB of sparse
+    // zeros takes long enough to observe), so Export must be disabled and Cancel
+    // enabled.
+    assert!(!page.is_enabled(resource::IDC_HASH_EXPORT));
+    assert!(page.is_enabled(resource::IDC_HASH_CANCEL));
+
+    page.click(resource::IDC_HASH_CANCEL);
+    page.wait_for_status_contains("Cancelled");
+    assert!(!page.is_enabled(resource::IDC_HASH_EXPORT));
+    assert!(!page.is_enabled(resource::IDC_HASH_CANCEL));
+    page.close();
+}
+
+/// Cancel must return to the dialog thread immediately; the scan finishes on its
+/// own and posts its completion later.
+#[test]
+fn cancelling_returns_immediately_and_finishes_later() {
+    let dir = TempDir::new("cancel-timing");
+    let path = dir.path().join("huge.bin");
+    std::fs::File::create(&path)
+        .expect("the file must be creatable")
+        .set_len(2 * 1024 * 1024 * 1024)
+        .expect("the file must be extendable");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-512"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![path], settings);
+    let started = Instant::now();
+    page.click(resource::IDC_HASH_CANCEL);
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "Cancel blocked the dialog thread for {:?}",
+        started.elapsed()
+    );
+    page.wait_for_status_contains("Cancelled");
+    page.close();
+}
+
+/// Clicking a column header sorts; a second click reverses; the sort indicator is
+/// driven by the same state.
+#[test]
+fn a_column_header_click_sorts_the_rows() {
+    let dir = TempDir::new("sorting");
+    dir.file("b.bin", b"bbb");
+    dir.file("a.bin", b"aaa");
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![dir.path().to_path_buf()], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+
+    page.sort_by(3); // File, ascending
+    assert_eq!(page.cell(0, 3), "a.bin");
+    assert_eq!(page.cell(1, 3), "b.bin");
+
+    page.sort_by(3); // descending
+    assert_eq!(page.cell(0, 3), "b.bin");
+    assert_eq!(page.cell(1, 3), "a.bin");
     page.close();
 }
 

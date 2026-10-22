@@ -40,6 +40,7 @@
 #define ES_AUTOHSCROLL      0x00000080L
 
 #define LVS_REPORT          0x00000001L
+#define LVS_OWNERDATA       0x00001000L
 #define LVS_SINGLESEL       0x00000004L
 #define LVS_SHOWSELALWAYS   0x00000008L
 #define LVS_NOCOLUMNHEADER  0x00004000L
@@ -49,6 +50,8 @@
 #define SS_LEFT             0x00000000L
 #define SS_NOPREFIX         0x00000080L
 #define BS_PUSHBUTTON       0x00000000L
+#define WS_VSCROLL          0x00200000L
+#define CBS_DROPDOWNLIST    0x0003L
 
 // Standard dialog command identifiers. `rc.exe` only knows these from
 // `windows.h`, which this file deliberately does not include, so they are
@@ -69,6 +72,10 @@
 #define IDC_HASH_VERIFY     1007
 #define IDC_HASH_EXPORT     1008
 #define IDC_HASH_SETTINGS   1009
+#define IDC_HASH_CANCEL     1010
+#define IDC_HASH_EXPORT_FORMAT 1011
+#define IDC_HASH_EXPORT_CLIPBOARD 1012
+#define IDC_HASH_CURRENT_ONLY 1013
 
 // The settings dialog. Checkboxes are read with IsDlgButtonChecked; the
 // algorithm checklist is a report-mode list view switched to check boxes at
@@ -87,41 +94,58 @@
 #define IDC_SETTINGS_SUMFILE_BANNER         2110
 #define IDC_SETTINGS_SUMFILE_BANNER_DATE    2111
 #define IDC_SETTINGS_DEFAULTS               2112
+#define IDC_SETTINGS_VERIFY_STRICT          2113
+#define IDC_SETTINGS_VERIFY_AUTO_FORMAT     2114
+#define IDC_SETTINGS_COLOUR_CLASS           2115
+#define IDC_SETTINGS_COLOUR_PREVIEW         2116
+#define IDC_SETTINGS_COLOUR_TEXT            2117
+#define IDC_SETTINGS_COLOUR_BG              2118
+#define IDC_SETTINGS_COLOUR_DEFAULTS        2119
 
-IDD_HASH_PROPPAGE DIALOGEX 0, 0, 260, 205
+IDD_HASH_PROPPAGE DIALOGEX 0, 0, 280, 230
 STYLE DS_SETFONT | DS_FIXEDSYS | DS_CONTROL | WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN
 EXSTYLE WS_EX_CONTROLPARENT
 CAPTION "Hashes"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     CONTROL         "", IDC_HASH_LIST, "SysListView32",
-                    LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_TABSTOP,
-                    7, 7, 246, 124
+                    LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | WS_TABSTOP,
+                    7, 7, 266, 124
 
-    LTEXT           "", IDC_HASH_STATUS, 7, 135, 246, 9,
+    LTEXT           "", IDC_HASH_STATUS, 7, 135, 266, 9,
                     SS_LEFT | SS_NOPREFIX | WS_GROUP
 
     LTEXT           "Expected:", -1, 7, 150, 42, 9, SS_LEFT | SS_NOPREFIX
-    EDITTEXT        IDC_HASH_EXPECTED, 50, 148, 140, 13,
+    EDITTEXT        IDC_HASH_EXPECTED, 50, 148, 150, 13,
                     ES_AUTOHSCROLL | WS_TABSTOP
-    PUSHBUTTON      "&Check", IDC_HASH_CHECK, 196, 147, 57, 15,
+    PUSHBUTTON      "&Check", IDC_HASH_CHECK, 204, 147, 69, 15,
                     BS_PUSHBUTTON | WS_TABSTOP
 
-    PUSHBUTTON      "Ve&rify...", IDC_HASH_VERIFY, 7, 166, 58, 15,
+    AUTOCHECKBOX    "Current file only", IDC_HASH_CURRENT_ONLY, 7, 164, 150, 10
+
+    LTEXT           "Format:", -1, 7, 178, 30, 9, SS_LEFT | SS_NOPREFIX
+    COMBOBOX        IDC_HASH_EXPORT_FORMAT, 38, 176, 90, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Ve&rify...", IDC_HASH_VERIFY, 134, 176, 60, 15,
                     BS_PUSHBUTTON | WS_TABSTOP
-    PUSHBUTTON      "E&xport...", IDC_HASH_EXPORT, 68, 166, 58, 15,
+    PUSHBUTTON      "E&xport...", IDC_HASH_EXPORT, 197, 176, 60, 15,
                     BS_PUSHBUTTON | WS_TABSTOP
-    PUSHBUTTON      "&Settings...", IDC_HASH_SETTINGS, 129, 166, 58, 15,
+
+    PUSHBUTTON      "Copy &checksums", IDC_HASH_EXPORT_CLIPBOARD, 7, 194, 100, 15,
                     BS_PUSHBUTTON | WS_TABSTOP
-    PUSHBUTTON      "&Copy", IDC_HASH_COPY, 200, 166, 53, 15,
+    PUSHBUTTON      "&Copy", IDC_HASH_COPY, 112, 194, 50, 15,
+                    BS_PUSHBUTTON | WS_TABSTOP
+    PUSHBUTTON      "&Settings...", IDC_HASH_SETTINGS, 165, 194, 58, 15,
+                    BS_PUSHBUTTON | WS_TABSTOP
+    PUSHBUTTON      "Cancel", IDC_HASH_CANCEL, 226, 194, 47, 15,
                     BS_PUSHBUTTON | WS_TABSTOP
 
     CONTROL         "", IDC_HASH_PROGRESS, "msctls_progress32",
                     PBS_SMOOTH,
-                    7, 186, 246, 10
+                    7, 214, 266, 10
 END
 
-IDD_SETTINGS DIALOGEX 0, 0, 300, 258
+IDD_SETTINGS DIALOGEX 0, 0, 300, 360
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "rustHashTab Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -144,7 +168,24 @@ BEGIN
     AUTOCHECKBOX    "&Banner", IDC_SETTINGS_SUMFILE_BANNER, 207, 194, 80, 10
     AUTOCHECKBOX    "Banner &date", IDC_SETTINGS_SUMFILE_BANNER_DATE, 110, 207, 90, 10
 
-    PUSHBUTTON      "&Defaults", IDC_SETTINGS_DEFAULTS, 7, 236, 55, 15
-    DEFPUSHBUTTON   "OK", IDOK, 190, 236, 48, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 242, 236, 48, 15
+    GROUPBOX        "Verification", -1, 7, 230, 286, 35
+    AUTOCHECKBOX    "&Strict path matching", IDC_SETTINGS_VERIFY_STRICT, 13, 242, 274, 10
+    AUTOCHECKBOX    "Auto-&format pasted digests", IDC_SETTINGS_VERIFY_AUTO_FORMAT, 13, 253, 274, 10
+
+    GROUPBOX        "Colours", -1, 7, 269, 286, 61
+    LTEXT           "Class:", -1, 13, 282, 30, 9, SS_LEFT | SS_NOPREFIX
+    COMBOBOX        IDC_SETTINGS_COLOUR_CLASS, 45, 280, 100, 60,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_SETTINGS_COLOUR_PREVIEW, 155, 282, 130, 9,
+                    SS_LEFT | SS_NOPREFIX
+    PUSHBUTTON      "&Text...", IDC_SETTINGS_COLOUR_TEXT, 13, 296, 70, 15,
+                    BS_PUSHBUTTON | WS_TABSTOP
+    PUSHBUTTON      "&Background...", IDC_SETTINGS_COLOUR_BG, 88, 296, 90, 15,
+                    BS_PUSHBUTTON | WS_TABSTOP
+    PUSHBUTTON      "Colour &defaults", IDC_SETTINGS_COLOUR_DEFAULTS, 183, 296, 80, 15,
+                    BS_PUSHBUTTON | WS_TABSTOP
+
+    PUSHBUTTON      "&Defaults", IDC_SETTINGS_DEFAULTS, 7, 340, 55, 15
+    DEFPUSHBUTTON   "OK", IDOK, 190, 340, 48, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 242, 340, 48, 15
 END

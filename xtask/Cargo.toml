@@ -13,6 +13,9 @@ workspace = true
 
 [dependencies]
 rusthashtab-hash.workspace = true
+# `bench --scheduling` drives the real scan pipeline so fan-out numbers are
+# measured through the code users run, not a second implementation.
+rusthashtab-scan.workspace = true
 # The parser and exporter under test: `verify` feeds them files produced by
 # real checksum tools and hands their output back to those tools.
 rusthashtab-sumfile.workspace = true

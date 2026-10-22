@@ -806,6 +806,7 @@ dependencies = [
  "hex",
  "regex",
  "rusthashtab-hash",
+ "rusthashtab-scan",
  "rusthashtab-sumfile",
  "serde_json",
 ]

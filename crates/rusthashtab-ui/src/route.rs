@@ -42,6 +42,10 @@ pub enum Route {
     Verification(u32),
     /// An export request finished; the payload is its sequence number.
     ExportDone(u32),
+    /// Discovery found this many files so far.
+    Discovery(usize),
+    /// The job list is published; the payload is the job count.
+    JobsReady(usize),
     /// This window has no state: `WM_NCDESTROY` already ran, and the page is
     /// about to be freed. Nothing may be touched.
     NoState,
@@ -68,6 +72,8 @@ pub fn route(message: u32, wparam: usize, lparam: isize, hwnd_has_state: bool) -
         crate::WM_SCAN_FINISHED => Route::Finished,
         crate::WM_VERIFY_READY => Route::Verification(decode_sequence(lparam)),
         crate::WM_EXPORT_DONE => Route::ExportDone(decode_sequence(lparam)),
+        crate::WM_DISCOVERY_PROGRESS => Route::Discovery(decode_count(lparam)),
+        crate::WM_JOBS_READY => Route::JobsReady(decode_count(lparam)),
         _ => Route::NotOurs,
     }
 }
@@ -85,7 +91,17 @@ fn is_ours(message: u32, wparam: usize) -> bool {
             | crate::WM_SCAN_FINISHED
             | crate::WM_VERIFY_READY
             | crate::WM_EXPORT_DONE
+            | crate::WM_DISCOVERY_PROGRESS
+            | crate::WM_JOBS_READY
     ) && wparam == MESSAGE_MAGIC
+}
+
+/// Turn a count carried in `lParam` into a `usize`.
+///
+/// Clamped rather than trusted: a count from another thread is only used to
+/// decide what to display, and a negative payload can only be a stray message.
+fn decode_count(lparam: isize) -> usize {
+    lparam.max(0) as usize
 }
 
 /// Turn the `lParam` of a completion message back into its request sequence.
@@ -140,7 +156,8 @@ pub fn quantise(done: u64, total: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        WM_EXPORT_DONE, WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_SCAN_FINISHED, WM_VERIFY_READY,
+        WM_DISCOVERY_PROGRESS, WM_EXPORT_DONE, WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_JOBS_READY,
+        WM_SCAN_FINISHED, WM_VERIFY_READY,
     };
 
     /// The whole point of the module: a message that is not ours is passed on,
@@ -187,6 +204,14 @@ mod tests {
         assert_eq!(
             route(WM_EXPORT_DONE, MESSAGE_MAGIC, 9, true),
             Route::ExportDone(9)
+        );
+        assert_eq!(
+            route(WM_DISCOVERY_PROGRESS, MESSAGE_MAGIC, 17, true),
+            Route::Discovery(17)
+        );
+        assert_eq!(
+            route(WM_JOBS_READY, MESSAGE_MAGIC, 4, true),
+            Route::JobsReady(4)
         );
     }
 

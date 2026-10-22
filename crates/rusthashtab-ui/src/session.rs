@@ -46,7 +46,7 @@
 #![cfg(windows)]
 
 use crate::{Counters, JobSpec, ListRow, MAX_HASHED_FILES};
-use rusthashtab_scan::{FileResult, ScanConfig, ScanEvent, ScanOutcome, expand_selection};
+use rusthashtab_scan::{FileResult, ScanConfig, ScanEvent, ScanOutcome, expand_selection_with};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -394,6 +394,13 @@ pub trait SessionSink: Send + Sync + 'static {
     fn rows_ready(&self);
     /// The scan is over.
     fn finished(&self, outcome: ScanOutcome);
+    /// Discovery found this many files so far.
+    ///
+    /// Defaulted so the collectors that only care about hashing do not have to
+    /// grow a method they would ignore.
+    fn discovering(&self, _files: usize) {}
+    /// The job list is published; `jobs` files will be hashed.
+    fn jobs_ready(&self, _jobs: usize) {}
 }
 
 /// A shared sink is a sink.
@@ -414,6 +421,14 @@ impl<T: SessionSink + ?Sized> SessionSink for Arc<T> {
 
     fn finished(&self, outcome: ScanOutcome) {
         (**self).finished(outcome);
+    }
+
+    fn discovering(&self, files: usize) {
+        (**self).discovering(files);
+    }
+
+    fn jobs_ready(&self, jobs: usize) {
+        (**self).jobs_ready(jobs);
     }
 }
 
@@ -446,6 +461,14 @@ impl SessionSink for WindowSink {
 
     fn finished(&self, _outcome: ScanOutcome) {
         self.post(crate::WM_SCAN_FINISHED, 0);
+    }
+
+    fn discovering(&self, files: usize) {
+        self.post(crate::WM_DISCOVERY_PROGRESS, files as isize);
+    }
+
+    fn jobs_ready(&self, jobs: usize) {
+        self.post(crate::WM_JOBS_READY, jobs as isize);
     }
 }
 
@@ -598,6 +621,14 @@ impl ReadoutSession {
         let thread = std::thread::Builder::new()
             .name("rusthashtab-page".to_string())
             .spawn(move || {
+                // If anything in `run` panics, the page would otherwise wait
+                // forever for a completion message that is never posted. The
+                // wrapper's destructor reports cancellation on every path that
+                // did not already report a finish.
+                let sink: Box<dyn SessionSink> = Box::new(FinishOnDrop {
+                    sink: Some(sink),
+                    sent: AtomicBool::new(false),
+                });
                 // `run` takes the sink, so it is dropped when the scan's own
                 // closure is dropped -- after the last event, never before.
                 let result = run(&roots, sink, &worker_shared);
@@ -703,12 +734,21 @@ impl Drop for ReadoutSession {
 /// ordinary file errors and the page still gets its final "scan finished" message.
 fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> ScanOutcome {
     if shared.is_cancelled() {
+        sink.finished(ScanOutcome::Cancelled);
         return ScanOutcome::Cancelled;
     }
 
     let display = shared.display();
 
-    let mut jobs = expand_selection(roots);
+    sink.discovering(0);
+    let mut jobs = expand_selection_with(roots, &|| shared.is_cancelled(), &mut |discovery| {
+        sink.discovering(discovery.files)
+    });
+
+    if shared.is_cancelled() {
+        sink.finished(ScanOutcome::Cancelled);
+        return ScanOutcome::Cancelled;
+    }
 
     // The cap. Applied here rather than refusing the selection, so a directory of a
     // hundred thousand files performs a hundred thousand's worth of *visible* work
@@ -718,6 +758,8 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
         jobs.truncate(MAX_HASHED_FILES);
         shared.skipped.store(skipped, Ordering::Release);
     }
+
+    sink.jobs_ready(jobs.len());
 
     // A checksum file beside each hashed file is an automatic verification
     // source when the setting asks for one. It is read here, on the session
@@ -758,6 +800,7 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
         jobs,
         enabled: display.enabled.clone(),
         workers: 0,
+        scheduling: rusthashtab_scan::Scheduling::Auto,
     };
 
     let scan_cancelled = Arc::new(AtomicBool::new(false));
@@ -791,6 +834,63 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
 /// the scan's closure, so a field would be captured by value and be unreachable from
 /// outside; the `Arc` is what both sides hold.
 type ScanFlag = Arc<AtomicBool>;
+
+/// A sink that reports cancellation if it is dropped without a finish.
+///
+/// `run` has several early returns, all of which call `finished` explicitly. This
+/// guard covers the path those cannot: a panic unwinding out of the session
+/// thread. The page must never be left waiting for a completion message that no
+/// one will post, and the destructor runs during unwinding.
+struct FinishOnDrop {
+    sink: Option<Box<dyn SessionSink>>,
+    sent: AtomicBool,
+}
+
+impl SessionSink for FinishOnDrop {
+    fn progress(&self, steps: u64) {
+        if let Some(sink) = &self.sink {
+            sink.progress(steps);
+        }
+    }
+
+    fn rows_ready(&self) {
+        if let Some(sink) = &self.sink {
+            sink.rows_ready();
+        }
+    }
+
+    fn finished(&self, outcome: ScanOutcome) {
+        if self.sent.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sink) = &self.sink {
+            sink.finished(outcome);
+        }
+    }
+
+    fn discovering(&self, files: usize) {
+        if let Some(sink) = &self.sink {
+            sink.discovering(files);
+        }
+    }
+
+    fn jobs_ready(&self, jobs: usize) {
+        if let Some(sink) = &self.sink {
+            sink.jobs_ready(jobs);
+        }
+    }
+}
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        if self.sent.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sink) = self.sink.take() {
+            sink.finished(ScanOutcome::Cancelled);
+        }
+    }
+}
 
 /// The scan's sink: turns events into [`Readout`]s and notifications.
 ///

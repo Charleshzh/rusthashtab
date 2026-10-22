@@ -76,6 +76,8 @@ struct VecCollector {
     progress: Mutex<Vec<u64>>,
     rows_ready: AtomicUsize,
     finished: Mutex<Option<ScanOutcome>>,
+    discovery: Mutex<Vec<usize>>,
+    jobs_ready: AtomicUsize,
 }
 
 impl SessionSink for VecCollector {
@@ -95,6 +97,17 @@ impl SessionSink for VecCollector {
             .finished
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+    }
+
+    fn discovering(&self, files: usize) {
+        self.discovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(files);
+    }
+
+    fn jobs_ready(&self, _jobs: usize) {
+        self.jobs_ready.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -485,6 +498,21 @@ fn the_sink_is_told_about_every_file_and_the_end() {
         collector.rows_ready.load(Ordering::Acquire),
         2,
         "one notification per file"
+    );
+    assert_eq!(
+        collector.jobs_ready.load(Ordering::Acquire),
+        1,
+        "the page must learn the job count before hashing starts"
+    );
+    let discovery = collector
+        .discovery
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(
+        discovery.last().copied(),
+        Some(2),
+        "discovery must report the final file count"
     );
     assert_eq!(
         *collector

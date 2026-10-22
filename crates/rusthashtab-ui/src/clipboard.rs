@@ -37,66 +37,106 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 /// freed twice even by a later edit that adds an early return.
 struct HandedOver;
 
-/// Render rows as the tab-separated text that goes on the clipboard.
+/// What the user asked to copy.
 ///
-/// One line per selected row, four columns: algorithm, digest, verdict, and the
-/// file's display path. The last column is what makes a pasted table usable when
-/// the user copied several files: a list of digests with no file names is a list
-/// nobody can check anything against.
+/// The four context-menu entries, the double-click behaviours, and the Copy
+/// button all go through one renderer so their formats cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyKind {
+    /// The selected rows as four-column TSV, one line each.
+    Selection,
+    /// One row as four-column TSV.
+    Row,
+    /// The digest alone, one per selected row.
+    Digest,
+    /// `digest *path`, the form a checksum file uses.
+    SumfileLine,
+    /// The display path alone.
+    FileName,
+    /// Every displayed row as TSV.
+    All,
+    /// One row as `digest *path`.
+    OneSumfileLine,
+}
+
+/// Render rows for the clipboard.
 ///
-/// A header line is deliberately **not** emitted: the selection is what the user
-/// asked for, and adding a line they did not select makes a paste into a
-/// spreadsheet land one row off.
+/// `selected` holds stable row IDs, not positions: rows are inserted into job
+/// order while earlier files are still hashing, so a position is not a stable
+/// name for a row. An ID that no longer exists is skipped; the rest of the
+/// selection is still what the user asked for.
 ///
-/// Returns `None` when there is nothing to copy, so the caller can avoid touching
-/// the clipboard at all rather than replacing its contents with an empty string.
-pub fn render(rows: &[ListRow], selected: &[usize]) -> Option<String> {
-    if selected.is_empty() {
+/// A header line is deliberately **not** emitted for TSV: the selection is what
+/// the user asked for, and adding a line they did not select makes a paste into a
+/// spreadsheet land one row off. `None` means nothing to copy, so the caller can
+/// avoid touching the clipboard rather than replacing it with an empty string.
+pub fn render(rows: &[ListRow], selected: &[u64], kind: CopyKind) -> Option<String> {
+    let chosen: Vec<&ListRow> = match kind {
+        CopyKind::All => rows.iter().collect(),
+        _ => selected
+            .iter()
+            .filter_map(|id| rows.iter().find(|row| row.id == *id))
+            .collect(),
+    };
+    if chosen.is_empty() {
         return None;
     }
 
     let mut text = String::new();
-    for index in selected {
-        let Some(row) = rows.get(*index) else {
-            // A selection that names a row the page no longer has. Skipping it is
-            // right: the rest of the selection is still what the user asked for.
-            continue;
-        };
-
-        let algorithm = if row.algorithm == usize::MAX {
-            String::from("-")
-        } else {
-            rusthashtab_hash::ALGORITHMS
-                .get(row.algorithm)
-                .map(|algorithm| algorithm.name)
-                .unwrap_or("-")
-                .to_string()
-        };
-
-        let digest = match row.error {
-            Some(code) => crate::resource::read_error_text(code),
-            None => row.digest_hex.clone(),
-        };
-
-        let verdict = match row.match_state {
-            rusthashtab_scan::MatchState::Matched { .. } => "matched",
-            rusthashtab_scan::MatchState::Mismatched => "mismatch",
-            rusthashtab_scan::MatchState::NotChecked => "not checked",
-        };
-
+    for row in chosen {
         if !text.is_empty() {
             text.push_str("\r\n");
         }
-        text.push_str(&algorithm);
-        text.push('\t');
-        text.push_str(&digest);
-        text.push('\t');
-        text.push_str(verdict);
-        text.push('\t');
-        text.push_str(&row.display_path);
+        match kind {
+            CopyKind::Digest => text.push_str(&digest_text(row)),
+            CopyKind::FileName => text.push_str(&row.display_path),
+            CopyKind::SumfileLine | CopyKind::OneSumfileLine => {
+                if row.error.is_some() {
+                    // There is no digest to put in a checksum line. Copying the
+                    // path is honest; inventing an error string as a digest is not.
+                    text.push_str(&row.display_path);
+                } else {
+                    text.push_str(&digest_text(row));
+                    text.push_str(" *");
+                    text.push_str(&row.display_path);
+                }
+            }
+            CopyKind::Selection | CopyKind::Row | CopyKind::All => {
+                text.push_str(&tsv_line(row));
+            }
+        }
     }
 
     (!text.is_empty()).then_some(text)
+}
+
+/// The digest cell's text: the digest, or the error description.
+fn digest_text(row: &ListRow) -> String {
+    match row.error {
+        Some(code) => crate::resource::read_error_text(code),
+        None => row.digest_hex.clone(),
+    }
+}
+
+/// One row's four-column TSV line.
+fn tsv_line(row: &ListRow) -> String {
+    let algorithm = if row.algorithm == usize::MAX {
+        String::from("-")
+    } else {
+        rusthashtab_hash::ALGORITHMS
+            .get(row.algorithm)
+            .map(|algorithm| algorithm.name)
+            .unwrap_or("-")
+            .to_string()
+    };
+    let digest = digest_text(row);
+    let verdict = match row.match_state {
+        rusthashtab_scan::MatchState::Matched { .. } => "matched",
+        rusthashtab_scan::MatchState::Mismatched => "mismatch",
+        rusthashtab_scan::MatchState::NotChecked => "not checked",
+    };
+
+    format!("{algorithm}\t{digest}\t{verdict}\t{}", row.display_path)
 }
 
 /// Copy the selected rows to the clipboard.
@@ -193,6 +233,14 @@ unsafe fn fill_clipboard(text: &str) -> bool {
 mod tests {
     use super::*;
     use rusthashtab_scan::MatchState;
+    use std::cell::Cell;
+
+    // Each test runs on its own thread, so this starts at zero for every test and
+    // rows created in one test get the IDs 0, 1, ... -- which lets the assertions
+    // address rows the way the page does without hand-writing an ID per call.
+    thread_local! {
+        static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+    }
 
     fn row(
         algorithm: usize,
@@ -202,6 +250,11 @@ mod tests {
         path: &str,
     ) -> ListRow {
         ListRow {
+            id: NEXT_ID.with(|next| {
+                let id = next.get();
+                next.set(id + 1);
+                id
+            }),
             job_index: 0,
             algorithm,
             digest_hex: digest.to_string(),
@@ -230,7 +283,7 @@ mod tests {
             None,
             "file.bin",
         )];
-        assert_eq!(render(&rows, &[]), None);
+        assert_eq!(render(&rows, &[], CopyKind::Selection), None);
     }
 
     /// The rows come out in the order they were selected, one line each, tab
@@ -255,7 +308,7 @@ mod tests {
             ),
         ];
 
-        let text = render(&rows, &[0, 1]).expect("two rows render");
+        let text = render(&rows, &[0, 1], CopyKind::Selection).expect("two rows render");
 
         assert_eq!(
             text,
@@ -284,7 +337,7 @@ mod tests {
                 "second.bin",
             ),
         ];
-        let text = render(&rows, &[1, 0]).expect("both rows render");
+        let text = render(&rows, &[1, 0], CopyKind::Selection).expect("both rows render");
         let lines: Vec<&str> = text.split("\r\n").collect();
         assert!(lines[0].contains("SECOND"));
         assert!(lines[1].contains("FIRST"));
@@ -301,7 +354,7 @@ mod tests {
             None,
             r"nested\a.bin",
         )];
-        let text = render(&rows, &[0]).expect("one row renders");
+        let text = render(&rows, &[0], CopyKind::Selection).expect("one row renders");
 
         assert_eq!(text, "SHA-256\tAABB\tnot checked\tnested\\a.bin");
         assert_eq!(text.split('\t').count(), 4, "one tab per column boundary");
@@ -317,7 +370,7 @@ mod tests {
             Some(5),
             "broken.bin",
         )];
-        let text = render(&rows, &[0]).expect("the error row renders");
+        let text = render(&rows, &[0], CopyKind::Selection).expect("the error row renders");
         assert_eq!(text, "-\tError 5\tnot checked\tbroken.bin");
     }
 
@@ -332,7 +385,7 @@ mod tests {
             None,
             "file.bin",
         )];
-        let text = render(&rows, &[0, 99]).expect("the live row renders");
+        let text = render(&rows, &[0, 99], CopyKind::Selection).expect("the live row renders");
         assert_eq!(text.lines().count(), 1);
     }
 
@@ -340,7 +393,7 @@ mod tests {
     #[test]
     fn an_entirely_stale_selection_renders_nothing() {
         let rows: Vec<ListRow> = Vec::new();
-        assert_eq!(render(&rows, &[0, 1]), None);
+        assert_eq!(render(&rows, &[0, 1], CopyKind::Selection), None);
     }
 
     /// A mismatched row is labelled as such: the colour in the list is not the only
@@ -374,7 +427,7 @@ mod tests {
                 "file.bin",
             ),
         ];
-        let text = render(&rows, &[0, 1, 2]).expect("three rows render");
+        let text = render(&rows, &[0, 1, 2], CopyKind::Selection).expect("three rows render");
         assert!(text.contains("matched"));
         assert!(text.contains("mismatch"));
         assert!(text.contains("not checked"));

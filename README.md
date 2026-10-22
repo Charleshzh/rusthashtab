@@ -465,10 +465,34 @@ large result sets.
 > 真正生效的等宽字体、显式导出格式下拉与剪贴板导出、剪贴板驱动的校验。性能方面：
 > 组合吞吐基准、重复路径去重、扫描自有线程上的单文件算法并行，以及大结果集的渲染改进。
 
-**Gate / 门禁:** `cargo xtask check`, real-control page tests, and a recorded combined
-benchmark baseline.
+**Status: done — the automated gate passes and the page is verified in a real
+property sheet.** A manual visual pass in `explorer.exe` and the internal 150 MiB/s
+all-algorithm target remain follow-ups recorded in the internal closure notes; they
+do not change the feature set below. The page now sorts by any column, copies through double-click, the
+context menu, `Ctrl+C` and the Copy button, cancels without blocking the dialog
+thread, keeps rows in job order while results arrive, hides the File column for a
+single file, paints five configurable row classes (with a high-contrast fallback),
+exports an explicitly selected format to a file or the clipboard, and accepts a
+bare hex/base64 digest or a whole GNU/SFV line for verification over all files or
+the current one. On the performance side the scan chooses file-level or
+algorithm-group scheduling from the file count, algorithm count and core count,
+duplicate paths are removed before the 1000-file cap, and discovery reports
+progress and can be cancelled.
 
-> **门禁：** `cargo xtask check`、真实控件页面测试，以及记录在案的组合吞吐基线。
+> **状态：已完成——自动门禁通过，页面已在真实属性表中验证。** 真实 `explorer.exe` 的
+> 人工视觉验收与内部 150 MiB/s 全算法目标仍作为后续事项记录在内部收口记录中，不影响下面的
+> 功能范围。页面现在可按任意列
+> 排序，支持双击、右键、`Ctrl+C` 与 Copy 按钮复制，取消不会阻塞对话框线程，结果到达时始终
+> 按 job 序插入，单文件时隐藏 File 列，5 类行颜色可配置（高对比模式回退到系统色），
+> 可显式选择导出格式并导出到文件或剪贴板，校验支持裸 hex/base64 或 GNU/SFV 整行，可作用于
+> 全部文件或当前文件。性能方面，扫描按文件数、算法数与核数选择文件级或算法组级调度，
+> 重复路径在 1000 文件上限之前去除，发现阶段有进度且可取消。
+
+**Gate / 门禁:** `cargo xtask check`, `cargo xtask verify --require-tools`, real-control
+page tests, and a recorded combined benchmark baseline.
+
+> **门禁：** `cargo xtask check`、`cargo xtask verify --require-tools`、真实控件页面测试，
+> 以及记录在案的组合吞吐基线。
 
 ### Phase 6 — workflows / 工作流
 
@@ -540,7 +564,7 @@ shipped file), and an install→use→uninstall pass on a clean VM.
 | Phase 2 scan pipeline / 第二阶段扫描管线 | ✅ done / 已完成 |
 | Phase 3 property sheet page / 第三阶段属性页 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
 | Phase 4 checksum files, verification and settings / 第四阶段 —— 校验和文件、校验与设置 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
-| Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ⬜ not started / 未开始 |
+| Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ✅ done, automated gate green, verified in a real property sheet; explorer visual pass tracked as a follow-up / 已完成，自动门禁通过，已在真实属性表中验证；explorer 视觉验收作为后续事项跟踪 |
 | Phase 6 workflows / 第六阶段 —— 工作流 | ⬜ not started / 未开始 |
 | Phase 7 context menu, standalone mode, file associations / 第七阶段 —— 右键菜单、独立模式、文件关联 | ⬜ not started / 未开始 |
 | Phase 8 localization and optional network features / 第八阶段 —— 本地化与可选联网 | ⬜ not started / 未开始 |

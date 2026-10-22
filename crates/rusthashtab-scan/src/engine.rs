@@ -39,6 +39,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
+/// How to divide the work between files and algorithms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scheduling {
+    /// Choose `FileLevel` or `AlgorithmGroups` from the file count, algorithm
+    /// count, and available parallelism.
+    #[default]
+    Auto,
+    /// One worker per file, every enabled algorithm updated inline.
+    FileLevel,
+    /// Split one file's algorithms across `groups` threads.
+    AlgorithmGroups {
+        /// Number of group threads; clamped to the active algorithm count.
+        groups: usize,
+    },
+}
+
 /// What to scan, and how.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanConfig {
@@ -54,6 +70,8 @@ pub struct ScanConfig {
     /// Worker threads to use. Zero selects a default from the machine's
     /// parallelism, capped at [`crate::MAX_WORKERS`].
     pub workers: usize,
+    /// How to divide work between files and algorithms.
+    pub scheduling: Scheduling,
 }
 
 impl ScanConfig {
@@ -66,6 +84,7 @@ impl ScanConfig {
             jobs,
             enabled: default_enabled(),
             workers: 0,
+            scheduling: Scheduling::Auto,
         }
     }
 
@@ -79,6 +98,7 @@ impl ScanConfig {
             jobs,
             enabled: vec![true; ALGORITHMS.len()],
             workers: 0,
+            scheduling: Scheduling::Auto,
         }
     }
 }
@@ -196,6 +216,7 @@ pub fn start(config: ScanConfig, sink: Box<dyn FnMut(ScanEvent) + Send>) -> Scan
         jobs,
         enabled,
         workers,
+        scheduling,
     } = config;
 
     let queue: VecDeque<(usize, FileJob)> = jobs.into_iter().enumerate().collect();
@@ -208,16 +229,17 @@ pub fn start(config: ScanConfig, sink: Box<dyn FnMut(ScanEvent) + Send>) -> Scan
         .filter(|index| enabled.get(*index).copied().unwrap_or(false))
         .collect();
 
-    let worker_count = if workers == 0 {
-        default_worker_count(total_files)
-    } else {
-        workers.clamp(1, crate::MAX_WORKERS)
-    };
+    let cores = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let (worker_count, groups) =
+        plan_workers_groups(scheduling, total_files, active.len(), cores, workers);
 
     let scheduler = Arc::new(Scheduler {
         queue: Mutex::new(queue),
         enabled,
         active,
+        groups,
         pool: BufferPool::for_scan(worker_count),
         cancel: CancelToken::new(),
         sink: Arc::new(Mutex::new(sink)),
@@ -281,11 +303,55 @@ pub fn start(config: ScanConfig, sink: Box<dyn FnMut(ScanEvent) + Send>) -> Scan
 }
 
 /// Worker threads to use when the caller did not say.
+#[cfg(test)]
 fn default_worker_count(jobs: usize) -> usize {
     let parallelism = thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
     parallelism.clamp(1, crate::MAX_WORKERS).min(jobs.max(1))
+}
+
+/// Pick the worker count and the algorithm-group count.
+///
+/// The two multiply: `workers` readers each feed `groups` hashing threads, so
+/// `workers × (1 + groups)` should stay near the core count without ever
+/// exploding. The policy is deliberately simple:
+///
+/// * one file, many algorithms -> one reader and a group per core (minus the
+///   reader);
+/// * a few files -> one reader per file, remaining cores split into groups;
+/// * many files -> the ordinary file-level scheduler, `groups == 1`.
+///
+/// A group count of 1 means the reader hashes inline, exactly the old path, so
+/// the multi-file case pays nothing for this feature.
+fn plan_workers_groups(
+    scheduling: Scheduling,
+    jobs: usize,
+    active: usize,
+    cores: usize,
+    requested_workers: usize,
+) -> (usize, usize) {
+    let workers = if requested_workers == 0 {
+        jobs.clamp(1, cores.clamp(1, crate::MAX_WORKERS))
+    } else {
+        requested_workers.clamp(1, crate::MAX_WORKERS)
+    };
+    let max_groups = crate::MAX_WORKERS.saturating_sub(1).max(1);
+    let groups = match scheduling {
+        Scheduling::FileLevel => 1,
+        Scheduling::AlgorithmGroups { groups } => groups.clamp(1, active.max(1)).min(max_groups),
+        Scheduling::Auto => {
+            if active <= 1 {
+                1
+            } else {
+                ((cores.saturating_sub(1)) / workers)
+                    .max(1)
+                    .min(active)
+                    .min(max_groups)
+            }
+        }
+    };
+    (workers, groups)
 }
 
 /// The state every worker shares.
@@ -296,6 +362,8 @@ struct Scheduler {
     enabled: Vec<bool>,
     /// The same information as positions, which is how the contexts are built.
     active: Vec<usize>,
+    /// Algorithm group threads per file; 1 means the inline path.
+    groups: usize,
     pool: Arc<BufferPool>,
     cancel: CancelToken,
     sink: Sink,
@@ -359,6 +427,11 @@ impl Scheduler {
 
     /// Hash one file and report it.
     fn hash_one(&self, job_index: usize, job: &FileJob, scratch: &mut ReadScratch) {
+        if self.groups > 1 {
+            self.hash_one_fanout(job_index, job);
+            return;
+        }
+
         let mut hashers: Vec<(usize, Box<dyn Hasher>)> = self
             .active
             .iter()
@@ -400,6 +473,57 @@ impl Scheduler {
             }
         }
 
+        self.report_file(job_index, job, digests, delivered, error);
+    }
+
+    /// The algorithm-group path for one file.
+    fn hash_one_fanout(&self, job_index: usize, job: &FileJob) {
+        let mut delivered = 0u64;
+        let outcome = crate::fanout::hash_file(
+            &job.path,
+            &self.pool,
+            &self.cancel,
+            &self.active,
+            self.groups,
+            &mut |bytes| {
+                delivered = delivered.saturating_add(bytes);
+                self.done.fetch_add(bytes, Ordering::Relaxed);
+                self.emit_progress();
+            },
+        );
+
+        let (digests, error) = match outcome {
+            Ok(crate::fanout::FanoutOutcome::Cancelled) => return,
+            Ok(crate::fanout::FanoutOutcome::Done { digests, bytes }) => {
+                delivered = bytes;
+                let mut table = vec![Vec::new(); ALGORITHMS.len()];
+                for (algorithm, digest) in digests {
+                    if let Some(slot) = table.get_mut(algorithm) {
+                        *slot = digest;
+                    }
+                }
+                (table, None)
+            }
+            Err(error) => (
+                vec![Vec::new(); ALGORITHMS.len()],
+                Some(error.raw_os_error().unwrap_or(0) as u32),
+            ),
+        };
+
+        self.done
+            .fetch_add(job.size.saturating_sub(delivered), Ordering::Relaxed);
+        self.report_file(job_index, job, digests, delivered, error);
+    }
+
+    /// Emit one file's result and progress.
+    fn report_file(
+        &self,
+        job_index: usize,
+        job: &FileJob,
+        digests: Vec<Vec<u8>>,
+        delivered: u64,
+        error: Option<u32>,
+    ) {
         let result = FileResult {
             path: job.path.clone(),
             digests,
@@ -504,6 +628,28 @@ mod tests {
             events.last(),
             Some(&ScanEvent::Finished(ScanOutcome::Complete)),
             "an empty scan must still report that it finished"
+        );
+    }
+
+    /// One file with many algorithms gets a reader plus algorithm groups; many
+    /// files keep the old file-level shape.
+    #[test]
+    fn the_auto_policy_uses_groups_for_one_file_and_files_for_many() {
+        assert_eq!(plan_workers_groups(Scheduling::Auto, 1, 31, 8, 0), (1, 7));
+        assert_eq!(plan_workers_groups(Scheduling::Auto, 2, 31, 8, 0), (2, 3));
+        assert_eq!(plan_workers_groups(Scheduling::Auto, 100, 31, 8, 0), (8, 1));
+        assert_eq!(
+            plan_workers_groups(Scheduling::Auto, 1, 1, 8, 0),
+            (1, 1),
+            "one algorithm has nothing to fan out"
+        );
+        assert_eq!(
+            plan_workers_groups(Scheduling::FileLevel, 1, 31, 8, 0),
+            (1, 1)
+        );
+        assert_eq!(
+            plan_workers_groups(Scheduling::AlgorithmGroups { groups: 4 }, 1, 31, 8, 0),
+            (1, 4)
         );
     }
 

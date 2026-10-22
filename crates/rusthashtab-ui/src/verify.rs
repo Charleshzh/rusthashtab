@@ -58,9 +58,9 @@
 
 use crate::JobSpec;
 use rusthashtab_hash::ALGORITHMS;
-use rusthashtab_scan::{FileJob, normalize_path};
+use rusthashtab_scan::{FileJob, normalize_path, path_key};
 use rusthashtab_sumfile::MAX_DIGEST_LEN;
-use rusthashtab_sumfile::parse::{ParseOutcome, hex_to_bytes, parse_all};
+use rusthashtab_sumfile::parse::{ParseOutcome, base64_to_bytes, hex_to_bytes, parse_all};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -313,6 +313,195 @@ pub fn parse_pasted(text: &str) -> Option<Vec<u8>> {
     hex_to_bytes(trimmed)
 }
 
+/// How a pasted digest was spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastedStyle {
+    /// A bare hex digest.
+    Hex,
+    /// A bare base64 digest.
+    Base64,
+    /// A whole checksum line (GNU or SFV).
+    Line,
+}
+
+/// A digest parsed from the paste box, with the file name it named (if any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastedDigest {
+    /// Decoded digest bytes.
+    pub digest: Vec<u8>,
+    /// The file name the line named, if it carried one.
+    pub file_name: Option<String>,
+    /// How the input was spelled.
+    pub style: PastedStyle,
+}
+
+/// Why pasted text could not be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastedError {
+    /// Nothing was pasted.
+    Empty,
+    /// The text was not a digest or a single checksum line.
+    NotADigest,
+    /// The text held more than one checksum line.
+    MultipleEntries,
+    /// The digest names a file that is not in the selection.
+    FileNotSelected,
+    /// The digest names more than one selected file.
+    AmbiguousFile,
+    /// The digest length is not produced by any enabled algorithm.
+    LengthNotEnabled,
+    /// Current-file scope was requested without a selected row.
+    NoCurrentFile,
+}
+
+/// Which files a pasted digest applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteScope {
+    /// Every file in the scan.
+    All,
+    /// One job, identified by its index in the job list.
+    Current(usize),
+}
+
+/// Parse the paste box.
+///
+/// Accepts a bare hex digest, a bare base64 digest, or exactly one checksum line
+/// in the GNU or SFV spelling. A line that names a file keeps that name; the
+/// caller uses it to pick the target, which is what makes "paste one line from a
+/// checksum file" work without the user first selecting a row.
+///
+/// Deliberately does **not** search arbitrary prose for a digest: a paste that
+/// happens to contain a 64-character hex string is not a request to check it.
+pub fn parse_pasted_line(text: &str) -> Result<PastedDigest, PastedError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(PastedError::Empty);
+    }
+
+    // Bare hex first: the dominant spelling, and it is also what `parse_all`
+    // recognises as a single-hash file.
+    if trimmed.len().is_multiple_of(2)
+        && (4..=MAX_DIGEST_LEN * 2).contains(&trimmed.len())
+        && let Some(digest) = hex_to_bytes(trimmed)
+    {
+        return Ok(PastedDigest {
+            digest,
+            file_name: None,
+            style: PastedStyle::Hex,
+        });
+    }
+
+    // A bare base64 digest is not a checksum *line*; the line parser would reject
+    // it because it requires a file name. Only a single base64-looking token is
+    // considered: the decoder itself tolerates whitespace for file input, which
+    // would make "this is not a digest" decode into bytes and then be reported as
+    // the wrong length rather than as not a digest at all.
+    if !trimmed.chars().any(char::is_whitespace)
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+        && let Some(digest) = base64_to_bytes(trimmed)
+        && (4..=MAX_DIGEST_LEN).contains(&digest.len())
+    {
+        return Ok(PastedDigest {
+            digest,
+            file_name: None,
+            style: PastedStyle::Base64,
+        });
+    }
+
+    let parsed = parse_all(trimmed);
+    if parsed.had_error {
+        return Err(PastedError::NotADigest);
+    }
+    match parsed.entries.as_slice() {
+        [] => Err(PastedError::NotADigest),
+        [entry] => Ok(PastedDigest {
+            digest: entry.digest.clone(),
+            file_name: (!entry.path.is_empty()).then(|| entry.path.clone()),
+            style: PastedStyle::Line,
+        }),
+        _ => Err(PastedError::MultipleEntries),
+    }
+}
+
+/// Pick the jobs a pasted digest applies to.
+///
+/// A line that names a file targets that file; a bare digest uses the requested
+/// scope. `strict` makes a named file resolve by full path instead of by unique
+/// basename, which is the difference between "this name is probably that file"
+/// and "this is that file".
+pub fn resolve_pasted_targets(
+    pasted: &PastedDigest,
+    jobs: &[JobSpec],
+    scope: PasteScope,
+    strict: bool,
+) -> Result<Vec<usize>, PastedError> {
+    if jobs.is_empty() {
+        return Err(PastedError::FileNotSelected);
+    }
+
+    if let Some(name) = &pasted.file_name {
+        let target = resolve_named_target(name, jobs, strict)?;
+        if let PasteScope::Current(current) = scope
+            && current != target
+        {
+            return Err(PastedError::FileNotSelected);
+        }
+        return Ok(vec![target]);
+    }
+
+    match scope {
+        PasteScope::All => Ok((0..jobs.len()).collect()),
+        PasteScope::Current(current) => {
+            if current < jobs.len() {
+                Ok(vec![current])
+            } else {
+                Err(PastedError::NoCurrentFile)
+            }
+        }
+    }
+}
+
+/// Resolve one file name from a pasted line to exactly one job.
+fn resolve_named_target(name: &str, jobs: &[JobSpec], strict: bool) -> Result<usize, PastedError> {
+    if strict {
+        let wanted = path_key(Path::new(name));
+        let matches: Vec<usize> = jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| path_key(&job.path) == wanted)
+            .map(|(index, _)| index)
+            .collect();
+        return match matches.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(PastedError::FileNotSelected),
+            _ => Err(PastedError::AmbiguousFile),
+        };
+    }
+
+    let wanted = Path::new(name)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| name.to_lowercase());
+    let matches: Vec<usize> = jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| {
+            job.path
+                .file_name()
+                .is_some_and(|file| file.to_string_lossy().to_lowercase() == wanted)
+                || job.display_path.to_lowercase() == name.to_lowercase()
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(PastedError::FileNotSelected),
+        _ => Err(PastedError::AmbiguousFile),
+    }
+}
+
 /// Resolve one entry to job indices, or `None` when it names none.
 fn resolve_targets(
     entry: &str,
@@ -370,11 +559,6 @@ fn resolve_targets(
         })
         .collect();
     (same_directory.len() == 1).then_some(same_directory)
-}
-
-/// The matching key for a path: normalized, slash-folded, lower-cased.
-fn path_key(path: &Path) -> String {
-    key_text(&normalize_path(path))
 }
 
 /// The matching key for a path that has already been normalized.
@@ -746,6 +930,81 @@ mod tests {
         // A whole checksum line is not a pasted digest: the filename would be
         // silently dropped.
         assert_eq!(parse_pasted(&format!("{SHA256_EMPTY}  a.txt")), None);
+    }
+
+    /// A pasted GNU line keeps its file name; that is what lets the page target
+    /// one file without the user selecting a row first.
+    #[test]
+    fn a_gnu_line_keeps_its_file_name() {
+        let pasted = parse_pasted_line(&format!("{SHA256_EMPTY}  nested/a.txt")).expect("valid");
+        assert_eq!(pasted.digest, digest(SHA256_EMPTY));
+        assert_eq!(pasted.file_name.as_deref(), Some("nested/a.txt"));
+        assert_eq!(pasted.style, PastedStyle::Line);
+    }
+
+    /// A bare base64 digest is accepted; the line parser would reject it because
+    /// it has no file name.
+    #[test]
+    fn a_bare_base64_digest_is_accepted() {
+        let pasted = parse_pasted_line("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=")
+            .expect("valid base64");
+        assert_eq!(pasted.digest, digest(SHA256_EMPTY));
+        assert_eq!(pasted.file_name, None);
+        assert_eq!(pasted.style, PastedStyle::Base64);
+    }
+
+    #[test]
+    fn several_lines_are_rejected() {
+        let text = format!("{SHA256_EMPTY}  a.txt\n{SHA256_EMPTY}  b.txt");
+        assert_eq!(parse_pasted_line(&text), Err(PastedError::MultipleEntries));
+    }
+
+    /// A bare digest applies to the whole selection by default; current-file
+    /// scope names one job.
+    #[test]
+    fn paste_scope_selects_all_or_one_job() {
+        let dir = TempDir::new("paste-scope");
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        let jobs = vec![job(&first), job(&second)];
+        let pasted = parse_pasted_line(SHA256_EMPTY).expect("valid hex");
+
+        assert_eq!(
+            resolve_pasted_targets(&pasted, &jobs, PasteScope::All, false),
+            Ok(vec![0, 1])
+        );
+        assert_eq!(
+            resolve_pasted_targets(&pasted, &jobs, PasteScope::Current(1), false),
+            Ok(vec![1])
+        );
+    }
+
+    /// A named line targets the named file, and strict mode requires the full
+    /// path rather than a unique basename.
+    #[test]
+    fn a_named_line_targets_that_file_and_strict_requires_the_path() {
+        let dir = TempDir::new("paste-named");
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        let jobs = vec![job(&first), job(&second)];
+        let pasted = parse_pasted_line(&format!("{SHA256_EMPTY}  a.txt")).expect("valid line");
+
+        assert_eq!(
+            resolve_pasted_targets(&pasted, &jobs, PasteScope::All, false),
+            Ok(vec![0])
+        );
+        assert_eq!(
+            resolve_pasted_targets(&pasted, &jobs, PasteScope::All, true),
+            Err(PastedError::FileNotSelected),
+            "strict mode compares the full path, not the basename"
+        );
+
+        let exact = format!("{SHA256_EMPTY}  {}", first.display());
+        let exact = parse_pasted_line(&exact).expect("valid line");
+        assert_eq!(
+            resolve_pasted_targets(&exact, &jobs, PasteScope::All, true),
+            Ok(vec![0])
+        );
     }
 
     #[test]

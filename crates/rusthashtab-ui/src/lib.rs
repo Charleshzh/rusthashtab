@@ -48,6 +48,7 @@ mod route;
 pub mod session;
 #[cfg(windows)]
 pub mod settings_dialog;
+pub mod strings;
 #[cfg(windows)]
 pub mod task;
 pub mod verify;
@@ -76,6 +77,13 @@ pub struct JobSpec {
 /// One row in the results list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRow {
+    /// Stable identity of this row within the page.
+    ///
+    /// Not the row's position: a row is inserted into job order while earlier
+    /// files are still hashing, and the whole list is rebuilt when the scan ends.
+    /// Selection and copying must survive both, so they address a row by this
+    /// value and each list item's `lParam` carries it.
+    pub id: u64,
     /// Job this row belongs to: an index into the scan's job list, which is what
     /// the file column displays.
     ///
@@ -99,6 +107,34 @@ pub struct ListRow {
     /// The file's display path, copied from the job so a row can be shown and
     /// copied without a lookup that could disagree with the list.
     pub display_path: String,
+}
+
+/// The stable identity of a row, from its job and algorithm.
+///
+/// Job indices are bounded by [`MAX_HASHED_FILES`] (1000) and algorithm indices by
+/// the table (31), so the packed value is unique on both pointer widths. An error
+/// row uses `usize::MAX` as its "algorithm" and therefore gets its own ID per job.
+pub fn row_id(job_index: usize, algorithm: usize) -> u64 {
+    ((job_index as u64) << 32) | u64::from(algorithm as u32)
+}
+
+/// Where the page is in the selection's lifecycle.
+///
+/// The page is modeless and the scan runs on its own thread, so "which controls
+/// are usable" is not derivable from any single flag: discovery, hashing, and the
+/// two ways hashing can end all permit different actions. One enum, set at the
+/// same points that post the transition messages, keeps those decisions in one
+/// place instead of scattered across handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPhase {
+    /// Expanding the selection; no job list yet.
+    Discovering,
+    /// The job list is published and files are being hashed.
+    Hashing,
+    /// Every file was hashed.
+    Finished,
+    /// The user asked to stop, or the scan reported that it could not finish.
+    Cancelled,
 }
 
 /// Counters shown in the status line, in the order the UI displays them.
@@ -141,6 +177,24 @@ pub struct DialogState {
     /// rebuilding rows from a control is exactly the kind of round trip that goes
     /// wrong when the control is empty or mid-update.
     pub rows: Vec<ListRow>,
+    /// Where the selection is in its lifecycle; drives every control's enabled state.
+    pub scan_phase: ScanPhase,
+    /// Files the scan was given, once the job list is published. Zero before then.
+    pub job_count: usize,
+    /// Files discovery has found so far, for the status line while expanding.
+    pub discovery_files: usize,
+    /// Set between the Cancel click and the scan's completion message.
+    pub cancelling: bool,
+    /// Formats the export selector currently offers.
+    pub export_choices: Vec<crate::export::ExportChoice>,
+    /// The selected export format, or `None` before the selector is filled.
+    pub export_choice: Option<crate::export::ExportChoice>,
+    /// Current sort order, or `None` for job order.
+    #[cfg(windows)]
+    pub sort: Option<crate::listview::SortState>,
+    /// Colours resolved from the settings, or from the system in high contrast.
+    #[cfg(windows)]
+    pub palette: crate::listview::Palette,
     /// The hashing thread, until teardown takes it.
     #[cfg(windows)]
     pub session: Option<session::ReadoutSession>,
@@ -179,6 +233,12 @@ pub struct DialogState {
     /// Sequence of the newest export request.
     #[cfg(windows)]
     pub export_seq: u32,
+    /// The page's tooltip control, once it has been created.
+    #[cfg(windows)]
+    pub tooltip: Option<windows::Win32::Foundation::HWND>,
+    /// The current status text, NUL-terminated, for the status tooltip.
+    #[cfg(windows)]
+    pub tooltip_status: Vec<u16>,
     /// The status-line label of the verification source currently being loaded.
     ///
     /// Stored on the dialog because the worker owns the file read; the label is
@@ -191,11 +251,24 @@ impl DialogState {
     /// State for a page about to be created.
     pub fn new(roots: Vec<std::path::PathBuf>, settings: rusthashtab_settings::Settings) -> Self {
         let enabled = crate::enabled_algorithms(&settings);
+        #[cfg(windows)]
+        let palette =
+            crate::listview::Palette::from_settings(&settings, crate::listview::high_contrast());
         Self {
             roots,
             settings,
             enabled,
             rows: Vec::new(),
+            scan_phase: ScanPhase::Discovering,
+            job_count: 0,
+            discovery_files: 0,
+            cancelling: false,
+            export_choices: Vec::new(),
+            export_choice: None,
+            #[cfg(windows)]
+            sort: None,
+            #[cfg(windows)]
+            palette,
             #[cfg(windows)]
             session: None,
             #[cfg(windows)]
@@ -216,6 +289,10 @@ impl DialogState {
             verify_seq: 0,
             #[cfg(windows)]
             export_seq: 0,
+            #[cfg(windows)]
+            tooltip: None,
+            #[cfg(windows)]
+            tooltip_status: Vec::new(),
             #[cfg(windows)]
             verify_source: None,
         }
@@ -331,7 +408,8 @@ impl UiError {
 /// as progress. [`route::route`] is the only place that decision is made, and it
 /// is a pure function so it can be tested without a window.
 pub use dialog::{
-    WM_EXPORT_DONE, WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_SCAN_FINISHED, WM_VERIFY_READY,
+    WM_DISCOVERY_PROGRESS, WM_EXPORT_DONE, WM_FILE_FINISHED, WM_FILE_PROGRESS, WM_JOBS_READY,
+    WM_SCAN_FINISHED, WM_SORT_COLUMN, WM_VERIFY_READY,
 };
 
 /// Progress is quantised to this many steps, so a 10 GB scan does not post a

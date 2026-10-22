@@ -19,6 +19,7 @@
 //! `MAX_PATH`, keeps opening correctly.
 
 use crate::FileJob;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf, Prefix};
 
@@ -136,6 +137,37 @@ fn prefix_text(kind: Prefix<'_>) -> OsString {
     text
 }
 
+/// What discovery has found so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Discovery {
+    /// Unique files found.
+    pub files: usize,
+    /// Directories entered.
+    pub directories: usize,
+}
+
+/// How often [`expand_selection_with`] reports progress, in files.
+///
+/// The page only needs enough updates to show that a large tree is moving. One
+/// callback per 256 files is coarse enough that a directory of a million files
+/// does not queue a million window messages, and fine enough that a walk of a few
+/// thousand files reports several times.
+pub const DISCOVERY_REPORT_INTERVAL: usize = 256;
+
+/// A path's identity for duplicate detection.
+///
+/// Normalization is lexical, so `C:\a\..\a\x`, `C:\A\X` and `c:/a/x` all name
+/// the same file on Windows. Lower-casing and folding `/` to `\` is what makes
+/// those one key. It deliberately does not consult the file system: resolving
+/// short names or hard links would stat every path again and can follow a
+/// reparse point, which the walk is trying not to do.
+pub fn path_key(path: &Path) -> String {
+    normalize_path(path)
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
 /// Expand a user selection into a flat list of files to hash.
 ///
 /// Directories are walked recursively. Reparse points (symlinks, junctions,
@@ -151,6 +183,11 @@ fn prefix_text(kind: Prefix<'_>) -> OsString {
 /// mid-walk is skipped instead: an error there would abort a scan of thousands of
 /// files because one of them was renamed.
 ///
+/// **Duplicate paths are removed**: a file selected directly and also reached
+/// through a selected directory appears once, and the first spelling wins. That
+/// matters beyond tidiness -- a duplicate would be hashed twice, shown twice, and
+/// counted twice in the progress total.
+///
 /// The order is deterministic but not sorted as a whole: within a directory,
 /// files come before subdirectories, and subdirectories are then descended in
 /// name order. Nothing downstream depends on a particular order — a UI sorts its
@@ -161,9 +198,38 @@ fn prefix_text(kind: Prefix<'_>) -> OsString {
 /// the file, so a file that grows or shrinks during the scan still hashes
 /// correctly.
 pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
+    expand_selection_with(roots, &|| false, &mut |_| {})
+}
+
+/// Expand a selection, reporting discovery progress and checking for cancellation.
+///
+/// `cancelled` is consulted between directory entries and before descending into
+/// a directory. When it returns true the walk stops and returns what it has; the
+/// caller is expected to discard that partial list and report cancellation, not
+/// to scan it. The callback is deliberately a plain closure rather than the
+/// scanner's private `CancelToken`: the page owns the cancellation flag, and this
+/// crate should not need to know what a window is.
+pub fn expand_selection_with(
+    roots: &[PathBuf],
+    cancelled: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(Discovery),
+) -> Vec<FileJob> {
     let mut jobs = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut directories = 0usize;
+
+    let report = |jobs: &Vec<FileJob>, directories: usize, progress: &mut dyn FnMut(Discovery)| {
+        progress(Discovery {
+            files: jobs.len(),
+            directories,
+        });
+    };
 
     for root in roots {
+        if cancelled() {
+            return jobs;
+        }
+
         let root = normalize_path(root);
         // Follow a reparse point only for the root itself, where the user's
         // intent is explicit. A failure here becomes an error job rather than an
@@ -172,14 +238,20 @@ pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
         let metadata = match std::fs::metadata(&root) {
             Ok(metadata) => metadata,
             Err(_) => {
-                jobs.push(job_for(&root, &root, 0));
+                if seen.insert(path_key(&root)) {
+                    jobs.push(job_for(&root, &root, 0));
+                    report(&jobs, directories, progress);
+                }
                 continue;
             }
         };
 
         if !metadata.is_dir() {
             let size = metadata.len();
-            jobs.push(job_for(&root, &root, size));
+            if seen.insert(path_key(&root)) {
+                jobs.push(job_for(&root, &root, size));
+                report(&jobs, directories, progress);
+            }
             continue;
         }
 
@@ -187,11 +259,17 @@ pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
         // reported while an unreadable subdirectory is still skipped.
         let mut stack = vec![(root.clone(), true)];
         while let Some((directory, is_root)) = stack.pop() {
+            if cancelled() {
+                return jobs;
+            }
+            directories += 1;
+
             let entries = match std::fs::read_dir(&directory) {
                 Ok(entries) => entries,
                 Err(_) => {
-                    if is_root {
+                    if is_root && seen.insert(path_key(&root)) {
                         jobs.push(job_for(&root, &root, 0));
+                        report(&jobs, directories, progress);
                     }
                     continue;
                 }
@@ -199,12 +277,18 @@ pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
 
             let mut children: Vec<(OsString, PathBuf)> = Vec::with_capacity(entries.size_hint().0);
             for entry in entries.flatten() {
+                if cancelled() {
+                    return jobs;
+                }
                 children.push((entry.file_name(), entry.path()));
             }
             children.sort_by(|a, b| a.0.cmp(&b.0));
 
             let mut subdirectories: Vec<PathBuf> = Vec::new();
             for (_, path) in children {
+                if cancelled() {
+                    return jobs;
+                }
                 // `symlink_metadata` deliberately does not follow the link, so a
                 // junction is seen as a reparse point rather than as the
                 // directory it points at.
@@ -216,8 +300,11 @@ pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
                 }
                 if metadata.is_dir() {
                     subdirectories.push(path);
-                } else {
+                } else if seen.insert(path_key(&path)) {
                     jobs.push(job_for(&root, &path, metadata.len()));
+                    if jobs.len().is_multiple_of(DISCOVERY_REPORT_INTERVAL) {
+                        report(&jobs, directories, progress);
+                    }
                 }
             }
 
@@ -229,6 +316,7 @@ pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
         }
     }
 
+    report(&jobs, directories, progress);
     jobs
 }
 
@@ -392,6 +480,65 @@ mod tests {
         let again = expand_selection(&[dir.path().to_path_buf()]);
         let again: Vec<&str> = again.iter().map(|j| j.display_path.as_str()).collect();
         assert_eq!(displays, again, "the walk order must be reproducible");
+    }
+
+    /// The same file selected twice, and a directory plus a file inside it, must
+    /// produce one job. A duplicate would be hashed and counted twice.
+    #[test]
+    fn duplicate_and_overlapping_roots_produce_one_job_per_file() {
+        let dir = TempDir::new("dedupe");
+        let file = dir.path().join("a.bin");
+        write(&file, 5);
+
+        let jobs = expand_selection(&[dir.path().to_path_buf(), file.clone()]);
+        assert_eq!(jobs.len(), 1, "the directory already contained the file");
+        assert_eq!(jobs[0].path, normalize_path(&file));
+
+        let jobs = expand_selection(&[file.clone(), file.clone()]);
+        assert_eq!(jobs.len(), 1, "the same root twice must be one job");
+    }
+
+    /// Windows paths are case-insensitive; a differently-cased spelling and a
+    /// `..` detour are the same file.
+    #[test]
+    fn case_and_dot_variants_are_one_file() {
+        let dir = TempDir::new("dedupe-variants");
+        let file = dir.path().join("Case.bin");
+        write(&file, 5);
+
+        let upper = PathBuf::from(file.to_string_lossy().to_ascii_uppercase());
+        let dotted = dir.path().join("sub").join("..").join("Case.bin");
+        let jobs = expand_selection(&[file.clone(), upper, dotted]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].path, normalize_path(&file));
+    }
+
+    /// Discovery reports as it walks, and a cancelled walk returns promptly with
+    /// whatever it had found.
+    #[test]
+    fn discovery_reports_and_cancellation_stops_the_walk() {
+        let dir = TempDir::new("discovery");
+        for index in 0..8 {
+            write(&dir.path().join(format!("f{index}.bin")), 1);
+        }
+
+        let mut reports = Vec::new();
+        let jobs = expand_selection_with(&[dir.path().to_path_buf()], &|| false, &mut |found| {
+            reports.push(found.files)
+        });
+        assert_eq!(jobs.len(), 8);
+        assert_eq!(reports.last().copied(), Some(8));
+
+        let calls = std::cell::Cell::new(0usize);
+        let jobs = expand_selection_with(
+            &[dir.path().to_path_buf()],
+            &|| {
+                calls.set(calls.get() + 1);
+                calls.get() > 2
+            },
+            &mut |_| {},
+        );
+        assert!(jobs.len() < 8, "a cancelled walk must not finish the tree");
     }
 
     #[test]

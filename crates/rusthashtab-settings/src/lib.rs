@@ -49,6 +49,114 @@ pub const MACHINE_FORCE_DISABLE_LOOKUP: &str = "ForceDisableLookup";
 /// A per-user language override, holding an LCID.
 pub const LANG_ID_OVERRIDE: &str = "LangIdOverride";
 
+/// The sentinel a colour uses to mean "whatever the system uses".
+///
+/// A `COLORREF` has only 24 meaningful bits; the reserved high byte is free, so a
+/// value no real colour uses is a better sentinel than a separate Boolean per
+/// field.
+pub const SYSTEM_COLOUR: u32 = u32::MAX;
+
+/// Foreground and background for one row class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowColour {
+    /// Text colour, `0x00BBGGRR`, or [`SYSTEM_COLOUR`].
+    pub text: u32,
+    /// Background colour, `0x00BBGGRR`, or [`SYSTEM_COLOUR`].
+    pub background: u32,
+}
+
+impl RowColour {
+    /// Both halves from the system.
+    pub const fn system() -> Self {
+        Self {
+            text: SYSTEM_COLOUR,
+            background: SYSTEM_COLOUR,
+        }
+    }
+}
+
+/// The five row classes the page can colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColourClass {
+    /// A digest matched under a secure algorithm.
+    Matched,
+    /// A digest matched under a weak algorithm.
+    Weak,
+    /// Expected digests existed and none matched.
+    Mismatched,
+    /// The file could not be read.
+    Error,
+    /// No expectation was compared.
+    Neutral,
+}
+
+/// Which half of a [`RowColour`] is being named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColourPart {
+    /// Foreground.
+    Text,
+    /// Background.
+    Background,
+}
+
+/// Every configurable row colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowColours {
+    /// Secure match.
+    pub matched: RowColour,
+    /// Weak match.
+    pub weak: RowColour,
+    /// Mismatch.
+    pub mismatched: RowColour,
+    /// Unreadable file.
+    pub error: RowColour,
+    /// Not checked.
+    pub neutral: RowColour,
+}
+
+impl Default for RowColours {
+    /// Chosen for contrast on the default window background, not copied from any
+    /// other implementation. Backgrounds start as the system window colour so a
+    /// page that never opens the colour settings looks native.
+    fn default() -> Self {
+        Self {
+            matched: RowColour {
+                text: 0x0000_6B00, // dark green: #006B00
+                background: SYSTEM_COLOUR,
+            },
+            weak: RowColour {
+                text: 0x0000_6D8A, // dark goldenrod: #8A6D00
+                background: SYSTEM_COLOUR,
+            },
+            mismatched: RowColour {
+                text: 0x0020_00B0, // dark red: #B00020
+                background: SYSTEM_COLOUR,
+            },
+            error: RowColour {
+                text: 0x0000_00A0, // dark red: #A00000
+                background: SYSTEM_COLOUR,
+            },
+            neutral: RowColour::system(),
+        }
+    }
+}
+
+/// The registry value name for one colour half.
+pub fn colour_value_name(class: ColourClass, part: ColourPart) -> &'static str {
+    match (class, part) {
+        (ColourClass::Matched, ColourPart::Text) => "ColourMatchedText",
+        (ColourClass::Matched, ColourPart::Background) => "ColourMatchedBackground",
+        (ColourClass::Weak, ColourPart::Text) => "ColourWeakText",
+        (ColourClass::Weak, ColourPart::Background) => "ColourWeakBackground",
+        (ColourClass::Mismatched, ColourPart::Text) => "ColourMismatchText",
+        (ColourClass::Mismatched, ColourPart::Background) => "ColourMismatchBackground",
+        (ColourClass::Error, ColourPart::Text) => "ColourErrorText",
+        (ColourClass::Error, ColourPart::Background) => "ColourErrorBackground",
+        (ColourClass::Neutral, ColourPart::Text) => "ColourNeutralText",
+        (ColourClass::Neutral, ColourPart::Background) => "ColourNeutralBackground",
+    }
+}
+
 /// The full set of user-configurable options.
 ///
 /// Field names map 1:1 onto registry value names via [`Settings::value_name`].
@@ -60,6 +168,12 @@ pub struct Settings {
     pub display_monospace: bool,
     /// Look for a sumfile next to each file being hashed.
     pub look_for_sumfiles: bool,
+    /// Require a pasted whole line's file name to resolve by full path.
+    pub verify_strict: bool,
+    /// Rewrite the paste box to canonical hex after a successful check.
+    pub verify_auto_format: bool,
+    /// Colours for the five result classes.
+    pub colours: RowColours,
     /// Uppercase hex when exporting sumfiles.
     pub sumfile_uppercase: bool,
     /// LF line endings in exported sumfiles.
@@ -98,6 +212,9 @@ impl Default for Settings {
             display_uppercase: true,
             display_monospace: true,
             look_for_sumfiles: false,
+            verify_strict: false,
+            verify_auto_format: false,
+            colours: RowColours::default(),
             sumfile_uppercase: true,
             sumfile_unix_endings: true,
             sumfile_double_space: false,
@@ -167,6 +284,8 @@ impl Settings {
             "display_uppercase" => "DisplayUppercase",
             "display_monospace" => "DisplayMonospace",
             "look_for_sumfiles" => "LookForSumfiles",
+            "verify_strict" => "VerifyStrict",
+            "verify_auto_format" => "VerifyAutoFormat",
             "sumfile_uppercase" => "SumfileUppercase",
             "sumfile_unix_endings" => "SumfileLF",
             "sumfile_double_space" => "SumfileDoubleSpace",
@@ -330,6 +449,76 @@ mod registry {
         settings.display_monospace =
             read_bool(&key, "DisplayMonospace", settings.display_monospace);
         settings.look_for_sumfiles = read_bool(&key, "LookForSumfiles", settings.look_for_sumfiles);
+        settings.verify_strict = read_bool(&key, "VerifyStrict", settings.verify_strict);
+        settings.verify_auto_format =
+            read_bool(&key, "VerifyAutoFormat", settings.verify_auto_format);
+
+        let defaults = settings.colours;
+        let read = |class, part, fallback| {
+            read_dword(&key, super::colour_value_name(class, part)).unwrap_or(fallback)
+        };
+        settings.colours = super::RowColours {
+            matched: super::RowColour {
+                text: read(
+                    super::ColourClass::Matched,
+                    super::ColourPart::Text,
+                    defaults.matched.text,
+                ),
+                background: read(
+                    super::ColourClass::Matched,
+                    super::ColourPart::Background,
+                    defaults.matched.background,
+                ),
+            },
+            weak: super::RowColour {
+                text: read(
+                    super::ColourClass::Weak,
+                    super::ColourPart::Text,
+                    defaults.weak.text,
+                ),
+                background: read(
+                    super::ColourClass::Weak,
+                    super::ColourPart::Background,
+                    defaults.weak.background,
+                ),
+            },
+            mismatched: super::RowColour {
+                text: read(
+                    super::ColourClass::Mismatched,
+                    super::ColourPart::Text,
+                    defaults.mismatched.text,
+                ),
+                background: read(
+                    super::ColourClass::Mismatched,
+                    super::ColourPart::Background,
+                    defaults.mismatched.background,
+                ),
+            },
+            error: super::RowColour {
+                text: read(
+                    super::ColourClass::Error,
+                    super::ColourPart::Text,
+                    defaults.error.text,
+                ),
+                background: read(
+                    super::ColourClass::Error,
+                    super::ColourPart::Background,
+                    defaults.error.background,
+                ),
+            },
+            neutral: super::RowColour {
+                text: read(
+                    super::ColourClass::Neutral,
+                    super::ColourPart::Text,
+                    defaults.neutral.text,
+                ),
+                background: read(
+                    super::ColourClass::Neutral,
+                    super::ColourPart::Background,
+                    defaults.neutral.background,
+                ),
+            },
+        };
         settings.sumfile_uppercase =
             read_bool(&key, "SumfileUppercase", settings.sumfile_uppercase);
         settings.sumfile_unix_endings = read_bool(&key, "SumfileLF", settings.sumfile_unix_endings);
@@ -404,6 +593,26 @@ mod registry {
         write_bool(key, "DisplayUppercase", settings.display_uppercase)?;
         write_bool(key, "DisplayMonospace", settings.display_monospace)?;
         write_bool(key, "LookForSumfiles", settings.look_for_sumfiles)?;
+        write_bool(key, "VerifyStrict", settings.verify_strict)?;
+        write_bool(key, "VerifyAutoFormat", settings.verify_auto_format)?;
+        for (class, colour) in [
+            (super::ColourClass::Matched, settings.colours.matched),
+            (super::ColourClass::Weak, settings.colours.weak),
+            (super::ColourClass::Mismatched, settings.colours.mismatched),
+            (super::ColourClass::Error, settings.colours.error),
+            (super::ColourClass::Neutral, settings.colours.neutral),
+        ] {
+            write_dword(
+                key,
+                super::colour_value_name(class, super::ColourPart::Text),
+                colour.text,
+            )?;
+            write_dword(
+                key,
+                super::colour_value_name(class, super::ColourPart::Background),
+                colour.background,
+            )?;
+        }
         write_bool(key, "SumfileUppercase", settings.sumfile_uppercase)?;
         write_bool(key, "SumfileLF", settings.sumfile_unix_endings)?;
         write_bool(key, "SumfileDoubleSpace", settings.sumfile_double_space)?;
@@ -546,6 +755,8 @@ mod tests {
             "display_uppercase",
             "display_monospace",
             "look_for_sumfiles",
+            "verify_strict",
+            "verify_auto_format",
             "sumfile_uppercase",
             "sumfile_unix_endings",
             "sumfile_double_space",
@@ -761,6 +972,15 @@ mod tests {
             display_uppercase: false,
             display_monospace: false,
             look_for_sumfiles: true,
+            verify_strict: true,
+            verify_auto_format: true,
+            colours: RowColours {
+                matched: RowColour {
+                    text: 0x0012_3456,
+                    background: 0x0065_4321,
+                },
+                ..RowColours::default()
+            },
             sumfile_uppercase: false,
             sumfile_unix_endings: false,
             sumfile_double_space: true,

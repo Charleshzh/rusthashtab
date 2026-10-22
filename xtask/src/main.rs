@@ -121,8 +121,11 @@ cargo xtask <command>
             export. 7z is the external authority for SFV's CRC32 values.
             --require-tools   Fail instead of skipping when a tool is missing.
 
-  bench     Measure throughput per algorithm.
-            --passes N   --size MiB   --filter SUBSTR
+  bench     Measure throughput per algorithm, the combined set with
+            --combined, or the real scan pipeline with --scheduling.
+            --passes N   --size MiB   --filter SUBSTR   --combined
+            --scheduling auto|file|algorithm   --algorithms default|all
+            --files N   --groups N
 
   audit     Print the correctness-coverage map: which algorithm is validated by
             what, and which have no authority attached yet.

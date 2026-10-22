@@ -63,6 +63,8 @@ mod compare;
 #[cfg(windows)]
 mod engine;
 #[cfg(windows)]
+mod fanout;
+#[cfg(windows)]
 mod pool;
 #[cfg(windows)]
 mod reader;
@@ -70,10 +72,13 @@ mod reader;
 use std::path::PathBuf;
 
 pub use compare::match_state;
-pub use path::{FILE_ATTRIBUTE_REPARSE_POINT, expand_selection, normalize_path};
+pub use path::{
+    DISCOVERY_REPORT_INTERVAL, Discovery, FILE_ATTRIBUTE_REPARSE_POINT, expand_selection,
+    expand_selection_with, normalize_path, path_key,
+};
 
 #[cfg(windows)]
-pub use engine::{ScanConfig, ScanEvent, ScanHandle, ScanOutcome, start};
+pub use engine::{ScanConfig, ScanEvent, ScanHandle, ScanOutcome, Scheduling, start};
 
 /// Bytes read per asynchronous I/O operation.
 pub const BLOCK_SIZE: usize = 2 << 20;

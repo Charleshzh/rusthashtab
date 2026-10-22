@@ -30,6 +30,14 @@ pub const IDC_HASH_VERIFY: i32 = 1007;
 pub const IDC_HASH_EXPORT: i32 = 1008;
 /// Opens the settings dialog.
 pub const IDC_HASH_SETTINGS: i32 = 1009;
+/// Stops the running scan without closing the page.
+pub const IDC_HASH_CANCEL: i32 = 1010;
+/// Chooses which checksum format/algorithm to export.
+pub const IDC_HASH_EXPORT_FORMAT: i32 = 1011;
+/// Copies the selected format's checksums to the clipboard.
+pub const IDC_HASH_EXPORT_CLIPBOARD: i32 = 1012;
+/// Restricts a pasted digest to the selected file.
+pub const IDC_HASH_CURRENT_ONLY: i32 = 1013;
 
 /// The settings dialog template.
 pub const IDD_SETTINGS: u16 = 102;
@@ -58,6 +66,20 @@ pub const IDC_SETTINGS_SUMFILE_BANNER: i32 = 2110;
 pub const IDC_SETTINGS_SUMFILE_BANNER_DATE: i32 = 2111;
 /// Restore the built-in defaults in the settings dialog.
 pub const IDC_SETTINGS_DEFAULTS: i32 = 2112;
+/// Require a pasted line's file name to resolve by full path.
+pub const IDC_SETTINGS_VERIFY_STRICT: i32 = 2113;
+/// Rewrite the paste box to canonical hex after a successful check.
+pub const IDC_SETTINGS_VERIFY_AUTO_FORMAT: i32 = 2114;
+/// Which colour class the colour controls edit.
+pub const IDC_SETTINGS_COLOUR_CLASS: i32 = 2115;
+/// A textual preview of the selected class's colours.
+pub const IDC_SETTINGS_COLOUR_PREVIEW: i32 = 2116;
+/// Pick the selected class's text colour.
+pub const IDC_SETTINGS_COLOUR_TEXT: i32 = 2117;
+/// Pick the selected class's background colour.
+pub const IDC_SETTINGS_COLOUR_BG: i32 = 2118;
+/// Restore the default colours.
+pub const IDC_SETTINGS_COLOUR_DEFAULTS: i32 = 2119;
 
 /// Identifiers the dialog templates declare, in declaration order.
 ///
@@ -74,6 +96,13 @@ pub(crate) const TEMPLATE_IDENTIFIERS: &[(&str, u16)] = &[
     ("IDC_HASH_VERIFY", IDC_HASH_VERIFY as u16),
     ("IDC_HASH_EXPORT", IDC_HASH_EXPORT as u16),
     ("IDC_HASH_SETTINGS", IDC_HASH_SETTINGS as u16),
+    ("IDC_HASH_CANCEL", IDC_HASH_CANCEL as u16),
+    ("IDC_HASH_EXPORT_FORMAT", IDC_HASH_EXPORT_FORMAT as u16),
+    (
+        "IDC_HASH_EXPORT_CLIPBOARD",
+        IDC_HASH_EXPORT_CLIPBOARD as u16,
+    ),
+    ("IDC_HASH_CURRENT_ONLY", IDC_HASH_CURRENT_ONLY as u16),
     ("IDD_SETTINGS", IDD_SETTINGS),
     ("IDC_SETTINGS_ALGORITHMS", IDC_SETTINGS_ALGORITHMS as u16),
     ("IDC_SETTINGS_UPPERCASE", IDC_SETTINGS_UPPERCASE as u16),
@@ -108,6 +137,28 @@ pub(crate) const TEMPLATE_IDENTIFIERS: &[(&str, u16)] = &[
         IDC_SETTINGS_SUMFILE_BANNER_DATE as u16,
     ),
     ("IDC_SETTINGS_DEFAULTS", IDC_SETTINGS_DEFAULTS as u16),
+    (
+        "IDC_SETTINGS_VERIFY_STRICT",
+        IDC_SETTINGS_VERIFY_STRICT as u16,
+    ),
+    (
+        "IDC_SETTINGS_VERIFY_AUTO_FORMAT",
+        IDC_SETTINGS_VERIFY_AUTO_FORMAT as u16,
+    ),
+    (
+        "IDC_SETTINGS_COLOUR_CLASS",
+        IDC_SETTINGS_COLOUR_CLASS as u16,
+    ),
+    (
+        "IDC_SETTINGS_COLOUR_PREVIEW",
+        IDC_SETTINGS_COLOUR_PREVIEW as u16,
+    ),
+    ("IDC_SETTINGS_COLOUR_TEXT", IDC_SETTINGS_COLOUR_TEXT as u16),
+    ("IDC_SETTINGS_COLOUR_BG", IDC_SETTINGS_COLOUR_BG as u16),
+    (
+        "IDC_SETTINGS_COLOUR_DEFAULTS",
+        IDC_SETTINGS_COLOUR_DEFAULTS as u16,
+    ),
 ];
 
 /// Column headings of the results list, in display order.

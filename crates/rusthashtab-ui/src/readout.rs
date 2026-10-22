@@ -61,6 +61,7 @@ pub fn rows_for(
 ) -> Vec<ListRow> {
     if let Some(code) = result.error {
         return vec![ListRow {
+            id: crate::row_id(job_index, usize::MAX),
             job_index,
             algorithm: usize::MAX,
             digest_hex: String::new(),
@@ -83,6 +84,7 @@ pub fn rows_for(
                 return None;
             }
             Some(ListRow {
+                id: crate::row_id(job_index, index),
                 job_index,
                 algorithm: index,
                 digest_hex: rusthashtab_sumfile::export::to_hex(digest, upper),

@@ -22,7 +22,7 @@
 use rusthashtab_hash::{ALGORITHMS, registry};
 use rusthashtab_scan::{
     BLOCK_SIZE, FileJob, FileResult, MatchState, Progress, ScanConfig, ScanEvent, ScanHandle,
-    ScanOutcome, start,
+    ScanOutcome, Scheduling, start,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -369,6 +369,32 @@ fn the_pipeline_does_not_change_the_answer_for_any_algorithm() {
                 algorithm.name
             );
         }
+    }
+}
+
+/// The algorithm-group path must produce exactly the same digests as the inline
+/// path, including across block boundaries. This is forced explicitly rather
+/// than left to `Auto`, so a small-core CI machine still exercises fan-out.
+#[test]
+fn the_algorithm_group_path_matches_the_whole_input() {
+    let dir = TempDir::new("fanout");
+    let path = dir.file("payload.bin", BLOCK_SIZE * 2 + 123);
+
+    let mut config = ScanConfig::all_algorithms(vec![job_for(&path)]);
+    config.scheduling = Scheduling::AlgorithmGroups { groups: 4 };
+    let report = run_scan(config, CancelTrigger::Never);
+    assert_eq!(report.outcome, ScanOutcome::Complete);
+
+    let (_, result, _) = report.result_for(&path);
+    assert_eq!(result.error, None);
+    assert_eq!(result.size, (BLOCK_SIZE * 2 + 123) as u64);
+    let expected = one_shot_digests(&path);
+    for (index, algorithm) in ALGORITHMS.iter().enumerate() {
+        assert_eq!(
+            result.digests[index], expected[index],
+            "{} differs on the algorithm-group path",
+            algorithm.name
+        );
     }
 }
 

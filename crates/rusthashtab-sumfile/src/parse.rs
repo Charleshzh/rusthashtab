@@ -180,6 +180,15 @@ impl SumFileParser {
     }
 }
 
+/// Decode a base64 digest, tolerating the URL-safe alphabet and missing padding.
+///
+/// Public because the page's paste box accepts a bare base64 digest, which is not
+/// a checksum *line* and therefore never reaches the line parser. One decoder
+/// means a digest accepted in a file is accepted when pasted.
+pub fn base64_to_bytes(s: &str) -> Option<Vec<u8>> {
+    base64_decode(s)
+}
+
 /// Decode a sumfile's base64 digest, tolerating the URL-safe alphabet and
 /// missing padding, both of which appear in real files.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {

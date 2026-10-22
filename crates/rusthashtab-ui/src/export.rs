@@ -52,6 +52,8 @@ use std::path::{Path, PathBuf};
 pub struct ExportPlan {
     /// Where the file will be written, exactly as the user chose it.
     pub path: PathBuf,
+    /// The format/algorithm the user selected, or the one the extension implied.
+    pub choice: ExportChoice,
     /// Which flavour of checksum file to write.
     pub format: ExportFormat,
     /// Index into [`rusthashtab_hash::ALGORITHMS`] of the digest to export.
@@ -60,6 +62,61 @@ pub struct ExportPlan {
     pub options: ExportOptions,
     /// The lines to write, in display-path order (the formatter sorts them).
     pub entries: Vec<FileSum>,
+}
+
+/// One entry in the export-format selector.
+///
+/// This is a user's decision, not an inference from a file-name extension. The
+/// extension still has a role -- it is copied into the suggested name and checked
+/// for agreement -- but the selector is what the page offers and what the user can
+/// see before saving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportChoice {
+    /// One algorithm's digests in `sha256sum`-style form.
+    Algorithm(usize),
+    /// CRC32 in SFV form.
+    Sfv,
+    /// The corz `.hash` form.
+    DotHash,
+}
+
+impl ExportChoice {
+    /// The format this choice writes.
+    pub fn format(self) -> ExportFormat {
+        match self {
+            Self::Algorithm(_) => ExportFormat::Sumfile,
+            Self::Sfv => ExportFormat::Sfv,
+            Self::DotHash => ExportFormat::DotHash,
+        }
+    }
+
+    /// The algorithm this choice exports, given the enabled flags.
+    ///
+    /// `DotHash` prefers the first enabled secure algorithm, because the corz
+    /// annotations are meant for strong digests; it falls back to the first
+    /// enabled algorithm when every secure one is off.
+    fn algorithm(self, enabled: &[bool]) -> Result<usize, ExportError> {
+        let first_enabled = enabled
+            .iter()
+            .position(|on| *on)
+            .ok_or(ExportError::NoAlgorithmEnabled)?;
+        match self {
+            Self::Algorithm(index) => {
+                if enabled.get(index).copied().unwrap_or(false) {
+                    Ok(index)
+                } else {
+                    Err(ExportError::AlgorithmNotEnabled)
+                }
+            }
+            Self::Sfv => crc32_algorithm(enabled),
+            Self::DotHash => {
+                let secure = enabled.iter().enumerate().find_map(|(index, on)| {
+                    (*on && ALGORITHMS.get(index).is_some_and(|a| a.secure)).then_some(index)
+                });
+                Ok(secure.unwrap_or(first_enabled))
+            }
+        }
+    }
 }
 
 /// Why a checksum file could not be planned or written.
@@ -80,6 +137,12 @@ pub enum ExportError {
     /// SFV is defined over CRC32, and CRC32 is disabled.
     #[error("SFV export needs CRC32, which is disabled")]
     Crc32NotEnabled,
+    /// The chosen format and the target's extension name different formats.
+    ///
+    /// Writing the choice's content under the extension's name produces a file
+    /// other tools will misread, so this is refused rather than guessed at.
+    #[error("the file name does not match the selected format")]
+    FormatMismatch,
     /// The file could not be written; the OS message is included.
     #[error("{0}")]
     Io(String),
@@ -149,6 +212,70 @@ pub fn plan(
         },
     };
 
+    let choice = match format {
+        ExportFormat::Sfv => ExportChoice::Sfv,
+        ExportFormat::DotHash => ExportChoice::DotHash,
+        ExportFormat::Sumfile => ExportChoice::Algorithm(algorithm),
+    };
+
+    build_plan(target, choice, format, algorithm, results, jobs, settings)
+}
+
+/// Plan an export from an explicit format/algorithm choice.
+///
+/// The extension is checked for agreement rather than used to decide: a user who
+/// selected SHA-256 and then typed `.md5` would otherwise get a SHA-256 file with
+/// an MD5 name. An unrecognised extension is allowed, because a checksum file
+/// does not have to have a registered one.
+pub fn plan_with_choice(
+    target: &Path,
+    choice: ExportChoice,
+    results: &[Option<FileResult>],
+    jobs: &[JobSpec],
+    settings: &Settings,
+    enabled: &[bool],
+) -> Result<ExportPlan, ExportError> {
+    let format = choice.format();
+    let algorithm = choice.algorithm(enabled)?;
+    check_extension_agrees(target, choice)?;
+    build_plan(target, choice, format, algorithm, results, jobs, settings)
+}
+
+/// Refuse a target whose registered extension names a different format/algorithm.
+fn check_extension_agrees(target: &Path, choice: ExportChoice) -> Result<(), ExportError> {
+    let extension = target
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let implied = match extension.as_str() {
+        "sfv" => Some(ExportChoice::Sfv),
+        "hash" => Some(ExportChoice::DotHash),
+        other => registry::by_extension(other).and_then(|found| {
+            ALGORITHMS
+                .iter()
+                .position(|algorithm| algorithm.name == found.name)
+                .map(ExportChoice::Algorithm)
+        }),
+    };
+
+    if implied.is_some_and(|implied| implied != choice) {
+        Err(ExportError::FormatMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+/// Build the plan once the format/algorithm decision is settled.
+fn build_plan(
+    target: &Path,
+    choice: ExportChoice,
+    format: ExportFormat,
+    algorithm: usize,
+    results: &[Option<FileResult>],
+    jobs: &[JobSpec],
+    settings: &Settings,
+) -> Result<ExportPlan, ExportError> {
     let options = ExportOptions {
         upper: settings.sumfile_uppercase,
         forward_slashes: settings.sumfile_forward_slashes,
@@ -186,11 +313,79 @@ pub fn plan(
 
     Ok(ExportPlan {
         path: target.to_path_buf(),
+        choice,
         format,
         algorithm,
         options,
         entries,
     })
+}
+
+/// The choices a page can offer for these enabled algorithms.
+///
+/// Only formats the page can actually produce: an SFV entry needs CRC32, and a
+/// corz `.hash` entry needs a secure algorithm (or an enabled fallback). Order is
+/// the algorithm table order, then SFV, then `.hash`, matching the way the old
+/// filter was built.
+pub fn choices(enabled: &[bool]) -> Vec<ExportChoice> {
+    let mut choices: Vec<ExportChoice> = ALGORITHMS
+        .iter()
+        .enumerate()
+        .filter(|(index, algorithm)| {
+            enabled.get(*index).copied().unwrap_or(false) && !algorithm.extensions.is_empty()
+        })
+        .map(|(index, _)| ExportChoice::Algorithm(index))
+        .collect();
+
+    if enabled
+        .iter()
+        .enumerate()
+        .any(|(index, on)| *on && ALGORITHMS[index].name == "CRC32")
+    {
+        choices.push(ExportChoice::Sfv);
+    }
+    if enabled.iter().enumerate().any(|(index, on)| {
+        *on && ALGORITHMS
+            .get(index)
+            .is_some_and(|algorithm| algorithm.secure)
+    }) {
+        choices.push(ExportChoice::DotHash);
+    }
+    choices
+}
+
+/// The extension a choice should suggest in a Save dialog.
+pub fn extension(choice: ExportChoice) -> &'static str {
+    match choice {
+        ExportChoice::Algorithm(index) => ALGORITHMS
+            .get(index)
+            .and_then(|algorithm| algorithm.extensions.first().copied())
+            .unwrap_or("txt"),
+        ExportChoice::Sfv => "sfv",
+        ExportChoice::DotHash => "hash",
+    }
+}
+
+/// The label a choice shows in the export-format selector.
+pub fn label(choice: ExportChoice) -> String {
+    match choice {
+        ExportChoice::Algorithm(index) => ALGORITHMS
+            .get(index)
+            .map(|algorithm| algorithm.name.to_string())
+            .unwrap_or_default(),
+        ExportChoice::Sfv => String::from("SFV (CRC32)"),
+        ExportChoice::DotHash => String::from("corz .hash"),
+    }
+}
+
+/// Render a plan for the clipboard: CRLF and no banner, as a paste expects.
+pub fn render_clipboard(plan: &ExportPlan) -> String {
+    let options = ExportOptions {
+        unix_endings: false,
+        banner: false,
+        ..plan.options.clone()
+    };
+    export(&plan.entries, plan.format, &options)
 }
 
 /// Write a planned checksum file.

@@ -28,23 +28,30 @@
 use crate::{ListRow, resource};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FF_MODERN, FIXED_PITCH, GetDC, GetObjectW,
-    GetStockObject, GetTextExtentPoint32W, HGDIOBJ, LOGFONTW, ReleaseDC, SelectObject,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FF_MODERN,
+    FIXED_PITCH, GetDC, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HGDIOBJ,
+    InvalidateRect, LOGFONTW, ReleaseDC, SelectObject,
 };
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT,
-    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM,
-    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
-    LVS_EX_FULLROWSELECT, NMLVCUSTOMDRAW,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW,
+    HDM_SETITEMW, HEADER_CONTROL_FORMAT_FLAGS, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_GETHEADER, LVM_GETNEXTITEM,
+    LVM_INSERTCOLUMNW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVNI_SELECTED, LVS_EX_FULLROWSELECT, NMLVCUSTOMDRAW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_GETFONT, WM_SETFONT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SPI_GETHIGHCONTRAST, SendMessageW, SystemParametersInfoW, WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
+};
 
 /// The colour a row is drawn in when a digest matched an expected value: a dark
 /// green, `#008B00`, written `0x00BBGGRR` because that is `COLORREF`'s order.
+#[cfg(test)]
 const MATCHED_COLOR: ColorDef = ColorDef(0x0000_8B00);
 /// The colour a row is drawn in when a digest had an expected value and missed it:
 /// a dark red, `#C00000`, in `COLORREF` order.
+#[cfg(test)]
 const MISMATCHED_COLOR: ColorDef = ColorDef(0x0000_00C0);
 /// The colour a row is drawn in when an expected value matched only under an
 /// algorithm that is not cryptographically secure: dark goldenrod, `#B8860B`, in
@@ -53,6 +60,7 @@ const MISMATCHED_COLOR: ColorDef = ColorDef(0x0000_00C0);
 /// Deliberately neither green nor red. A CRC32 collision is evidence, not proof,
 /// and painting it like a SHA-256 match would let a weak check pass for a strong
 /// one -- which is the whole reason the comparison layer reports `secure`.
+#[cfg(test)]
 const WEAK_MATCH_COLOR: ColorDef = ColorDef(0x000B_86B8);
 
 /// A `COLORREF`, spelled `0x00BBGGRR`.
@@ -61,9 +69,11 @@ const WEAK_MATCH_COLOR: ColorDef = ColorDef(0x000B_86B8);
 /// and a bare literal here would be read as `0xRRGGBB` by everyone including the
 /// author. It was: the first version of both constants above was in `RGB` order,
 /// and [`tests::the_colours_are_spelled_in_colorref_order`] is what caught it.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ColorDef(u32);
 
+#[cfg(test)]
 impl ColorDef {
     /// The `COLORREF` the GDI APIs want.
     fn colorref(self) -> COLORREF {
@@ -282,28 +292,106 @@ pub fn remeasure_columns(list: HWND) {
     }
 }
 
-/// Replace every row in the list.
+/// Keep the control from repainting while a batch of items is changed.
 ///
-/// Called with the page's whole row list rather than with a delta, because the
-/// control is not the source of truth: the rows are owned by the page, and this is a
-/// rendering of them. Rebuilding the control on each batch also means a row
-/// inserted out of order cannot leave the two disagreeing.
-pub fn set_rows(list: HWND, rows: &[ListRow]) {
-    // SAFETY: `list` is the page's list view, and clearing it takes no arguments.
-    unsafe {
-        SendMessageW(list, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
-    }
+/// Every row insertion is a window message, and a report-mode list view repaints
+/// after each one. At 31,000 rows that is the difference between a visible
+/// flicker and no flicker at all. The guard restores redrawing on every exit path,
+/// including a panic, because a control left with `WM_SETREDRAW` off looks frozen
+/// forever.
+pub struct RedrawGuard {
+    list: HWND,
+}
 
-    for (row_index, row) in rows.iter().enumerate() {
-        insert_row(list, row_index, row);
+impl RedrawGuard {
+    /// Stop redrawing until the returned guard is dropped.
+    pub fn new(list: HWND) -> Self {
+        // SAFETY: `list` is the page's list view. `WM_SETREDRAW` takes a BOOL in
+        // `wParam` and no pointer.
+        unsafe {
+            SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        Self { list }
     }
 }
 
-/// Append one row, returning its item index.
+impl Drop for RedrawGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.list` was live when the guard was made and the page owns
+        // it for at least as long as the guard. The second call re-enables
+        // painting; the invalidate is what actually makes the control redraw.
+        unsafe {
+            SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), Some(LPARAM(0)));
+            let _ = InvalidateRect(Some(self.list), None, true);
+        }
+    }
+}
+
+/// Show or hide the File column for a selection of `jobs` files.
 ///
-/// `row_index` is the row's position in the page's row list, which is what the
-/// item's `lParam` records so a selection can be turned back into rows.
-pub fn insert_row(list: HWND, row_index: usize, row: &ListRow) -> i32 {
+/// A single file's display path is already the page's subject, and the column
+/// costs the Digest column exactly the width it needs. The width is re-measured
+/// from the control's font rather than remembered, so this follows a DPI change.
+pub fn set_file_column_for_jobs(list: Option<HWND>, jobs: usize) {
+    let Some(list) = list else {
+        return;
+    };
+    let widths = column_widths(list);
+    let width = if jobs == 1 { 0 } else { widths[3] };
+    let mut column = LVCOLUMNW {
+        mask: LVCF_WIDTH,
+        cx: width,
+        ..Default::default()
+    };
+    // SAFETY: column 3 is the File column the template declares; `list` is the
+    // page's list view and `column` lives for the call. `LVM_SETCOLUMNW` with
+    // `LVCF_WIDTH` reads only `cx`.
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_SETCOLUMNW,
+            Some(WPARAM(3)),
+            Some(LPARAM((&mut column as *mut LVCOLUMNW) as isize)),
+        );
+    }
+}
+
+/// Replace every row in the list.
+///
+/// The control is a virtual (`LVS_OWNERDATA`) report view: setting the item count
+/// is the whole fill, and the control asks the page for each visible cell through
+/// `LVN_GETDISPINFOW`. That is what keeps 31,000 rows from costing 124,000
+/// `LVM_INSERTITEMW`/`LVM_SETITEMTEXTW` messages.
+pub fn set_rows(list: HWND, rows: &[ListRow]) {
+    // SAFETY: `list` is the page's list view; `LVM_SETITEMCOUNT` takes a count and
+    // a flags word, neither a pointer.
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_SETITEMCOUNT,
+            Some(WPARAM(rows.len())),
+            Some(LPARAM(0)),
+        );
+        let _ = InvalidateRect(Some(list), None, true);
+    }
+}
+
+/// Repaint after the page's row contents changed.
+///
+/// In virtual mode the control has no per-item text to update; it asks again for
+/// the cells it draws, and the page's row list is already the new value.
+pub fn update_rows(list: HWND) {
+    // SAFETY: `list` is the page's list view; invalidating it takes no pointer.
+    unsafe {
+        let _ = InvalidateRect(Some(list), None, true);
+    }
+}
+
+/// The four cells of one row, already formatted.
+///
+/// Public because the dialog's `LVN_GETDISPINFOW` handler is the virtual list's
+/// data source.
+pub fn row_cells(row: &ListRow) -> [String; 4] {
     let digest = if let Some(code) = row.error {
         resource::read_error_text(code)
     } else {
@@ -323,56 +411,12 @@ pub fn insert_row(list: HWND, row_index: usize, row: &ListRow) -> i32 {
         rusthashtab_scan::MatchState::Mismatched => "mismatch",
         rusthashtab_scan::MatchState::NotChecked => "not checked",
     };
-
-    let mut algorithm_wide = wide(&algorithm);
-    let mut digest_wide = wide(&digest);
-    let mut matched_wide = wide(matched);
-    let mut file_wide = wide(&file_column_text(row));
-
-    let mut item = LVITEMW {
-        mask: LVIF_TEXT | LVIF_PARAM,
-        // The position in the list. `LVM_INSERTITEMW` takes its index from
-        // `iItem` (the `ListView_InsertItem` macro passes `wParam` as zero), so
-        // leaving this at zero inserted every row at the front and reversed the
-        // list.
-        iItem: row_index as i32,
-        // The row's index in the page's list, which is how a selection is turned
-        // back into rows. Not the item index: the two are the same only while rows
-        // are appended in order, and that is not a property to rely on.
-        lParam: LPARAM(row_index as isize),
-        pszText: windows::core::PWSTR(algorithm_wide.as_mut_ptr()),
-        ..Default::default()
-    };
-
-    // SAFETY: `list` is the page's list view, `item` and every string it points at
-    // live for the duration of the call, and `LVM_INSERTITEMW` copies what it needs.
-    // The column index is carried in `iSubItem` between the two calls below.
-    //
-    // `wParam` is the item's position, not zero: zero inserts at the *front*, which
-    // silently reversed the list. The row's index in the page's list is the
-    // position it must occupy, and an index past the end is appended by the
-    // control anyway.
-    let inserted = unsafe {
-        SendMessageW(
-            list,
-            LVM_INSERTITEMW,
-            Some(WPARAM(row_index)),
-            Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
-        )
-    };
-    if inserted.0 < 0 {
-        // The control refused the item -- out of memory, in practice. There is
-        // nothing to roll back and nothing useful to say; the row simply does not
-        // appear, and the status line's count is what disagrees with the list.
-        return -1;
-    }
-
-    let index = inserted.0 as usize;
-    set_sub_item(list, index, 1, &mut digest_wide);
-    set_sub_item(list, index, 2, &mut matched_wide);
-    set_sub_item(list, index, 3, &mut file_wide);
-
-    index as i32
+    [
+        algorithm,
+        digest,
+        matched.to_string(),
+        file_column_text(row),
+    ]
 }
 
 /// What the File column shows for one row.
@@ -393,29 +437,143 @@ fn file_column_text(row: &ListRow) -> String {
     }
 }
 
-/// Set one cell of an existing item.
-fn set_sub_item(list: HWND, item: usize, sub_item: i32, text: &mut [u16]) {
-    let mut cell = LVITEMW {
-        iSubItem: sub_item,
-        pszText: windows::core::PWSTR(text.as_mut_ptr()),
-        ..Default::default()
-    };
+/// A sortable column, in template order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Column {
+    /// The File column.
+    File = 3,
+    /// The Algorithm column.
+    Algorithm = 0,
+    /// The Digest column.
+    Digest = 1,
+    /// The Match column.
+    Match = 2,
+}
 
-    // SAFETY: the item index came from a successful `LVM_INSERTITEMW`, and `cell`
-    // plus the string it points at live for the call. `LVM_SETITEMTEXTW` copies the
-    // text into the control's own storage.
-    unsafe {
-        SendMessageW(
-            list,
-            LVM_SETITEMTEXTW,
-            Some(WPARAM(item)),
-            Some(LPARAM((&mut cell as *mut LVITEMW) as isize)),
-        );
+impl Column {
+    /// The column a header index names, if it is one of ours.
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Algorithm),
+            1 => Some(Self::Digest),
+            2 => Some(Self::Match),
+            3 => Some(Self::File),
+            _ => None,
+        }
     }
 }
 
-/// The rows currently selected, by their index in the page's row list.
-pub fn selected_rows(list: HWND) -> Vec<usize> {
+/// The current sort: which column, and in which direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortState {
+    /// Column being sorted.
+    pub column: Column,
+    /// Ascending when true, descending when false.
+    pub ascending: bool,
+}
+
+/// The rank a row's match state contributes to Digest/Match ordering.
+///
+/// Deliberately not alphabetical: an unreadable file is the most important thing
+/// in the table, and "not checked" is the least, so the order is by attention
+/// required. The same rank is used for both columns so the two cannot disagree.
+fn match_rank(row: &ListRow) -> u8 {
+    if row.error.is_some() {
+        return 0;
+    }
+    match row.match_state {
+        rusthashtab_scan::MatchState::Matched { secure: true, .. } => 1,
+        rusthashtab_scan::MatchState::Matched { secure: false, .. } => 2,
+        rusthashtab_scan::MatchState::Mismatched => 3,
+        rusthashtab_scan::MatchState::NotChecked => 4,
+    }
+}
+
+/// A row's algorithm name, or an empty string for an error row.
+fn algorithm_name(row: &ListRow) -> &'static str {
+    rusthashtab_hash::ALGORITHMS
+        .get(row.algorithm)
+        .map(|algorithm| algorithm.name)
+        .unwrap_or("")
+}
+
+/// Sort rows in place.
+///
+/// Stable by design: equal keys keep their job order, and the tie-break is the
+/// row's stable ID rather than its position, so repeated sorts cannot shuffle
+/// equal rows. `sort_by` is stable, but the explicit tie-break also covers a
+/// descending sort, where reversing the whole comparison would otherwise reverse
+/// the tie-break too.
+pub fn sort_rows(rows: &mut [ListRow], state: SortState) {
+    rows.sort_by(|left, right| {
+        let ordering = match state.column {
+            Column::File => left
+                .display_path
+                .to_lowercase()
+                .cmp(&right.display_path.to_lowercase()),
+            Column::Algorithm => algorithm_name(left)
+                .to_lowercase()
+                .cmp(&algorithm_name(right).to_lowercase()),
+            Column::Digest => match_rank(left).cmp(&match_rank(right)).then_with(|| {
+                left.digest_hex
+                    .to_lowercase()
+                    .cmp(&right.digest_hex.to_lowercase())
+            }),
+            Column::Match => match_rank(left).cmp(&match_rank(right)),
+        };
+
+        let ordering = if state.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+
+        // The tie-break is always ascending. A descending sort must not reverse
+        // the order of rows that compare equal; job order is the stable answer.
+        ordering.then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+/// Show the sort arrow on the active column, and clear it everywhere else.
+pub fn set_sort_indicator(list: HWND, state: Option<SortState>) {
+    // SAFETY: `list` is the page's list view; `LVM_GETHEADER` returns its header
+    // control or null, and the header is a child of the list.
+    let header = unsafe { SendMessageW(list, LVM_GETHEADER, Some(WPARAM(0)), Some(LPARAM(0))) };
+    if header.0 == 0 {
+        return;
+    }
+    let header = HWND(header.0 as *mut core::ffi::c_void);
+
+    for index in 0..resource::COLUMNS.len() {
+        let active = state.filter(|sort| sort.column as usize == index);
+        let flags = match active {
+            Some(sort) if sort.ascending => HDF_SORTUP.0,
+            Some(_) => HDF_SORTDOWN.0,
+            None => 0,
+        };
+        let mut item = HDITEMW {
+            mask: HDI_FORMAT,
+            fmt: HEADER_CONTROL_FORMAT_FLAGS(flags),
+            ..Default::default()
+        };
+        // SAFETY: `header` is the list view's header, `index` is one of its
+        // columns, and `item` lives for the call.
+        unsafe {
+            SendMessageW(
+                header,
+                HDM_SETITEMW,
+                Some(WPARAM(index)),
+                Some(LPARAM((&mut item as *mut HDITEMW) as isize)),
+            );
+        }
+    }
+}
+
+/// The rows currently selected, by stable row ID.
+///
+/// IDs rather than positions: a row's position changes when an earlier file
+/// finishes, and a copy that used positions would silently take the wrong row.
+pub fn selected_ids(list: HWND, rows: &[ListRow]) -> Vec<u64> {
     let mut selected = Vec::new();
     // -1 asks for the first item matching the flags; each answer asks for the next
     // one after it. The loop therefore terminates even if the selection changes
@@ -438,30 +596,49 @@ pub fn selected_rows(list: HWND) -> Vec<usize> {
         }
         after = found.0;
 
-        let mut item = LVITEMW {
-            mask: LVIF_PARAM,
-            iItem: found.0 as i32,
-            ..Default::default()
-        };
-        // SAFETY: `after` is an item index the control just reported, and `item`
-        // lives for the call. `LVM_GETITEMW` fills in `lParam` from the item we
-        // inserted.
-        let copied = unsafe {
-            SendMessageW(
-                list,
-                LVM_GETITEMW,
-                Some(WPARAM(0)),
-                Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
-            )
-        };
-        // A zero return is failure; the control reports success as non-zero, which
-        // is the `BOOL` convention rather than an item index.
-        if copied.0 != 0 {
-            selected.push(item.lParam.0 as usize);
+        // In owner-data mode the item index is the row index: the page's row list
+        // is the data source, and `LVN_GETDISPINFOW` is asked for that same index.
+        if let Some(row) = rows.get(found.0 as usize) {
+            selected.push(row.id);
         }
     }
 
     selected
+}
+
+/// The stable ID of one list item, if it exists.
+pub fn item_id(_list: HWND, item: usize, rows: &[ListRow]) -> Option<u64> {
+    rows.get(item).map(|row| row.id)
+}
+
+/// Select the items whose IDs are in `ids`, and clear every other selection.
+pub fn select_ids(list: HWND, ids: &[u64], rows: &[ListRow]) {
+    if ids.is_empty() {
+        return;
+    }
+
+    // SAFETY: `list` is the page's list view. Every message below takes integers
+    // or a pointer to a live local `LVITEMW`.
+    unsafe {
+        for (index, row) in rows.iter().enumerate() {
+            let selected = ids.contains(&row.id);
+            let mut state = LVITEMW {
+                state: if selected {
+                    LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0)
+                } else {
+                    LIST_VIEW_ITEM_STATE_FLAGS(0)
+                },
+                stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
+                ..Default::default()
+            };
+            SendMessageW(
+                list,
+                LVM_SETITEMSTATE,
+                Some(WPARAM(index)),
+                Some(LPARAM((&mut state as *mut LVITEMW) as isize)),
+            );
+        }
+    }
 }
 
 /// How a row should be drawn, given what its digest compared to.
@@ -474,6 +651,8 @@ pub enum RowColour {
     MatchedWeak,
     /// An expected digest did not match.
     Mismatched,
+    /// The file could not be read.
+    Error,
     /// Nothing to compare against, or no result.
     Neutral,
 }
@@ -484,7 +663,9 @@ pub fn colour_for(state: rusthashtab_scan::MatchState, failed: bool) -> RowColou
         // A file that could not be read is not a mismatch: telling the user their
         // file is corrupt when it was merely unreadable is the one thing the
         // comparison layer deliberately avoids, and the display must not undo it.
-        return RowColour::Neutral;
+        // It is its own class so the user can colour it differently from "not
+        // checked".
+        return RowColour::Error;
     }
     match state {
         rusthashtab_scan::MatchState::Matched { secure: true, .. } => RowColour::Matched,
@@ -492,6 +673,110 @@ pub fn colour_for(state: rusthashtab_scan::MatchState, failed: bool) -> RowColou
         rusthashtab_scan::MatchState::Mismatched => RowColour::Mismatched,
         rusthashtab_scan::MatchState::NotChecked => RowColour::Neutral,
     }
+}
+
+/// Resolved colours for the five row classes.
+///
+/// Resolved once, not on the paint path: `GetSysColor` and the settings lookup are
+/// both cheap but neither belongs in a `CDDS_SUBITEM` handler that can run
+/// thousands of times for one scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    matched: (COLORREF, COLORREF),
+    weak: (COLORREF, COLORREF),
+    mismatched: (COLORREF, COLORREF),
+    error: (COLORREF, COLORREF),
+    neutral: (COLORREF, COLORREF),
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self::from_settings(&rusthashtab_settings::Settings::default(), false)
+    }
+}
+
+impl Palette {
+    /// Resolve the settings into colours the paint path can use.
+    ///
+    /// High contrast ignores the configured colours: a user who asked the system
+    /// for high contrast has already said that arbitrary foreground/background
+    /// pairs are less readable than the system's own. The Match column's text
+    /// still carries the meaning, so nothing is lost.
+    pub fn from_settings(settings: &rusthashtab_settings::Settings, high_contrast: bool) -> Self {
+        let system_text = system_colour(COLOR_WINDOWTEXT);
+        let system_background = system_colour(COLOR_WINDOW);
+        let resolve = |colour: rusthashtab_settings::RowColour| {
+            if high_contrast
+                || colour.text == rusthashtab_settings::SYSTEM_COLOUR
+                || colour.background == rusthashtab_settings::SYSTEM_COLOUR
+            {
+                let text = if high_contrast || colour.text == rusthashtab_settings::SYSTEM_COLOUR {
+                    system_text
+                } else {
+                    COLORREF(colour.text)
+                };
+                let background =
+                    if high_contrast || colour.background == rusthashtab_settings::SYSTEM_COLOUR {
+                        system_background
+                    } else {
+                        COLORREF(colour.background)
+                    };
+                (text, background)
+            } else {
+                (COLORREF(colour.text), COLORREF(colour.background))
+            }
+        };
+
+        let colours = settings.colours;
+        Self {
+            matched: resolve(colours.matched),
+            weak: resolve(colours.weak),
+            mismatched: resolve(colours.mismatched),
+            error: resolve(colours.error),
+            neutral: resolve(colours.neutral),
+        }
+    }
+
+    /// The text and background for one class.
+    pub fn for_class(&self, class: RowColour) -> (COLORREF, COLORREF) {
+        match class {
+            RowColour::Matched => self.matched,
+            RowColour::MatchedWeak => self.weak,
+            RowColour::Mismatched => self.mismatched,
+            RowColour::Error => self.error,
+            RowColour::Neutral => self.neutral,
+        }
+    }
+}
+
+/// One system colour as a `COLORREF`.
+fn system_colour(index: windows::Win32::Graphics::Gdi::SYS_COLOR_INDEX) -> COLORREF {
+    // SAFETY: `GetSysColor` reads a system colour table entry; every defined
+    // index is valid and the call has no pointer arguments.
+    COLORREF(unsafe { GetSysColor(index) })
+}
+
+/// Whether the system is in a high-contrast theme.
+///
+/// A configured foreground/background pair can be unreadable under such a theme;
+/// the page then uses the system's own colours and lets the Match column's text
+/// carry the verdict.
+pub fn high_contrast() -> bool {
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: core::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `contrast` declares its own size and lives for the call;
+    // `SystemParametersInfoW` writes at most `cbSize` bytes into it.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            Some((&mut contrast as *mut HIGHCONTRASTW).cast()),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    ok.is_ok() && (contrast.dwFlags.0 & HCF_HIGHCONTRASTON.0) != 0
 }
 
 /// Handle a custom-draw notification from the results list.
@@ -517,6 +802,23 @@ pub unsafe fn custom_draw(
     rows: &[ListRow],
     monospace_font: isize,
 ) -> Option<isize> {
+    // SAFETY: the caller promises this is an `NM_CUSTOMDRAW` notification and the
+    // default palette owns no resources.
+    unsafe { custom_draw_with_palette(lparam, rows, monospace_font, &Palette::default()) }
+}
+
+/// Custom draw with an explicit palette.
+///
+/// # Safety
+///
+/// `lparam` must be the `NMHDR` of an `NM_CUSTOMDRAW` notification, which is what
+/// the dialog procedure is handed for that message.
+pub unsafe fn custom_draw_with_palette(
+    lparam: LPARAM,
+    rows: &[ListRow],
+    monospace_font: isize,
+    palette: &Palette,
+) -> Option<isize> {
     // SAFETY: the caller promises this is an `NM_CUSTOMDRAW` notification.
     let custom = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
 
@@ -539,25 +841,21 @@ pub unsafe fn custom_draw(
     }
 
     if stage == (CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0) {
-        let row_index = custom.nmcd.lItemlParam.0 as usize;
+        // In owner-data mode the item spec is the row index: the control has no
+        // per-item storage, so there is no `lParam` to read.
+        let row_index = custom.nmcd.dwItemSpec;
         let mut flags = CDRF_DODEFAULT;
 
         if let Some(row) = rows.get(row_index) {
-            match colour_for(row.match_state, row.error.is_some()) {
-                RowColour::Matched => {
-                    custom.clrText = MATCHED_COLOR.colorref();
-                    flags = CDRF_NEWFONT;
-                }
-                RowColour::MatchedWeak => {
-                    custom.clrText = WEAK_MATCH_COLOR.colorref();
-                    flags = CDRF_NEWFONT;
-                }
-                RowColour::Mismatched => {
-                    custom.clrText = MISMATCHED_COLOR.colorref();
-                    flags = CDRF_NEWFONT;
-                }
-                RowColour::Neutral => {}
+            let (text, background) =
+                palette.for_class(colour_for(row.match_state, row.error.is_some()));
+            custom.clrText = text;
+            // A selected row must keep the system highlight; painting a custom
+            // background over it would make the selection disappear.
+            if (custom.nmcd.uItemState.0 & CDIS_SELECTED.0) == 0 {
+                custom.clrTextBk = background;
             }
+            flags = CDRF_NEWFONT;
         }
 
         // Column 1 is Digest; the other columns keep the sheet's UI font.
@@ -582,6 +880,7 @@ pub unsafe fn custom_draw(
 }
 
 /// NUL-terminate a string for a Win32 parameter.
+#[cfg(test)]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(core::iter::once(0)).collect()
 }
@@ -591,6 +890,14 @@ fn wide(text: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use rusthashtab_scan::MatchState;
+    use std::cell::Cell;
+
+    // One counter per test thread, so rows created in one test get IDs 0, 1, ...
+    // and `custom_draw_at` can address them by position without hand-writing an
+    // ID for every call.
+    thread_local! {
+        static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+    }
 
     /// The colours must be in `COLORREF` order, which is `0x00BBGGRR` -- the
     /// opposite of how a colour is written everywhere else.
@@ -694,6 +1001,7 @@ mod tests {
     #[test]
     fn the_file_column_shows_the_display_path_with_an_index_fallback() {
         let mut row = ListRow {
+            id: crate::row_id(7, usize::MAX),
             job_index: 7,
             algorithm: usize::MAX,
             digest_hex: String::new(),
@@ -707,12 +1015,12 @@ mod tests {
         assert_eq!(file_column_text(&row), "nested\\file.bin");
     }
 
-    /// A file that could not be read must not be shown as a mismatch. That
-    /// distinction is made deliberately in the comparison layer, and the display
-    /// undoing it would tell the user their file is corrupt.
+    /// A file that could not be read must not be shown as a mismatch. It has its
+    /// own class now, so the user can colour it separately from "not checked",
+    /// but it is still not red.
     #[test]
-    fn an_unreadable_file_is_not_coloured_as_a_mismatch() {
-        assert_eq!(colour_for(MatchState::Mismatched, true), RowColour::Neutral);
+    fn an_unreadable_file_is_coloured_as_an_error_not_a_mismatch() {
+        assert_eq!(colour_for(MatchState::Mismatched, true), RowColour::Error);
         assert_eq!(
             colour_for(MatchState::Mismatched, false),
             RowColour::Mismatched
@@ -792,23 +1100,20 @@ mod tests {
             row_for(MatchState::NotChecked, None),
         ];
 
+        let palette = Palette::default();
         let expected = [
-            (0usize, MATCHED_COLOR, CDRF_NEWFONT as isize),
-            (1, WEAK_MATCH_COLOR, CDRF_NEWFONT as isize),
-            (2, MISMATCHED_COLOR, CDRF_NEWFONT as isize),
-            (3, ColorDef(0), CDRF_DODEFAULT as isize),
+            (0usize, palette.for_class(RowColour::Matched).0),
+            (1, palette.for_class(RowColour::MatchedWeak).0),
+            (2, palette.for_class(RowColour::Mismatched).0),
+            (3, palette.for_class(RowColour::Neutral).0),
         ];
-        for (row, colour, expected_answer) in expected {
+        for (row, colour) in expected {
             let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(row));
             draw.iSubItem = 1;
             // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
             let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
-            assert_eq!(answer, Some(expected_answer));
-            assert_eq!(
-                draw.clrText,
-                colour.colorref(),
-                "row {row} was not given its colour"
-            );
+            assert_eq!(answer, Some(CDRF_NEWFONT as isize));
+            assert_eq!(draw.clrText, colour, "row {row} was not given its colour");
         }
     }
 
@@ -881,6 +1186,11 @@ mod tests {
     /// A row shaped the way the page stores it.
     fn row_for(state: MatchState, error: Option<u32>) -> ListRow {
         ListRow {
+            id: NEXT_ID.with(|next| {
+                let id = next.get();
+                next.set(id + 1);
+                id
+            }),
             job_index: 0,
             algorithm: 0,
             digest_hex: String::new(),
@@ -896,6 +1206,7 @@ mod tests {
         draw.nmcd.hdr.idFrom = resource::IDC_HASH_LIST as usize;
         draw.nmcd.dwDrawStage = windows::Win32::UI::Controls::NMCUSTOMDRAW_DRAW_STAGE(stage);
         if let Some(index) = row {
+            draw.nmcd.dwItemSpec = index;
             draw.nmcd.lItemlParam = LPARAM(index as isize);
         }
         draw
