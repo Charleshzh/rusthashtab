@@ -168,6 +168,10 @@ pub struct DialogState {
     /// The export in flight, if any.
     #[cfg(windows)]
     pub export_task: Option<task::Background<Result<usize, String>>>,
+    /// A fixed-pitch font for the digest column, when the display setting asks for
+    /// one. `0` means none; it is created from the sheet's font in `WM_INITDIALOG`.
+    #[cfg(windows)]
+    pub mono_font: isize,
     /// Sequence of the newest verification request; a completion with any other
     /// sequence is stale and is ignored.
     #[cfg(windows)]
@@ -206,6 +210,8 @@ impl DialogState {
             verify_task: None,
             #[cfg(windows)]
             export_task: None,
+            #[cfg(windows)]
+            mono_font: 0,
             #[cfg(windows)]
             verify_seq: 0,
             #[cfg(windows)]

@@ -236,6 +236,23 @@ impl HostedPage {
         }
     }
 
+    /// Wait until the status line contains `needle`.
+    ///
+    /// The finished status line is written from a posted message, so a test that
+    /// only waits for rows can still observe the previous status text.
+    fn wait_for_status_contains(&self, needle: &str) {
+        let deadline = Instant::now() + DEADLINE;
+        while !self.status_text().contains(needle) {
+            assert!(
+                Instant::now() < deadline,
+                "status line never contained {needle:?}; got {:?}",
+                self.status_text()
+            );
+            pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Close the window and reclaim the state, as the shell's teardown does.
     fn close(self) {
         // SAFETY: `hwnd` is a live window created by `CreateDialogParamW`.
@@ -430,6 +447,34 @@ fn a_directory_root_shows_every_file_under_it() {
     page.wait_for_rows(3);
 
     assert_eq!(page.row_count(), 3, "three files under the root");
+
+    page.close();
+}
+
+/// A root that vanished between the shell reading the selection and the page
+/// opening it must not stop the scan or leave the page saying "Hashing…" forever.
+#[test]
+fn a_missing_root_is_reported_and_the_scan_still_finishes() {
+    let dir = TempDir::new("missing-root");
+    let good = dir.file("good.bin", b"good");
+    let missing = dir.path().join("gone.bin");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("MD5"),
+        ..rusthashtab_settings::Settings::default()
+    };
+
+    let page = HostedPage::open(vec![good, missing], settings);
+
+    // One row for the readable file, one error row for the missing root.
+    page.wait_for_rows(2);
+    page.wait_for_status_contains("1 error");
+
+    let digest_cells: Vec<String> = (0..2).map(|row| page.cell(row, 1)).collect();
+    assert!(
+        digest_cells.iter().any(|cell| cell.starts_with("Error")),
+        "the missing root must be visible as an error row, got {digest_cells:?}"
+    );
 
     page.close();
 }

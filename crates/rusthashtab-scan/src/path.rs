@@ -144,10 +144,12 @@ fn prefix_text(kind: Prefix<'_>) -> OsString {
 /// reparse point is followed, because naming it explicitly is a request to open
 /// it.
 ///
-/// A root that cannot be stat'ed is an error — the user asked for a file that is
-/// not there. A subdirectory or file that disappears mid-walk is skipped
-/// instead: an error there would abort a scan of thousands of files because one
-/// of them was renamed.
+/// A root that cannot be stat'ed still produces a job: the scanner will try to open
+/// it and report the OS error, so the page can show an error row instead of
+/// silently dropping part of the selection. A root directory that cannot be
+/// enumerated is treated the same way. A subdirectory or file that disappears
+/// mid-walk is skipped instead: an error there would abort a scan of thousands of
+/// files because one of them was renamed.
 ///
 /// The order is deterministic but not sorted as a whole: within a directory,
 /// files come before subdirectories, and subdirectories are then descended in
@@ -158,14 +160,22 @@ fn prefix_text(kind: Prefix<'_>) -> OsString {
 /// total is computed from; the scanner re-reads the actual size when it opens
 /// the file, so a file that grows or shrinks during the scan still hashes
 /// correctly.
-pub fn expand_selection(roots: &[PathBuf]) -> std::io::Result<Vec<FileJob>> {
+pub fn expand_selection(roots: &[PathBuf]) -> Vec<FileJob> {
     let mut jobs = Vec::new();
 
     for root in roots {
         let root = normalize_path(root);
         // Follow a reparse point only for the root itself, where the user's
-        // intent is explicit.
-        let metadata = std::fs::metadata(&root)?;
+        // intent is explicit. A failure here becomes an error job rather than an
+        // `Err`: one deleted path in a multi-file selection must not lose the
+        // rest of the selection, and the page must still be told the scan ended.
+        let metadata = match std::fs::metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                jobs.push(job_for(&root, &root, 0));
+                continue;
+            }
+        };
 
         if !metadata.is_dir() {
             let size = metadata.len();
@@ -173,13 +183,18 @@ pub fn expand_selection(roots: &[PathBuf]) -> std::io::Result<Vec<FileJob>> {
             continue;
         }
 
-        let mut stack = vec![root.clone()];
-        while let Some(directory) = stack.pop() {
+        // `true` marks the root directory itself, so an unreadable root can be
+        // reported while an unreadable subdirectory is still skipped.
+        let mut stack = vec![(root.clone(), true)];
+        while let Some((directory, is_root)) = stack.pop() {
             let entries = match std::fs::read_dir(&directory) {
                 Ok(entries) => entries,
-                // An unreadable subdirectory is skipped: access-denied on one
-                // directory must not lose the other ten thousand files.
-                Err(_) => continue,
+                Err(_) => {
+                    if is_root {
+                        jobs.push(job_for(&root, &root, 0));
+                    }
+                    continue;
+                }
             };
 
             let mut children: Vec<(OsString, PathBuf)> = Vec::with_capacity(entries.size_hint().0);
@@ -209,12 +224,12 @@ pub fn expand_selection(roots: &[PathBuf]) -> std::io::Result<Vec<FileJob>> {
             // Reverse so the stack pops in sorted order, which keeps the job
             // list itself deterministic rather than merely stable.
             for path in subdirectories.into_iter().rev() {
-                stack.push(path);
+                stack.push((path, false));
             }
         }
     }
 
-    Ok(jobs)
+    jobs
 }
 
 /// Build a job for one file, with the display path relative to the scan root.
@@ -353,7 +368,7 @@ mod tests {
         let file = dir.path().join("one.bin");
         write(&file, 17);
 
-        let jobs = expand_selection(std::slice::from_ref(&file)).unwrap();
+        let jobs = expand_selection(std::slice::from_ref(&file));
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].path, normalize_path(&file));
         assert_eq!(jobs[0].display_path, "one.bin");
@@ -370,20 +385,40 @@ mod tests {
         write(&dir.path().join("a.txt"), 2);
         write(&nested.join("z.txt"), 3);
 
-        let jobs = expand_selection(&[dir.path().to_path_buf()]).unwrap();
+        let jobs = expand_selection(&[dir.path().to_path_buf()]);
         let displays: Vec<&str> = jobs.iter().map(|j| j.display_path.as_str()).collect();
         assert_eq!(displays, vec!["a.txt", "b\\z.txt", "b\\c\\deep.txt"]);
 
-        let again = expand_selection(&[dir.path().to_path_buf()]).unwrap();
+        let again = expand_selection(&[dir.path().to_path_buf()]);
         let again: Vec<&str> = again.iter().map(|j| j.display_path.as_str()).collect();
         assert_eq!(displays, again, "the walk order must be reproducible");
     }
 
     #[test]
-    fn a_missing_root_is_an_error() {
+    fn a_missing_root_becomes_an_error_job() {
         let dir = TempDir::new("missing");
         let absent = dir.path().join("not-there.bin");
-        assert!(expand_selection(&[absent]).is_err());
+        let jobs = expand_selection(std::slice::from_ref(&absent));
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a missing root must become one job the scanner can report"
+        );
+        assert_eq!(jobs[0].path, normalize_path(&absent));
+        assert_eq!(jobs[0].size, 0);
+    }
+
+    #[test]
+    fn a_missing_root_does_not_drop_its_siblings() {
+        let dir = TempDir::new("missing-sibling");
+        let good = dir.path().join("good.bin");
+        write(&good, 3);
+        let absent = dir.path().join("not-there.bin");
+
+        let jobs = expand_selection(&[good.clone(), absent.clone()]);
+        assert_eq!(jobs.len(), 2, "the good root must survive the missing one");
+        assert!(jobs.iter().any(|job| job.path == normalize_path(&good)));
+        assert!(jobs.iter().any(|job| job.path == normalize_path(&absent)));
     }
 
     /// The cycle this walk exists to avoid: a directory that contains itself
@@ -413,7 +448,7 @@ mod tests {
             return;
         }
 
-        let jobs = expand_selection(&[dir.path().to_path_buf()]).unwrap();
+        let jobs = expand_selection(&[dir.path().to_path_buf()]);
         let displays: Vec<&str> = jobs.iter().map(|j| j.display_path.as_str()).collect();
         assert_eq!(
             displays,

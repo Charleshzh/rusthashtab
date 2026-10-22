@@ -161,9 +161,6 @@ pub fn status_finished_with_skipped(counters: &crate::Counters, skipped: usize) 
 /// The status line when the scan was cancelled before it finished.
 pub const STATUS_CANCELLED: &str = "Cancelled";
 
-/// The status line when the hashing thread failed to start.
-pub const STATUS_FAILED: &str = "Could not start hashing";
-
 /// The status line when the selection contained nothing hashable.
 pub const STATUS_EMPTY: &str = "Nothing to hash";
 
@@ -241,9 +238,6 @@ pub fn with_verification(base: String, source: &str, unmatched: usize, had_error
 pub fn status_exported(count: usize) -> String {
     format!("Exported {count} hashes")
 }
-
-/// The status line while hashing has not been restarted after a settings change.
-pub const STATUS_SETTINGS_SAVED: &str = "Settings saved";
 
 /// The status line when the settings dialog is unavailable.
 ///

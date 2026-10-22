@@ -327,14 +327,14 @@ fn progress_only_moves_forward_and_reaches_the_end() {
 
 /// A file that cannot be read is a result, not the end of the scan.
 #[test]
-fn an_unreadable_file_does_not_stop_the_others() {
+fn a_missing_root_becomes_an_error_row_and_does_not_stop_the_others() {
     let dir = TempDir::new("unreadable");
     dir.file("good.bin", b"good");
 
     let shared = Arc::new(rusthashtab_ui::session::Shared::new());
-    // A path that does not exist, alongside one that does. `expand_selection`
-    // refuses a root it cannot stat, so the missing file is passed as a second root
-    // the way a selection that changed underneath the shell would arrive.
+    // A path that does not exist, alongside one that does. A selection can change
+    // underneath the shell between the time it is read and the time the page opens
+    // it, so this is the normal case, not an exotic one.
     let session = ReadoutSession::start(
         vec![dir.path().join("good.bin"), dir.path().join("gone.bin")],
         display_one("MD5"),
@@ -342,25 +342,25 @@ fn an_unreadable_file_does_not_stop_the_others() {
         Arc::clone(&shared),
     );
 
-    // A root that cannot be opened ends the session early, and it is reported as
-    // `Cancelled` -- claiming completeness over a selection that was never fully read
-    // would be a lie. So this waits for the thread without asserting it was not
-    // cancelled.
-    wait_for(&shared);
+    wait_until_complete(&shared);
     let exit = session.finish(Duration::from_secs(30));
     // Drained after the thread has stopped, so there is nothing left to race with.
-    let readouts = shared.drain();
+    let mut readouts = shared.drain();
+    readouts.sort_by_key(|readout| readout.job_index);
 
-    // The selection as a whole is reported as not completed, because a root could
-    // not be opened: claiming completeness would be a lie.
-    assert_eq!(exit, rusthashtab_ui::session::SessionExit::Cancelled);
+    // The missing root did not abort the scan: the good file was hashed, the missing
+    // one became an error row, and the page was told the scan finished.
+    assert_eq!(exit, rusthashtab_ui::session::SessionExit::Complete);
+    assert_eq!(readouts.len(), 2, "one readout per job");
     assert!(
-        readouts.is_empty()
-            || readouts
-                .iter()
-                .all(|readout: &Readout| readout.error.is_none()),
-        "no file was reported with a fabricated error"
+        readouts[0].error.is_none() && !readouts[0].rows.is_empty(),
+        "the readable file must still be hashed"
     );
+    assert!(
+        readouts[1].error.is_some(),
+        "the missing root must be reported, not dropped"
+    );
+    assert_eq!(readouts[1].rows.len(), 1, "an error is one row");
 }
 
 // ---------------------------------------------------------------------------

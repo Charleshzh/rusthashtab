@@ -28,16 +28,17 @@
 use crate::{ListRow, resource};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    DEFAULT_GUI_FONT, GetDC, GetStockObject, GetTextExtentPoint32W, HGDIOBJ, ReleaseDC,
-    SelectObject,
+    CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FF_MODERN, FIXED_PITCH, GetDC, GetObjectW,
+    GetStockObject, GetTextExtentPoint32W, HGDIOBJ, LOGFONTW, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_FULLROWSELECT, NMLVCUSTOMDRAW,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM,
+    LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVNI_SELECTED,
+    LVS_EX_FULLROWSELECT, NMLVCUSTOMDRAW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_SETFONT};
+use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_GETFONT, WM_SETFONT};
 
 /// The colour a row is drawn in when a digest matched an expected value: a dark
 /// green, `#008B00`, written `0x00BBGGRR` because that is `COLORREF`'s order.
@@ -143,7 +144,16 @@ fn column_widths(list: HWND) -> [i32; 4] {
                 return length * 7;
             }
 
-            let font = GetStockObject(DEFAULT_GUI_FONT);
+            // The control's own font, not the stock GUI font: the property sheet
+            // adopts a DPI-scaled status font, and measuring against the stock font
+            // would size every column for the wrong typeface at every scale.
+            let current =
+                SendMessageW(list, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0 as isize;
+            let font = if current != 0 {
+                HGDIOBJ(current as *mut core::ffi::c_void)
+            } else {
+                GetStockObject(DEFAULT_GUI_FONT)
+            };
             let previous: HGDIOBJ = SelectObject(dc, font);
             let mut size = windows::Win32::Foundation::SIZE::default();
             let measured = GetTextExtentPoint32W(dc, &wide[..wide.len() - 1], &mut size);
@@ -169,6 +179,59 @@ fn column_widths(list: HWND) -> [i32; 4] {
         text_width("mismatched") + 16,
         text_width(&"x".repeat(48)) + 16,
     ]
+}
+
+/// Create a monospace face with the same metrics as `base`.
+///
+/// `Consolas` is the modern Windows console face; if it is missing, GDI's font
+/// mapper substitutes another fixed-pitch face. The exact face matters less than
+/// the metrics: the caller uses it only for digest cells, where every character
+/// has to line up.
+///
+/// Returns `0` when the base font is unusable. The caller treats `0` as "no
+/// monospace font", which is the graceful path if `GetObjectW` fails.
+pub(crate) fn create_monospace_font(base: isize) -> isize {
+    if base == 0 {
+        return 0;
+    }
+
+    // SAFETY: `base` is a font handle owned by the dialog.
+    let mut logfont = LOGFONTW::default();
+    // SAFETY: `GetObjectW` writes at most `size_of::<LOGFONTW>()` bytes into
+    // `logfont`, which is a live local.
+    let copied = unsafe {
+        GetObjectW(
+            HGDIOBJ(base as *mut core::ffi::c_void),
+            core::mem::size_of::<LOGFONTW>() as i32,
+            Some((&mut logfont as *mut LOGFONTW).cast()),
+        )
+    };
+    if copied == 0 {
+        return 0;
+    }
+
+    logfont.lfFaceName = [0; 32];
+    for (slot, unit) in logfont.lfFaceName.iter_mut().zip("Consolas".encode_utf16()) {
+        *slot = unit;
+    }
+    logfont.lfPitchAndFamily = FIXED_PITCH.0 | FF_MODERN.0;
+
+    // SAFETY: `logfont` is a fully initialised `LOGFONTW` for the duration of the
+    // call. The returned handle is owned by the caller and released with
+    // [`destroy_font`].
+    unsafe { CreateFontIndirectW(&logfont) }.0 as isize
+}
+
+/// Release a font created by [`create_monospace_font`].
+pub(crate) fn destroy_font(font: isize) {
+    if font == 0 {
+        return;
+    }
+    // SAFETY: the handle came from `create_monospace_font`, is owned by the page,
+    // and is released exactly once here.
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(font as *mut core::ffi::c_void));
+    }
 }
 
 /// Give a control the font the property sheet chose for the page.
@@ -449,7 +512,11 @@ pub fn colour_for(state: rusthashtab_scan::MatchState, failed: bool) -> RowColou
 ///
 /// `lparam` must be the `NMHDR` of an `NM_CUSTOMDRAW` notification, which is what
 /// the dialog procedure is handed for that message.
-pub unsafe fn custom_draw(lparam: LPARAM, rows: &[ListRow]) -> Option<isize> {
+pub unsafe fn custom_draw(
+    lparam: LPARAM,
+    rows: &[ListRow],
+    monospace_font: isize,
+) -> Option<isize> {
     // SAFETY: the caller promises this is an `NM_CUSTOMDRAW` notification.
     let custom = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
 
@@ -459,20 +526,54 @@ pub unsafe fn custom_draw(lparam: LPARAM, rows: &[ListRow]) -> Option<isize> {
         return None;
     }
 
-    if custom.nmcd.dwDrawStage.0 == CDDS_PREPAINT.0 {
+    let stage = custom.nmcd.dwDrawStage.0;
+    if stage == CDDS_PREPAINT.0 {
         return Some(CDRF_NOTIFYITEMDRAW as isize);
     }
 
-    if custom.nmcd.dwDrawStage.0 == CDDS_ITEMPREPAINT.0 {
+    if stage == CDDS_ITEMPREPAINT.0 {
+        // The colour and the optional monospace face are both applied per subitem:
+        // selecting a font for the whole item would also change the algorithm and
+        // file columns, and the sheet's font is the right one there.
+        return Some(CDRF_NOTIFYSUBITEMDRAW as isize);
+    }
+
+    if stage == (CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0) {
         let row_index = custom.nmcd.lItemlParam.0 as usize;
+        let mut flags = CDRF_DODEFAULT;
+
         if let Some(row) = rows.get(row_index) {
             match colour_for(row.match_state, row.error.is_some()) {
-                RowColour::Matched => custom.clrText = MATCHED_COLOR.colorref(),
-                RowColour::MatchedWeak => custom.clrText = WEAK_MATCH_COLOR.colorref(),
-                RowColour::Mismatched => custom.clrText = MISMATCHED_COLOR.colorref(),
+                RowColour::Matched => {
+                    custom.clrText = MATCHED_COLOR.colorref();
+                    flags = CDRF_NEWFONT;
+                }
+                RowColour::MatchedWeak => {
+                    custom.clrText = WEAK_MATCH_COLOR.colorref();
+                    flags = CDRF_NEWFONT;
+                }
+                RowColour::Mismatched => {
+                    custom.clrText = MISMATCHED_COLOR.colorref();
+                    flags = CDRF_NEWFONT;
+                }
                 RowColour::Neutral => {}
             }
         }
+
+        // Column 1 is Digest; the other columns keep the sheet's UI font.
+        if custom.iSubItem == 1 && monospace_font != 0 {
+            // SAFETY: `hdc` is the DC the control is painting into, and
+            // `monospace_font` is a live font owned by the page.
+            unsafe {
+                SelectObject(
+                    custom.nmcd.hdc,
+                    HGDIOBJ(monospace_font as *mut core::ffi::c_void),
+                );
+            }
+            flags = CDRF_NEWFONT;
+        }
+
+        return Some(flags as isize);
     }
 
     // Every other stage still has to be painted. Returning zero here would let the
@@ -653,14 +754,25 @@ mod tests {
     fn the_prepaint_stage_asks_for_item_notifications() {
         let mut draw = custom_draw_at(CDDS_PREPAINT.0, None);
         // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
-        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[]) };
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[], 0) };
         assert_eq!(answer, Some(CDRF_NOTIFYITEMDRAW as isize));
     }
 
-    /// At the item stage the matched row gets the match colour; the answer still
-    /// has to ask for default painting or the row's text would not be drawn.
+    /// The item stage only asks for subitem notifications. Colours and the optional
+    /// monospace face belong to individual cells: selecting a font for the whole item
+    /// would also change the algorithm and file columns.
     #[test]
-    fn the_item_stage_sets_the_text_colour() {
+    fn the_item_stage_asks_for_sub_item_notifications() {
+        let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0, Some(0));
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[], 0) };
+        assert_eq!(answer, Some(CDRF_NOTIFYSUBITEMDRAW as isize));
+    }
+
+    /// At the subitem stage the matched row gets the match colour; the answer has to
+    /// ask for a repaint (`CDRF_NEWFONT`) or the colour would not take effect.
+    #[test]
+    fn the_sub_item_stage_sets_the_text_colour() {
         let rows = vec![
             row_for(
                 MatchState::Matched {
@@ -681,16 +793,17 @@ mod tests {
         ];
 
         let expected = [
-            (0usize, MATCHED_COLOR),
-            (1, WEAK_MATCH_COLOR),
-            (2, MISMATCHED_COLOR),
-            (3, ColorDef(0)),
+            (0usize, MATCHED_COLOR, CDRF_NEWFONT as isize),
+            (1, WEAK_MATCH_COLOR, CDRF_NEWFONT as isize),
+            (2, MISMATCHED_COLOR, CDRF_NEWFONT as isize),
+            (3, ColorDef(0), CDRF_DODEFAULT as isize),
         ];
-        for (row, colour) in expected {
-            let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0, Some(row));
+        for (row, colour, expected_answer) in expected {
+            let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(row));
+            draw.iSubItem = 1;
             // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
-            let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows) };
-            assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
+            let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
+            assert_eq!(answer, Some(expected_answer));
             assert_eq!(
                 draw.clrText,
                 colour.colorref(),
@@ -706,7 +819,7 @@ mod tests {
         let mut draw = custom_draw_at(CDDS_PREPAINT.0, None);
         draw.nmcd.hdr.idFrom = 0x1234;
         // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
-        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[]) };
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[], 0) };
         assert_eq!(answer, None);
     }
 
@@ -715,9 +828,9 @@ mod tests {
     #[test]
     fn a_stale_row_index_is_ignored_but_still_paints() {
         let rows = vec![row_for(MatchState::Mismatched, None)];
-        let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0, Some(99));
+        let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(99));
         // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
-        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows) };
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
         assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
         assert_eq!(draw.clrText, ColorDef(0).colorref());
     }
@@ -727,8 +840,42 @@ mod tests {
     fn a_stage_we_do_not_colour_still_paints() {
         let mut draw = custom_draw_at(CDDS_PREPAINT.0 + 1, None);
         // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
-        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[]) };
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &[], 0) };
         assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
+    }
+
+    /// The digest cell is the only one that gets the monospace face; selecting it
+    /// for a different column would change the algorithm/file text too.
+    #[test]
+    fn the_digest_sub_item_uses_the_monospace_font_when_one_is_given() {
+        use windows::Win32::Graphics::Gdi::{
+            ANSI_FIXED_FONT, CreateCompatibleDC, DeleteDC, GetStockObject as GdiStockObject,
+        };
+
+        // SAFETY: a memory DC is a plain GDI object with no window affinity.
+        let dc = unsafe { CreateCompatibleDC(None) };
+        assert!(!dc.is_invalid(), "a memory DC is needed for this test");
+        // SAFETY: the stock object is owned by GDI, so no deletion is required.
+        let font = unsafe { GdiStockObject(ANSI_FIXED_FONT) };
+
+        let rows = vec![row_for(
+            MatchState::Matched {
+                algorithm: 0,
+                secure: true,
+            },
+            None,
+        )];
+        let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(0));
+        draw.iSubItem = 1;
+        draw.nmcd.hdc = dc;
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW`; `font` is a live stock font.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, font.0 as isize) };
+        assert_eq!(answer, Some(CDRF_NEWFONT as isize));
+
+        // SAFETY: `dc` was created above and is deleted exactly once.
+        unsafe {
+            let _ = DeleteDC(dc);
+        }
     }
 
     /// A row shaped the way the page stores it.

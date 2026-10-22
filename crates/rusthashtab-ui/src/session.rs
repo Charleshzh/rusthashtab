@@ -698,9 +698,9 @@ impl Drop for ReadoutSession {
 /// three cases indistinguishable instead of silently claiming completeness over a
 /// half-finished result set -- which a test caught here.
 ///
-/// A selection that cannot be expanded at all also reports `Cancelled`: there is no
-/// useful result set in that case, and `Complete` would be a lie about work that
-/// never happened.
+/// A selection that cannot be expanded at all is not `Cancelled`: expansion now
+/// produces a job for every root it cannot stat, so the scanner reports those as
+/// ordinary file errors and the page still gets its final "scan finished" message.
 fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> ScanOutcome {
     if shared.is_cancelled() {
         return ScanOutcome::Cancelled;
@@ -708,12 +708,7 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
 
     let display = shared.display();
 
-    let Ok(mut jobs) = expand_selection(roots) else {
-        // A root that cannot be stat'ed -- deleted between the shell reading the
-        // selection and us opening it. Nothing else in the selection is lost
-        // because of it, and the page says so through its empty result list.
-        return ScanOutcome::Cancelled;
-    };
+    let mut jobs = expand_selection(roots);
 
     // The cap. Applied here rather than refusing the selection, so a directory of a
     // hundred thousand files performs a hundred thousand's worth of *visible* work

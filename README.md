@@ -6,14 +6,13 @@ file Properties dialog.
 > 一个 Windows shell 扩展：直接在文件「属性」对话框中计算和校验文件哈希。
 
 Select any file, open **Properties**, and the **Hashes** tab shows its digest under
-every algorithm you have enabled — computed in parallel, with a running progress bar.
-Paste a hash you were given and it is highlighted green or red as it matches. There is
-also a right-click context menu entry and a standalone mode for when you just want a
-hash quickly.
+every algorithm you have enabled — with a running progress bar. Paste a hash you were
+given and it is highlighted green or red as it matches. The context menu, standalone
+mode, localization and installer are planned; see [Roadmap](#roadmap--路线图).
 
-> 选中任意文件打开**属性**，**Hashes** 标签页会列出所有已启用算法下的摘要——并行计算，
-> 并带实时进度条。粘贴别人给你的哈希值，匹配与否会直接标色。此外还有右键菜单项，
-> 以及只想要一个哈希值时的独立运行模式。
+> 选中任意文件打开**属性**，**Hashes** 标签页会列出所有已启用算法下的摘要，
+> 并带实时进度条。粘贴别人给你的哈希值，匹配与否会直接标色。右键菜单、独立运行模式、
+> 本地化与安装器仍在路线图中，见[路线图](#roadmap--路线图)。
 
 > **Bilingual document.** Every section is written in English first, then Chinese.
 > English is authoritative; if the two disagree, English wins. **When you change one
@@ -37,13 +36,12 @@ hash quickly.
 ## Features / 功能
 
 - **31 hash algorithms** in one pass over the file (see [Algorithms](#algorithms--算法))
-- **Parallel hashing** — every enabled algorithm runs over each block concurrently
+- **Parallel hashing** — files are hashed concurrently; each block is fed to every
+  enabled algorithm
 - **Verification** — paste a digest, or point it at a checksum file; matches are
   coloured green (secure) or amber (weak) against a red mismatch
 - **Checksum file support** — reads and writes `sha256sum`-style files, SFV, and corz `.hash`
-- **Reputation lookup** — optional, opt-in, off by default
 - **Native look** — a real Win32 dialog, DPI-aware, no bundled toolkit
-- **35 languages** for the interface
 - **Multi-architecture** — x86, x64 and ARM64
 - **Long path support**
 - **One DLL per architecture** — CPU feature dispatch happens at runtime, so there is
@@ -52,13 +50,11 @@ hash quickly.
 **中文**
 
 - **一次遍历计算 31 种哈希算法**（见[算法](#algorithms--算法)）
-- **并行哈希** —— 每个启用的算法并发处理同一个数据块
+- **并行哈希** —— 文件并发哈希；每个数据块依次喂给所有已启用算法
 - **校验** —— 粘贴一段哈希，或指向校验和文件；匹配按绿（安全算法）或琥珀（弱算法）标色，
   不匹配标红
 - **校验和文件支持** —— 读写 `sha256sum` 风格文件、SFV 以及 corz `.hash`
-- **信誉查询** —— 可选、需显式同意、默认关闭
 - **原生外观** —— 真正的 Win32 对话框，支持 DPI 缩放，不捆绑任何 GUI 工具包
-- **界面支持 35 种语言**
 - **多架构** —— x86、x64 与 ARM64
 - **长路径支持**
 - **每个架构只有一个 DLL** —— CPU 特性派发在运行时完成，不存在需要挑选的按指令集拆分的二进制
@@ -182,7 +178,7 @@ crates/
   rusthashtab-sumfile    checksum file parsing and export
   rusthashtab-settings   persisted user settings
   rusthashtab-scan       file discovery and the concurrent hashing pipeline
-  rusthashtab-net        reputation lookup and update check
+  rusthashtab-net        reputation/update scaffolding, not wired into the UI yet
   rusthashtab-ui         Win32 dialog UI and the property sheet page
   rusthashtab-shell      the shell extension DLL: COM plumbing and registration
 xtask/                   developer automation: verification, benchmarks, pre-commit gate
@@ -445,38 +441,95 @@ result are recorded in `docs/internal/PHASE4-CHECKSUM-AND-SETTINGS.md`.
 > 工具校验和文件交叉检查。与 Phase 3 一样，最后一步是在真实 `explorer.exe` 的属性对话框
 > 里人工过一遍；清单与结果记录在 `docs/internal/PHASE4-CHECKSUM-AND-SETTINGS.md`。
 
-**Status: complete and verified in a real Properties dialog.** The maintainer's manual pass
-in `explorer.exe` succeeded on 2026-10-22, including the two defects that pass found and this
-phase fixed: the settings dialog's algorithm list was blank (a report-mode list view with no
-column draws nothing) and matched rows were not coloured (a dialog procedure must return a
-custom-draw result through `DWLP_MSGRESULT`).
+**Status: complete and verified in a real Properties dialog.** The automated gate is green.
+A manual pass on 2026-10-22 covered the default algorithm set, digests compared against an
+independent tool, pasted-digest match/mismatch/non-hex handling, sidecar verification,
+settings persistence, export to a checksum file verified with `md5sum -c`, copying a row,
+and a clean close with `explorer.exe` still running.
 
-> **状态：已完成，并已在真实属性对话框中验收。** 维护者 2026-10-22 在 `explorer.exe` 中的
-> 人工验收通过，其中包含这次验收发现、并在本阶段修掉的两个缺陷：设置对话框算法列表空白
-> （report 模式列表视图没有列就不绘制），以及匹配行不变色（对话框过程必须通过
-> `DWLP_MSGRESULT` 返回自定义绘制结果）。
+> **状态：已完成，并已在真实属性对话框中验收。** 自动门禁全绿。2026-10-22 的人工验收覆盖了
+> 默认算法集合、摘要与独立工具比对、粘贴摘要的正确/错误/非十六进制处理、sidecar 校验、
+> 设置持久化、导出校验和文件并用 `md5sum -c` 复核、复制行，以及关闭属性对话框后
+> `explorer.exe` 仍存活。
 
-### Phase 5 — context menu, localization, standalone mode / 右键菜单、本地化、独立模式
+### Phase 5 — page completion and performance / 页面补全与性能
 
-`IContextMenu`, the 35-language resource pipeline, standalone mode and file associations.
+Sortable columns, copy interactions (double-click, context menu, `Ctrl+C`), cancel, stable
+row order, DPI-correct column widths, configurable colours, a working monospace option, an
+explicit export format selector with clipboard export, and clipboard-driven verification.
+On the performance side: a combined-throughput benchmark, duplicate-path elimination,
+single-file algorithm parallelism behind the scan's own threads, and better rendering for
+large result sets.
 
-> `IContextMenu`、35 种语言的资源管线、独立模式与文件关联。
+> 结果列表排序、双击/右键/Ctrl+C 复制、取消、稳定行序、DPI 正确的列宽、可配置颜色、
+> 真正生效的等宽字体、显式导出格式下拉与剪贴板导出、剪贴板驱动的校验。性能方面：
+> 组合吞吐基准、重复路径去重、扫描自有线程上的单文件算法并行，以及大结果集的渲染改进。
 
-**Gate / 门禁:** `cargo xtask check` + the release-hygiene job.
+**Gate / 门禁:** `cargo xtask check`, real-control page tests, and a recorded combined
+benchmark baseline.
 
-### Phase 6 — release / 发布
+> **门禁：** `cargo xtask check`、真实控件页面测试，以及记录在案的组合吞吐基线。
+
+### Phase 6 — workflows / 工作流
+
+Interpret a selected checksum file as a manifest (hash the files it lists), infer the
+algorithm from the file extension, make the verification scope explicit, tighten sidecar
+matching, and finish the settings that affect those flows.
+
+> 把选中的校验和文件当作清单解释（哈希其中列出的文件）、按扩展名推断算法、明确校验
+> 作用范围、收紧 sidecar 匹配，并补全影响这些流程的设置项。
+
+**Gate / 门禁:** `cargo xtask check` plus real-page tests for the manifest and verification
+scope.
+
+> **门禁：** `cargo xtask check`，外加清单模式与校验范围的真实页面测试。
+
+### Phase 7 — context menu, standalone mode, file associations / 右键菜单、独立模式、文件关联
+
+`IContextMenu`, a resizable windowed host that reuses the page, a standalone executable,
+and associations for the checksum extensions we produce.
+
+> `IContextMenu`、可缩放且复用属性页的独立窗口宿主、独立可执行文件，以及我们生成的
+> 校验和扩展名关联。
+
+**Gate / 门禁:** `cargo xtask check` plus a manual `explorer.exe` pass covering the menu,
+standalone window, associations and closing the page cleanly.
+
+> **门禁：** `cargo xtask check`，外加一次真实 `explorer.exe` 人工验收，覆盖右键菜单、
+> 独立窗口、文件关联与关闭页面的清理。
+
+### Phase 8 — localization and optional network features / 本地化与可选联网功能
+
+A resource pipeline with language selection and fallback. English and Simplified Chinese
+ship first; additional languages are added as translations are completed, and the README
+only claims the languages that are actually finished. Reputation lookup and update checking
+are out of scope for 1.0 unless a separate decision funds their key, terms and privacy work.
+
+> 资源管线、语言选择与回退。先发布英文与简体中文；其余语言按翻译完成度逐步加入，
+> README 只宣称实际完成的语言。信誉查询与更新检查不在 1.0 范围内，除非另做决定并为其
+> key、条款与隐私工作投入资源。
+
+**Gate / 门禁:** `cargo xtask check`; every language named in the README is present and
+switchable, and no network request happens on a path that is documented as offline.
+
+> **门禁：** `cargo xtask check`；README 声明的每种语言都存在且可切换，且文档说明为
+> 离线的路径不会发出网络请求。
+
+### Phase 9 — release / 发布
 
 Installer (per-user and per-machine MSI × x86/x64/ARM64), Authenticode signing, the
-false-positive workflow.
+false-positive workflow, a tested OS/architecture matrix, and release hygiene.
 
-> 安装器（每用户/每机器 MSI × x86/x64/ARM64）、Authenticode 签名、误报处理流程。
+> 安装器（每用户/每机器 MSI × x86/x64/ARM64）、Authenticode 签名、误报处理流程、
+> 经过测试的操作系统/架构矩阵，以及发布卫生。
 
-**Gate / 门禁:** `cargo xtask check` on all three target triples, plus the release-hygiene
-job: no internal research in any artifact, every README section still bilingual, no upstream
-identifier in any shipped file.
+**Gate / 门禁:** `cargo xtask check` on all three target triples, the release-hygiene job
+(no internal research in any artifact, README still bilingual, no upstream identifier in a
+shipped file), and an install→use→uninstall pass on a clean VM.
 
-> 三个目标三元组上跑 `cargo xtask check`，外加发布卫生作业：任何产物中都不含内部资料、README
-> 每一节仍然双语、任何随发行发布的文件都不含上游标识符。
+> **门禁：** 三个目标三元组上跑 `cargo xtask check`、发布卫生作业（任何产物中都不含内部
+> 资料、README 每一节仍然双语、任何随发行发布的文件都不含上游标识符），以及在干净 VM 上
+> 完成安装→使用→卸载。
 
 ### Status / 当前进度
 
@@ -487,7 +540,11 @@ identifier in any shipped file.
 | Phase 2 scan pipeline / 第二阶段扫描管线 | ✅ done / 已完成 |
 | Phase 3 property sheet page / 第三阶段属性页 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
 | Phase 4 checksum files, verification and settings / 第四阶段 —— 校验和文件、校验与设置 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
-| Phases 5–6 | ⬜ not started / 未开始 |
+| Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ⬜ not started / 未开始 |
+| Phase 6 workflows / 第六阶段 —— 工作流 | ⬜ not started / 未开始 |
+| Phase 7 context menu, standalone mode, file associations / 第七阶段 —— 右键菜单、独立模式、文件关联 | ⬜ not started / 未开始 |
+| Phase 8 localization and optional network features / 第八阶段 —— 本地化与可选联网 | ⬜ not started / 未开始 |
+| Phase 9 release / 第九阶段 —— 发布 | ⬜ not started / 未开始 |
 
 ## Contributing / 贡献
 

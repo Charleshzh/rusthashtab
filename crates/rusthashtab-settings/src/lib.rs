@@ -9,8 +9,8 @@
 //!
 //! Each algorithm gets one boolean value named after it (`"SHA-256"`, `"K12-264"`,
 //! …). Non-algorithm options use descriptive names (`"DisplayUppercase"`,
-//! `"LookForSumfiles"`). Colours are stored as a `COLORREF` packed into a
-//! `DWORD`.
+//! `"LookForSumfiles"`). Colours are not configurable yet, so there is no colour
+//! value in this layout.
 //!
 //! # Why not a config file
 //!

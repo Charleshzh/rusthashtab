@@ -188,21 +188,6 @@ unsafe fn fill_clipboard(text: &str) -> bool {
     true
 }
 
-/// Whether the clipboard can be opened right now.
-///
-/// Used by the page to leave the Copy button alone when another process holds the
-/// clipboard, rather than replacing its contents with nothing.
-pub fn is_available() -> bool {
-    // SAFETY: a null owner is allowed; the call fails rather than faults when
-    // another process holds the clipboard.
-    if unsafe { OpenClipboard(None) }.is_err() {
-        return false;
-    }
-    // SAFETY: the clipboard was opened immediately above and is closed exactly once.
-    let _ = unsafe { CloseClipboard() };
-    true
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

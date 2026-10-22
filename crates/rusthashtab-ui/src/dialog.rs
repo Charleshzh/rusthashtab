@@ -162,6 +162,7 @@ fn on_init(hwnd: HWND, lparam: LPARAM) -> isize {
     // wrong typeface. The sheet sends `WM_SETFONT` to the page and then to its
     // children; `on_set_font` re-measures when it arrives.
     let font = dialog_font(hwnd);
+    state.mono_font = crate::listview::create_monospace_font(font);
     build_controls(hwnd, state, font);
     start_hashing(hwnd, state);
 
@@ -246,6 +247,11 @@ fn on_destroy(hwnd: HWND) {
     state.verify_task = None;
     state.export_task = None;
     state.verify_source = None;
+
+    if state.mono_font != 0 {
+        crate::listview::destroy_font(state.mono_font);
+        state.mono_font = 0;
+    }
 }
 
 /// `WM_SETFONT` from the property sheet manager.
@@ -270,9 +276,16 @@ fn on_set_font(hwnd: HWND, wparam: WPARAM) {
     // so they are re-measured -- a column sized for the wrong face shows truncated
     // text, which is the most visible way a page fails to follow the host.
     // SAFETY: `hwnd` is the page dialog.
-    let list = unsafe { state(hwnd) }.and_then(|state| state.list);
-    if let Some(list) = list {
-        crate::listview::remeasure_columns(list);
+    if let Some(state) = unsafe { state(hwnd) } {
+        if let Some(list) = state.list {
+            crate::listview::remeasure_columns(list);
+        }
+        // The monospace face is derived from the UI font's metrics. If the sheet
+        // changes the font after the page was built, the derived face must follow.
+        if state.mono_font != 0 {
+            crate::listview::destroy_font(state.mono_font);
+        }
+        state.mono_font = crate::listview::create_monospace_font(font);
     }
 }
 
@@ -881,8 +894,15 @@ fn on_notify(hwnd: HWND, lparam: LPARAM) -> isize {
 
     // SAFETY: this is an `NM_CUSTOMDRAW` notification. `custom_draw` checks the
     // control id, so another control's custom draw is left to the default handler
-    // rather than answered by us.
-    match unsafe { crate::listview::custom_draw(lparam, &state.rows) } {
+    // rather than answered by us. The font handle is non-zero only when the
+    // monospace setting is on and the face could be created.
+    let mono_font = if state.settings.display_monospace {
+        state.mono_font
+    } else {
+        0
+    };
+    // SAFETY: the notification is the one the message carries.
+    match unsafe { crate::listview::custom_draw(lparam, &state.rows, mono_font) } {
         Some(answer) => {
             // The custom-draw answer is a **message result**, not the dialog
             // procedure's BOOL. A dialog procedure must put it in
@@ -1137,6 +1157,10 @@ extern "system" fn raw_page_callback(
             // but if the window was never created -- the sheet accepted the page
             // handle and then refused the page -- this is the only chance, and a
             // session dropped without being finished would join here instead.
+            if state.mono_font != 0 {
+                crate::listview::destroy_font(state.mono_font);
+                state.mono_font = 0;
+            }
             if let Some(session) = state.session.take() {
                 session.shared().retire();
                 let _ = session.finish(std::time::Duration::from_secs(30));

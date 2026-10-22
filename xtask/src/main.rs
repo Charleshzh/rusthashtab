@@ -356,6 +356,25 @@ fn check(args: &[String]) -> ExitCode {
         );
 
         if runnable {
+            // Some UI tests inspect the **release** DLL as an artifact: they load it
+            // through COM, or read its resource section, because "the code is correct"
+            // and "the shipped artifact contains the page" are different questions.
+            // `cargo test` builds the debug profile only, so without this step a clean
+            // clone fails those tests for a reason that has nothing to do with the
+            // change being gated.
+            ok &= step(
+                &format!("cargo build -p rusthashtab-shell --release --target {target}"),
+                "cargo",
+                &[
+                    "build",
+                    "-p",
+                    "rusthashtab-shell",
+                    "--release",
+                    "--target",
+                    target,
+                ],
+            );
+
             ok &= step(
                 &format!("cargo test --workspace --target {target}"),
                 "cargo",
