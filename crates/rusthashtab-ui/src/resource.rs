@@ -84,6 +84,8 @@ pub const IDC_SETTINGS_COLOUR_DEFAULTS: i32 = 2119;
 pub const IDC_SETTINGS_COLOUR_TEXT_ENABLED: i32 = 2120;
 /// Whether the selected class paints its background colour.
 pub const IDC_SETTINGS_COLOUR_BG_ENABLED: i32 = 2121;
+/// The hex/off label under the live colour sample.
+pub const IDC_SETTINGS_COLOUR_PREVIEW_LABEL: i32 = 2122;
 
 /// Identifiers the dialog templates declare, in declaration order.
 ///
@@ -170,6 +172,10 @@ pub(crate) const TEMPLATE_IDENTIFIERS: &[(&str, u16)] = &[
     (
         "IDC_SETTINGS_COLOUR_BG_ENABLED",
         IDC_SETTINGS_COLOUR_BG_ENABLED as u16,
+    ),
+    (
+        "IDC_SETTINGS_COLOUR_PREVIEW_LABEL",
+        IDC_SETTINGS_COLOUR_PREVIEW_LABEL as u16,
     ),
 ];
 

@@ -31,24 +31,23 @@
 
 use crate::{algorithm_names, resource};
 use rusthashtab_settings::Settings;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateSolidBrush, DT_CENTER,
-    DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetSysColor,
-    GetSysColorBrush, HGDIOBJ, InvalidateRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateSolidBrush, DeleteObject,
+    GetSysColor, GetSysColorBrush, HBRUSH, HDC, HGDIOBJ, InvalidateRect, SetBkColor, SetTextColor,
 };
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, DRAWITEMSTRUCT, IsDlgButtonChecked,
-    LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_STATEIMAGEMASK,
-    LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMSTATE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVS_EX_CHECKBOXES,
-    LVS_EX_FULLROWSELECT, LVSCW_AUTOSIZE_USEHEADER,
+    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked, LIST_VIEW_ITEM_STATE_FLAGS,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS,
+    LVM_GETITEMSTATE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT,
+    LVSCW_AUTOSIZE_USEHEADER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, DialogBoxParamW, EndDialog,
-    GetDlgItem, MB_ICONWARNING, MB_OK, MessageBoxW, SendMessageW, SetWindowTextW, WM_COMMAND,
-    WM_DRAWITEM, WM_GETFONT, WM_INITDIALOG, WM_NCDESTROY,
+    GetDlgCtrlID, GetDlgItem, MB_ICONWARNING, MB_OK, MessageBoxW, SendMessageW, SetWindowTextW,
+    WM_COMMAND, WM_CTLCOLORSTATIC, WM_INITDIALOG, WM_NCDESTROY,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -136,6 +135,9 @@ struct DialogState {
     form: SettingsForm,
     /// Set by OK; `None` means cancelled or failed.
     result: Option<Settings>,
+    /// The sample's background brush; owned only when the user chose a custom
+    /// background. `None` means the dialog face brush.
+    preview_brush: Option<HBRUSH>,
 }
 
 impl core::fmt::Debug for DialogState {
@@ -161,6 +163,7 @@ pub fn show(parent: HWND, instance: HINSTANCE, current: &Settings) -> Option<Set
     let mut state = Box::new(DialogState {
         form: SettingsForm::from_settings(current),
         result: None,
+        preview_brush: None,
     });
     let pointer = (&mut *state) as *mut DialogState;
 
@@ -207,14 +210,15 @@ extern "system" fn dialog_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
                 0
             }
         }
-        WM_DRAWITEM => {
-            if on_draw_item(hwnd, lparam) {
-                1
-            } else {
-                0
-            }
-        }
+        WM_CTLCOLORSTATIC => on_ctlcolor_static(hwnd, wparam, lparam),
         WM_NCDESTROY => {
+            if let Some(state) = state(hwnd)
+                && let Some(brush) = state.preview_brush.take()
+            {
+                // SAFETY: the brush was created by `CreateSolidBrush` in
+                // `update_colour_preview` and is not selected anywhere.
+                let _ = unsafe { DeleteObject(HGDIOBJ(brush.0)) };
+            }
             // A message already in the queue will still be dispatched here after
             // this returns; it must not find a window that no longer points at
             // the caller's state.
@@ -259,7 +263,7 @@ fn on_init(hwnd: HWND, lparam: LPARAM) {
     autosize_algorithm_column(list);
     fill_options(hwnd, &state.form);
     fill_colour_classes(hwnd);
-    update_colour_controls(hwnd, &state.form);
+    update_colour_controls(hwnd, state);
 }
 
 /// The five colour classes, in the order the selector lists them.
@@ -364,9 +368,9 @@ fn colour_text(colour: u32) -> String {
 }
 
 /// Tick the two enabled boxes and redraw the preview for the selected class.
-fn update_colour_controls(hwnd: HWND, form: &SettingsForm) {
+fn update_colour_controls(hwnd: HWND, state: &mut DialogState) {
     let class = selected_class(hwnd);
-    let colour = colour_of(&form.settings, class);
+    let colour = colour_of(&state.form.settings, class);
     let text_state = if colour.text_enabled {
         BST_CHECKED
     } else {
@@ -386,7 +390,7 @@ fn update_colour_controls(hwnd: HWND, form: &SettingsForm) {
             background_state,
         );
     }
-    update_colour_preview(hwnd, form);
+    update_colour_preview(hwnd, state);
 }
 
 /// Apply the two enabled check boxes to the selected class.
@@ -425,127 +429,88 @@ fn read_colour_controls(hwnd: HWND, form: &mut SettingsForm) {
     colour.background_enabled = background_enabled;
 }
 
-/// Draw the live colour sample.
+/// Paint the live sample with the selected foreground and background.
 ///
-/// The control is a `SS_OWNERDRAW` static, not a label: a real sample is more
-/// useful than a hex string, because the user is choosing how the list will
-/// look, not a number. The top strip is the sample text on the chosen
-/// foreground/background; the bottom strip keeps the hex values readable on the
-/// dialog background.
-fn on_draw_item(hwnd: HWND, lparam: LPARAM) -> bool {
-    if lparam.0 == 0 {
-        return false;
-    }
+/// A static control's text colour and background come from
+/// `WM_CTLCOLORSTATIC`: `SetTextColor`/`SetBkColor` set the DC, and the returned
+/// brush fills the control behind the text. This is more dependable than an
+/// owner-drawn static, and it makes the preview a real sample of the list
+/// colours rather than a label that merely says what they are.
+fn on_ctlcolor_static(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> isize {
     let Some(state) = state(hwnd) else {
-        return false;
+        return 0;
     };
-    // SAFETY: `WM_DRAWITEM` passes a pointer to a `DRAWITEMSTRUCT` that is valid
-    // for the duration of the message; the caller owns it.
-    let draw = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
-    if draw.CtlID != resource::IDC_SETTINGS_COLOUR_PREVIEW as u32 {
-        return false;
-    }
-
-    let class = selected_class(hwnd);
-    let colour = colour_of(&state.form.settings, class);
-    // SAFETY: `GetSysColor` reads a system colour table entry.
-    let system_text = COLORREF(unsafe { GetSysColor(COLOR_BTNTEXT) });
+    // SAFETY: `WM_CTLCOLORSTATIC` passes a display DC in `wParam` and the child
+    // window handle in `lParam`; both are valid for the message's lifetime.
+    let dc = HDC(wparam.0 as *mut core::ffi::c_void);
     // SAFETY: as above.
-    let system_face = COLORREF(unsafe { GetSysColor(COLOR_BTNFACE) });
-    let text = if colour.text_enabled && colour.text != rusthashtab_settings::SYSTEM_COLOUR {
-        COLORREF(colour.text)
-    } else {
-        system_text
-    };
-    let background =
-        if colour.background_enabled && colour.background != rusthashtab_settings::SYSTEM_COLOUR {
+    let child = HWND(lparam.0 as *mut core::ffi::c_void);
+    // SAFETY: `child` is the control that sent the message.
+    let id = unsafe { GetDlgCtrlID(child) };
+
+    if id == resource::IDC_SETTINGS_COLOUR_PREVIEW {
+        let class = selected_class(hwnd);
+        let colour = colour_of(&state.form.settings, class);
+        // SAFETY: `GetSysColor` reads a system colour table entry.
+        let system_text = COLORREF(unsafe { GetSysColor(COLOR_BTNTEXT) });
+        // SAFETY: as above.
+        let system_face = COLORREF(unsafe { GetSysColor(COLOR_BTNFACE) });
+        let text = if colour.text_enabled && colour.text != rusthashtab_settings::SYSTEM_COLOUR {
+            COLORREF(colour.text)
+        } else {
+            system_text
+        };
+        let background = if colour.background_enabled
+            && colour.background != rusthashtab_settings::SYSTEM_COLOUR
+        {
             COLORREF(colour.background)
         } else {
             system_face
         };
-
-    let rect = draw.rcItem;
-    let sample_height = (rect.bottom - rect.top) * 2 / 3;
-    let mut sample = RECT {
-        left: rect.left,
-        top: rect.top,
-        right: rect.right,
-        bottom: rect.top + sample_height,
-    };
-    let mut labels = RECT {
-        left: rect.left + 3,
-        top: sample.bottom,
-        right: rect.right - 3,
-        bottom: rect.bottom,
-    };
-
-    // SAFETY: `draw.hDC` is the DC the dialog supplied for this item; the
-    // brushes and the font are selected only for the duration of this call.
-    unsafe {
-        let _ = FillRect(draw.hDC, &rect, GetSysColorBrush(COLOR_BTNFACE));
-        let brush = CreateSolidBrush(background);
-        if !brush.is_invalid() {
-            let _ = FillRect(draw.hDC, &sample, brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
+        // SAFETY: `dc` is a valid display DC for the duration of the message.
+        unsafe {
+            let _ = SetTextColor(dc, text);
+            let _ = SetBkColor(dc, background);
         }
-
-        let font = SendMessageW(draw.hwndItem, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0
-            as *mut core::ffi::c_void;
-        let old_font = if font.is_null() {
-            None
-        } else {
-            Some(SelectObject(draw.hDC, HGDIOBJ(font)))
+        // SAFETY: `GetSysColorBrush` returns a system-owned brush for a valid
+        // colour index; it must not be deleted.
+        let brush = unsafe {
+            state
+                .preview_brush
+                .unwrap_or_else(|| GetSysColorBrush(COLOR_BTNFACE))
         };
-
-        let _ = SetBkMode(draw.hDC, TRANSPARENT);
-        let _ = SetTextColor(draw.hDC, text);
-        let mut sample_text: Vec<u16> = "0123456789ABCDEF".encode_utf16().collect();
-        let _ = DrawTextW(
-            draw.hDC,
-            &mut sample_text,
-            &mut sample,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-        );
-
-        // The hex values are secondary information; keep them on the dialog
-        // face so they stay readable whatever the sample colours are.
-        let _ = SetTextColor(draw.hDC, system_text);
-        let labels_text = format!(
-            "text {} / bg {}",
-            if colour.text_enabled {
-                colour_text(colour.text)
-            } else {
-                String::from("off")
-            },
-            if colour.background_enabled {
-                colour_text(colour.background)
-            } else {
-                String::from("off")
-            }
-        );
-        let mut labels_wide: Vec<u16> = labels_text.encode_utf16().collect();
-        let _ = DrawTextW(
-            draw.hDC,
-            &mut labels_wide,
-            &mut labels,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-        );
-
-        if let Some(old) = old_font {
-            let _ = SelectObject(draw.hDC, old);
-        }
+        return brush.0 as isize;
     }
-    true
+
+    if id == resource::IDC_SETTINGS_COLOUR_PREVIEW_LABEL {
+        // SAFETY: `GetSysColor` reads a system colour table entry; `dc` is a
+        // valid display DC for the duration of the message.
+        let (text, face) = unsafe {
+            (
+                COLORREF(GetSysColor(COLOR_BTNTEXT)),
+                COLORREF(GetSysColor(COLOR_BTNFACE)),
+            )
+        };
+        // SAFETY: as above.
+        unsafe {
+            let _ = SetTextColor(dc, text);
+            let _ = SetBkColor(dc, face);
+        }
+        // SAFETY: the system brush is owned by USER32 and must not be deleted.
+        return unsafe { GetSysColorBrush(COLOR_BTNFACE) }.0 as isize;
+    }
+
+    0
 }
 
-/// Update the text preview for the selected class.
-fn update_colour_preview(hwnd: HWND, form: &SettingsForm) {
+/// Update the sample brush and the hex/off label for the selected class.
+fn update_colour_preview(hwnd: HWND, state: &mut DialogState) {
     let Some(preview) = control(hwnd, resource::IDC_SETTINGS_COLOUR_PREVIEW) else {
         return;
     };
     let class = selected_class(hwnd);
-    let colour = colour_of(&form.settings, class);
-    let text = format!(
+    let colour = colour_of(&state.form.settings, class);
+    let labels = format!(
         "text {} / bg {}",
         if colour.text_enabled {
             colour_text(colour.text)
@@ -558,11 +523,32 @@ fn update_colour_preview(hwnd: HWND, form: &SettingsForm) {
             String::from("off")
         }
     );
-    let wide: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
-    // SAFETY: `preview` is the dialog's static and the string outlives the call.
+    if let Some(label) = control(hwnd, resource::IDC_SETTINGS_COLOUR_PREVIEW_LABEL) {
+        let wide: Vec<u16> = labels.encode_utf16().chain(core::iter::once(0)).collect();
+        // SAFETY: `label` is the dialog's static and the string outlives the call.
+        unsafe {
+            let _ = SetWindowTextW(label, PCWSTR(wide.as_ptr()));
+        }
+    }
+
+    if let Some(brush) = state.preview_brush.take() {
+        // SAFETY: the brush was created by `CreateSolidBrush` below and is not
+        // selected into any DC outside the `WM_CTLCOLORSTATIC` handler.
+        let _ = unsafe { DeleteObject(HGDIOBJ(brush.0)) };
+    }
+    if colour.background_enabled && colour.background != rusthashtab_settings::SYSTEM_COLOUR {
+        // SAFETY: `CreateSolidBrush` takes a plain `COLORREF` and returns an
+        // owned brush; it is stored in the dialog state and deleted on the next
+        // change or at `WM_NCDESTROY`.
+        state.preview_brush = Some(unsafe { CreateSolidBrush(COLORREF(colour.background)) });
+    }
+
+    // SAFETY: both controls belong to this dialog and are still alive.
     unsafe {
-        let _ = SetWindowTextW(preview, PCWSTR(wide.as_ptr()));
         let _ = InvalidateRect(Some(preview), None, true);
+        if let Some(label) = control(hwnd, resource::IDC_SETTINGS_COLOUR_PREVIEW_LABEL) {
+            let _ = InvalidateRect(Some(label), None, true);
+        }
     }
 }
 
@@ -651,14 +637,14 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
     // `CBN_SELCHANGE` is 1. The class selector only changes the preview; the
     // settings object is updated when a colour is actually picked.
     if id == resource::IDC_SETTINGS_COLOUR_CLASS && code == 1 {
-        update_colour_controls(hwnd, &state.form);
+        update_colour_controls(hwnd, state);
         return true;
     }
     if id == resource::IDC_SETTINGS_COLOUR_TEXT_ENABLED
         || id == resource::IDC_SETTINGS_COLOUR_BG_ENABLED
     {
         apply_colour_checkboxes(hwnd, &mut state.form);
-        update_colour_preview(hwnd, &state.form);
+        update_colour_preview(hwnd, state);
         return true;
     }
 
@@ -701,7 +687,7 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
                 fill_algorithms(list, &state.form);
             }
             fill_options(hwnd, &state.form);
-            update_colour_controls(hwnd, &state.form);
+            update_colour_controls(hwnd, state);
             true
         }
         resource::IDC_SETTINGS_COLOUR_TEXT => {
@@ -711,7 +697,7 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
                 let stored = colour_of_mut(&mut state.form.settings, class);
                 stored.text = colour;
                 stored.text_enabled = true;
-                update_colour_controls(hwnd, &state.form);
+                update_colour_controls(hwnd, state);
             }
             true
         }
@@ -721,13 +707,13 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
             if let Some(colour) = pick_colour(hwnd, current.background, COLOR_WINDOW) {
                 colour_of_mut(&mut state.form.settings, class).background = colour;
                 colour_of_mut(&mut state.form.settings, class).background_enabled = true;
-                update_colour_controls(hwnd, &state.form);
+                update_colour_controls(hwnd, state);
             }
             true
         }
         resource::IDC_SETTINGS_COLOUR_DEFAULTS => {
             state.form.settings.colours = rusthashtab_settings::RowColours::default();
-            update_colour_controls(hwnd, &state.form);
+            update_colour_controls(hwnd, state);
             true
         }
         _ => false,
