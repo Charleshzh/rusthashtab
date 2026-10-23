@@ -817,7 +817,7 @@ fn is_checked(list: HWND, row: usize) -> bool {
 /// Tick the option check boxes from the form.
 fn fill_options(hwnd: HWND, form: &SettingsForm) {
     let settings = &form.settings;
-    let boxes: [(i32, bool); 12] = [
+    let boxes: [(i32, bool); 15] = [
         (resource::IDC_SETTINGS_UPPERCASE, settings.display_uppercase),
         (resource::IDC_SETTINGS_MONOSPACE, settings.display_monospace),
         (
@@ -828,6 +828,18 @@ fn fill_options(hwnd: HWND, form: &SettingsForm) {
         (
             resource::IDC_SETTINGS_VERIFY_AUTO_FORMAT,
             settings.verify_auto_format,
+        ),
+        (
+            resource::IDC_SETTINGS_VERIFY_CLIPBOARD,
+            settings.verify_from_clipboard,
+        ),
+        (
+            resource::IDC_SETTINGS_HASH_SUMFILE,
+            settings.hash_sumfile_too,
+        ),
+        (
+            resource::IDC_SETTINGS_SUMFILE_ALGORITHM_ONLY,
+            settings.sumfile_algorithm_only,
         ),
         (
             resource::IDC_SETTINGS_SUMFILE_UPPERCASE,
@@ -880,6 +892,9 @@ fn read_options(hwnd: HWND, form: &mut SettingsForm) {
     settings.look_for_sumfiles = checked(resource::IDC_SETTINGS_LOOK_FOR_SUMFILES);
     settings.verify_strict = checked(resource::IDC_SETTINGS_VERIFY_STRICT);
     settings.verify_auto_format = checked(resource::IDC_SETTINGS_VERIFY_AUTO_FORMAT);
+    settings.verify_from_clipboard = checked(resource::IDC_SETTINGS_VERIFY_CLIPBOARD);
+    settings.hash_sumfile_too = checked(resource::IDC_SETTINGS_HASH_SUMFILE);
+    settings.sumfile_algorithm_only = checked(resource::IDC_SETTINGS_SUMFILE_ALGORITHM_ONLY);
     settings.sumfile_uppercase = checked(resource::IDC_SETTINGS_SUMFILE_UPPERCASE);
     settings.sumfile_unix_endings = checked(resource::IDC_SETTINGS_SUMFILE_LF);
     settings.sumfile_double_space = checked(resource::IDC_SETTINGS_SUMFILE_DOUBLE_SPACE);
@@ -980,6 +995,31 @@ mod tests {
             form.algorithms,
             SettingsForm::from_settings(&Settings::default()).algorithms
         );
+    }
+
+    /// The three Phase 6 checkboxes are part of the form, so a change made in the
+    /// dialog survives `to_settings`; the dialog never drops one silently.
+    #[test]
+    fn the_phase_six_options_round_trip_through_the_form() {
+        let settings = Settings {
+            verify_from_clipboard: true,
+            hash_sumfile_too: true,
+            sumfile_algorithm_only: false,
+            ..Settings::default()
+        };
+
+        let form = SettingsForm::from_settings(&settings);
+        let saved = form.to_settings().expect("algorithms are enabled");
+        assert!(saved.verify_from_clipboard);
+        assert!(saved.hash_sumfile_too);
+        assert!(!saved.sumfile_algorithm_only);
+
+        let mut defaults = SettingsForm::from_settings(&settings);
+        defaults.reset_to_defaults();
+        let defaults = defaults.to_settings().expect("defaults keep algorithms on");
+        assert!(!defaults.verify_from_clipboard);
+        assert!(!defaults.hash_sumfile_too);
+        assert!(defaults.sumfile_algorithm_only);
     }
 
     /// An out-of-range toggle is ignored rather than panicking on the shell's

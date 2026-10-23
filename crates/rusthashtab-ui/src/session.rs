@@ -46,6 +46,7 @@
 #![cfg(windows)]
 
 use crate::{Counters, JobSpec, ListRow, MAX_HASHED_FILES};
+use rusthashtab_hash::ALGORITHMS;
 use rusthashtab_scan::{FileResult, ScanConfig, ScanEvent, ScanOutcome, expand_selection_with};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -101,6 +102,13 @@ pub struct Shared {
     expected: Mutex<Vec<Vec<Vec<u8>>>>,
     /// Which verification source produced [`Shared::expected`], if any.
     verification: Mutex<Option<VerificationInfo>>,
+    /// Details of the checksum file this page interpreted as a manifest, if any.
+    ///
+    /// Kept separately from [`VerificationInfo`] because the status line only says
+    /// that the source was a manifest; the page also needs to know whether the
+    /// current scan is a manifest scan when it decides how a settings change
+    /// applies.
+    manifest: Mutex<Option<ManifestInfo>>,
     /// The status line's counters.
     counters: Mutex<Counters>,
     /// How rows are spelled out. See [`Display`].
@@ -129,11 +137,14 @@ impl Shared {
             results: Mutex::new(Vec::new()),
             expected: Mutex::new(Vec::new()),
             verification: Mutex::new(None),
+            manifest: Mutex::new(None),
             counters: Mutex::new(Counters::default()),
             display: Mutex::new(Display {
                 enabled: Vec::new(),
                 uppercase: true,
                 look_for_sumfiles: false,
+                hash_sumfile_too: false,
+                sumfile_algorithm_only: true,
             }),
             progress: AtomicU64::new(0),
             files_done: AtomicUsize::new(0),
@@ -150,6 +161,31 @@ impl Shared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Replace the scan's display snapshot.
+    ///
+    /// Written by the session thread once, after it has worked out the effective
+    /// algorithm set (a checksum-file manifest can temporarily enable the
+    /// algorithm its extension names). The page reads it back when the job list
+    /// is published, so both sides build rows with the same `enabled` vector.
+    pub(crate) fn set_display(&self, display: Display) {
+        *self
+            .display
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = display;
+    }
+
+    /// Change the digest case used for rows that finish from now on.
+    ///
+    /// The page applies a display-only settings change without restarting the
+    /// scan; the collector reads this value for every result, so rows that arrive
+    /// after the change cannot stick to the previous spelling.
+    pub(crate) fn set_uppercase(&self, uppercase: bool) {
+        self.display
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .uppercase = uppercase;
     }
 
     /// Take everything waiting to be displayed.
@@ -242,6 +278,22 @@ impl Shared {
     /// The verification source in effect, if any.
     pub fn verification(&self) -> Option<VerificationInfo> {
         self.lock_verification().clone()
+    }
+
+    /// Record the manifest this page was started from, or clear it with `None`.
+    pub fn set_manifest(&self, info: Option<ManifestInfo>) {
+        *self
+            .manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = info;
+    }
+
+    /// The manifest this page was started from, if the selection was one.
+    pub fn manifest(&self) -> Option<ManifestInfo> {
+        self.manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Replace the status line's counters.
@@ -528,6 +580,30 @@ pub struct VerificationInfo {
     pub unmatched: usize,
     /// Whether the source had lines that could not be parsed.
     pub had_error: bool,
+    /// Checksum files found beside the hashed files that could not be read.
+    ///
+    /// Only sidecar lookups produce this: an explicitly chosen checksum file that
+    /// cannot be read is reported with a message box instead.
+    pub unreadable: usize,
+}
+
+/// What the page knows about a selection that was interpreted as a checksum-file
+/// manifest.
+///
+/// The status line already names the source; this value exists so the page can
+/// answer "is this scan a manifest scan" when a settings change has to decide
+/// whether it affects the running work, and so tests can tell a manifest scan
+/// from an ordinary one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestInfo {
+    /// The checksum file that was interpreted.
+    pub path: std::path::PathBuf,
+    /// The algorithm inferred from its extension, if any.
+    pub inferred: Option<usize>,
+    /// Entries that named a file and became jobs.
+    pub named_entries: usize,
+    /// Whether the checksum file itself is also being hashed.
+    pub sumfile_hashed: bool,
 }
 
 /// How the page wants rows spelled out.
@@ -549,6 +625,13 @@ pub struct Display {
     /// scan starts: the page can change settings while a scan runs, and the
     /// running scan must keep the behaviour it was given.
     pub look_for_sumfiles: bool,
+    /// Also hash the checksum file itself when the selection is a manifest.
+    pub hash_sumfile_too: bool,
+    /// When the manifest's extension names an algorithm, use only that algorithm
+    /// for this scan.
+    ///
+    /// A temporary choice: nothing here is written to the settings store.
+    pub sumfile_algorithm_only: bool,
 }
 
 /// A running hashing thread, and the state the page reads.
@@ -738,17 +821,46 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
         return ScanOutcome::Cancelled;
     }
 
-    let display = shared.display();
+    let mut display = shared.display();
 
-    sink.discovering(0);
-    let mut jobs = expand_selection_with(roots, &|| shared.is_cancelled(), &mut |discovery| {
-        sink.discovering(discovery.files)
-    });
+    // A single selected checksum file is interpreted as a manifest: the files it
+    // lists become the jobs, with their expected digests attached. Detection and
+    // parsing happen here, on the session thread, because they are file-system
+    // work. A selection that does not qualify falls through to ordinary
+    // expansion, so the page never loses the ability to hash the file itself.
+    let manifest = manifest_for(roots, &display);
+    let is_manifest = manifest.is_some();
+    let jobs = if let Some((path, plan)) = manifest {
+        let inferred_name = plan.inferred.map(|index| ALGORITHMS[index].name);
+        display.enabled = plan.enabled;
+        shared.set_display(display.clone());
+        shared.set_manifest(Some(ManifestInfo {
+            path: path.clone(),
+            inferred: plan.inferred,
+            named_entries: plan.named_entries,
+            sumfile_hashed: display.hash_sumfile_too,
+        }));
+        shared.set_verification(VerificationInfo {
+            source: crate::resource::manifest_source(&path, inferred_name),
+            unmatched: plan.unmatched,
+            had_error: plan.had_error,
+            unreadable: 0,
+        });
+        sink.discovering(plan.jobs.len());
+        plan.jobs
+    } else {
+        sink.discovering(0);
+        expand_selection_with(roots, &|| shared.is_cancelled(), &mut |discovery| {
+            sink.discovering(discovery.files)
+        })
+    };
 
     if shared.is_cancelled() {
         sink.finished(ScanOutcome::Cancelled);
         return ScanOutcome::Cancelled;
     }
+
+    let mut jobs = jobs;
 
     // The cap. Applied here rather than refusing the selection, so a directory of a
     // hundred thousand files performs a hundred thousand's worth of *visible* work
@@ -759,22 +871,23 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
         shared.skipped.store(skipped, Ordering::Release);
     }
 
-    sink.jobs_ready(jobs.len());
-
     // A checksum file beside each hashed file is an automatic verification
     // source when the setting asks for one. It is read here, on the session
     // thread, because it is file-system work and the dialog's thread must not
-    // wait on it.
-    if display.look_for_sumfiles {
-        let attached = crate::verify::attach_sidecars(&mut jobs);
-        if attached > 0 {
-            // Say where the verdicts came from. The exact per-file accounting is
-            // not available here (a sidecar covers one file, so "unmatched" has
-            // no meaning); the label is still better than an unexplained green.
+    // wait on it. A manifest scan already has its expectations from the manifest,
+    // so sidecars are deliberately not consulted there.
+    if display.look_for_sumfiles && !is_manifest {
+        let attached = crate::verify::attach_sidecars(&mut jobs, &display.enabled);
+        if attached.attached > 0
+            || attached.unmatched > 0
+            || attached.had_error
+            || attached.unreadable > 0
+        {
             shared.set_verification(VerificationInfo {
                 source: String::from("checksum files beside the hashed files"),
-                unmatched: 0,
-                had_error: false,
+                unmatched: attached.unmatched,
+                had_error: attached.had_error,
+                unreadable: attached.unreadable,
             });
         }
     }
@@ -782,8 +895,8 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
     // Publish what is about to be scanned, before the scan starts: the sink needs
     // each job's display path to build the file column, and the result slots have
     // to exist before the first result arrives. The expected digests are the ones
-    // the sidecar scan just attached (usually none); a source that arrives during
-    // the scan replaces them through `set_expected`.
+    // the manifest or the sidecar scan attached (usually none); a source that
+    // arrives during the scan replaces them through `set_expected`.
     shared.set_jobs(
         jobs.iter()
             .map(|job| JobSpec {
@@ -796,6 +909,11 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
 
     shared.files_total.store(jobs.len(), Ordering::Release);
 
+    // Posted only after the job list and its expectation table are published: the
+    // page's handler rebuilds from `Shared` when it receives this message, and a
+    // message that arrived first would find an empty job list.
+    sink.jobs_ready(jobs.len());
+
     let config = ScanConfig {
         jobs,
         enabled: display.enabled.clone(),
@@ -807,7 +925,6 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
     let collector = Collector {
         shared: Arc::clone(shared),
         sink,
-        display,
         flag: Arc::clone(&scan_cancelled),
     };
 
@@ -826,6 +943,29 @@ fn run(roots: &[PathBuf], sink: Box<dyn SessionSink>, shared: &Arc<Shared>) -> S
     }
 
     ScanOutcome::Complete
+}
+
+/// Interpret a single selected checksum file as a manifest.
+///
+/// Returns the normalized path and the plan. `None` means "not a manifest": more
+/// than one root, a directory, an unregistered extension, an unreadable file, or
+/// a file with no entry that names a file. Every `None` falls back to ordinary
+/// hashing, so a failed interpretation never loses the selection.
+fn manifest_for(
+    roots: &[PathBuf],
+    display: &Display,
+) -> Option<(PathBuf, crate::manifest::ManifestPlan)> {
+    let [root] = roots else {
+        return None;
+    };
+    let path = rusthashtab_scan::normalize_path(root);
+    let plan = crate::manifest::plan(
+        &path,
+        &display.enabled,
+        display.hash_sumfile_too,
+        display.sumfile_algorithm_only,
+    )?;
+    Some((path, plan))
 }
 
 /// One flag, shared between the collector and the function that owns it.
@@ -901,7 +1041,6 @@ impl Drop for FinishOnDrop {
 struct Collector {
     shared: Arc<Shared>,
     sink: Box<dyn SessionSink>,
-    display: Display,
     /// Set when the scan reports an outcome other than `Complete`.
     flag: ScanFlag,
 }
@@ -927,14 +1066,19 @@ impl Collector {
                 // must not be the only place a finished file is remembered.
                 self.shared.store_result(job_index, result.clone());
 
+                // Read the display snapshot for every result rather than capturing
+                // it when the collector was built: a display-only settings change
+                // (upper-case hex) applies without restarting the scan, and rows
+                // that arrive after it must not stick to the previous spelling.
+                let display = self.shared.display();
+
                 // The event's own verdict is deliberately ignored: it was computed
                 // against the expected digests the scan was started with, and a
                 // verification source can arrive *while* the scan runs. Recomputing
                 // against the digests stored on `Shared` is what keeps a row's
                 // colour consistent with the source the dialog currently shows.
                 let expected = self.shared.expected_at(job_index);
-                let verdict =
-                    rusthashtab_scan::match_state(&result, &expected, &self.display.enabled);
+                let verdict = rusthashtab_scan::match_state(&result, &expected, &display.enabled);
 
                 // The job list was published before the scan started, so the job is
                 // there. The empty fallback only matters if that contract is broken,
@@ -949,8 +1093,8 @@ impl Collector {
                     job_index,
                     &display_path,
                     &result,
-                    &self.display.enabled,
-                    self.display.uppercase,
+                    &display.enabled,
+                    display.uppercase,
                     verdict,
                     &expected,
                 );
@@ -1148,6 +1292,7 @@ mod tests {
             source: "checksum file: a.sha256".to_string(),
             unmatched: 2,
             had_error: true,
+            unreadable: 1,
         };
         shared.set_verification(info.clone());
         assert_eq!(shared.verification(), Some(info));

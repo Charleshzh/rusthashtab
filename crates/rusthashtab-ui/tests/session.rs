@@ -117,6 +117,8 @@ fn display_all() -> Display {
         enabled: vec![true; ALGORITHMS.len()],
         uppercase: true,
         look_for_sumfiles: false,
+        hash_sumfile_too: false,
+        sumfile_algorithm_only: true,
     }
 }
 
@@ -133,6 +135,8 @@ fn display_one(name: &str) -> Display {
         enabled,
         uppercase: true,
         look_for_sumfiles: false,
+        hash_sumfile_too: false,
+        sumfile_algorithm_only: true,
     }
 }
 
@@ -374,6 +378,273 @@ fn a_missing_root_becomes_an_error_row_and_does_not_stop_the_others() {
         "the missing root must be reported, not dropped"
     );
     assert_eq!(readouts[1].rows.len(), 1, "an error is one row");
+}
+
+// ---------------------------------------------------------------------------
+// checksum-file manifests
+// ---------------------------------------------------------------------------
+
+/// A GNU-style line for one file, named relative to the checksum file.
+fn sumfile_line(path: &Path, algorithm: &str) -> String {
+    let digest = digest_for(path, algorithm);
+    format!(
+        "{}  {}\n",
+        rusthashtab_sumfile::export::to_hex(&digest, true),
+        path.file_name()
+            .expect("the test file has a name")
+            .to_string_lossy()
+    )
+}
+
+fn wait_for_readouts_sorted(
+    shared: &Arc<rusthashtab_ui::session::Shared>,
+    expected: usize,
+) -> Vec<Readout> {
+    let mut readouts = wait_for_readouts(shared, expected);
+    readouts.sort_by_key(|readout| readout.job_index);
+    readouts
+}
+
+/// The Phase 6 core workflow: selecting one checksum file hashes the files it
+/// lists and uses its digests as expectations -- without touching the settings
+/// store and without the user opening `Verify...`.
+#[test]
+fn a_single_checksum_file_is_interpreted_as_a_manifest() {
+    let dir = TempDir::new("manifest");
+    let data = dir.file("payload.bin", b"manifest target bytes");
+    let sumfile = dir.file("sums.sha256", sumfile_line(&data, "SHA-256").as_bytes());
+
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    // Only MD5 is configured. The `.sha256` extension must temporarily enable
+    // SHA-256 for this scan (and only this scan).
+    let session = ReadoutSession::start(
+        vec![sumfile.clone()],
+        display_one("MD5"),
+        0isize,
+        Arc::clone(&shared),
+    );
+
+    wait_until_complete(&shared);
+    let readouts = wait_for_readouts_sorted(&shared, 1);
+    let _ = session.finish(Duration::from_secs(30));
+
+    assert_eq!(readouts.len(), 1);
+    assert_eq!(
+        readouts[0].match_state,
+        MatchState::Matched {
+            algorithm: ALGORITHMS
+                .iter()
+                .position(|algorithm| algorithm.name == "SHA-256")
+                .expect("SHA-256 is in the table"),
+            secure: true,
+        }
+    );
+    assert_eq!(readouts[0].rows.len(), 1, "only the inferred algorithm ran");
+    assert_eq!(ALGORITHMS[readouts[0].rows[0].algorithm].name, "SHA-256");
+
+    let manifest = shared.manifest().expect("the selection is a manifest");
+    assert_eq!(manifest.path, rusthashtab_scan::normalize_path(&sumfile));
+    assert_eq!(manifest.named_entries, 1);
+    assert!(!manifest.sumfile_hashed);
+    assert_eq!(
+        manifest.inferred,
+        ALGORITHMS
+            .iter()
+            .position(|algorithm| algorithm.name == "SHA-256")
+    );
+
+    let verification = shared
+        .verification()
+        .expect("the manifest is a verification source");
+    assert!(verification.source.contains("interpreted as sumfile"));
+    assert!(verification.source.contains("SHA-256"));
+
+    let enabled: Vec<&str> = shared
+        .display()
+        .enabled
+        .iter()
+        .enumerate()
+        .filter(|(_, on)| **on)
+        .map(|(index, _)| ALGORITHMS[index].name)
+        .collect();
+    assert_eq!(enabled, vec!["SHA-256"]);
+    assert_eq!(
+        shared.jobs()[0].path,
+        rusthashtab_scan::normalize_path(&data)
+    );
+}
+
+/// `SumfileAlgorithmOnly` is a choice: with it off, the extension's algorithm is
+/// added to the configured set instead of replacing it.
+#[test]
+fn sumfile_algorithm_only_off_keeps_the_configured_algorithms() {
+    let dir = TempDir::new("manifest-union");
+    let data = dir.file("payload.bin", b"manifest union bytes");
+    let sumfile = dir.file("sums.sha256", sumfile_line(&data, "SHA-256").as_bytes());
+
+    let mut display = display_one("MD5");
+    display.sumfile_algorithm_only = false;
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    let session = ReadoutSession::start(vec![sumfile], display, 0isize, Arc::clone(&shared));
+
+    wait_until_complete(&shared);
+    let readouts = wait_for_readouts_sorted(&shared, 1);
+    let _ = session.finish(Duration::from_secs(30));
+
+    assert_eq!(readouts[0].rows.len(), 2, "MD5 and SHA-256 both ran");
+    let sha256 = readouts[0]
+        .rows
+        .iter()
+        .find(|row| ALGORITHMS[row.algorithm].name == "SHA-256")
+        .expect("the SHA-256 row exists");
+    assert!(matches!(sha256.match_state, MatchState::Matched { .. }));
+    let md5 = readouts[0]
+        .rows
+        .iter()
+        .find(|row| ALGORITHMS[row.algorithm].name == "MD5")
+        .expect("the MD5 row exists");
+    assert_eq!(md5.match_state, MatchState::NotChecked);
+}
+
+/// `HashSumfileToo` adds the checksum file itself, in front of the files it
+/// lists, and does not duplicate it when the manifest already names it.
+#[test]
+fn hashing_the_sumfile_too_adds_it_as_the_first_job() {
+    let dir = TempDir::new("manifest-hash-sumfile");
+    let data = dir.file("payload.bin", b"manifest self bytes");
+    let sumfile = dir.file("sums.sha256", sumfile_line(&data, "SHA-256").as_bytes());
+
+    let mut display = display_one("SHA-256");
+    display.hash_sumfile_too = true;
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    let session =
+        ReadoutSession::start(vec![sumfile.clone()], display, 0isize, Arc::clone(&shared));
+
+    wait_until_complete(&shared);
+    let readouts = wait_for_readouts_sorted(&shared, 2);
+    let _ = session.finish(Duration::from_secs(30));
+
+    assert_eq!(readouts.len(), 2);
+    assert_eq!(readouts[0].rows[0].display_path, "sums.sha256");
+    assert_eq!(readouts[1].rows[0].display_path, "payload.bin");
+    assert!(shared.manifest().expect("manifest").sumfile_hashed);
+}
+
+/// A manifest already supplies the expectations; a sidecar beside a listed file
+/// must not be layered on top of them.
+#[test]
+fn a_sidecar_is_not_attached_in_manifest_mode() {
+    let dir = TempDir::new("manifest-sidecar");
+    let data = dir.file("payload.bin", b"manifest sidecar bytes");
+    let sumfile = dir.file("sums.sha256", sumfile_line(&data, "SHA-256").as_bytes());
+    // This would make the file a mismatch if a sidecar lookup ran.
+    dir.file(
+        "payload.bin.sha256",
+        format!("{}  payload.bin\n", "0".repeat(64)).as_bytes(),
+    );
+
+    let mut display = display_one("SHA-256");
+    display.look_for_sumfiles = true;
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    let session = ReadoutSession::start(vec![sumfile], display, 0isize, Arc::clone(&shared));
+
+    wait_until_complete(&shared);
+    let readouts = wait_for_readouts_sorted(&shared, 1);
+    let _ = session.finish(Duration::from_secs(30));
+
+    assert_eq!(
+        readouts[0].match_state,
+        MatchState::Matched {
+            algorithm: ALGORITHMS
+                .iter()
+                .position(|algorithm| algorithm.name == "SHA-256")
+                .expect("SHA-256 is in the table"),
+            secure: true,
+        },
+        "the sidecar must not override the manifest's expectation"
+    );
+}
+
+/// A selection with a second root is not a manifest: the checksum file is just
+/// another file to hash.
+#[test]
+fn a_manifest_requires_exactly_one_selected_root() {
+    let dir = TempDir::new("manifest-two-roots");
+    let data = dir.file("payload.bin", b"two roots");
+    let sumfile = dir.file("sums.sha256", sumfile_line(&data, "SHA-256").as_bytes());
+
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    let session = ReadoutSession::start(
+        vec![sumfile, data],
+        display_one("MD5"),
+        0isize,
+        Arc::clone(&shared),
+    );
+
+    wait_until_complete(&shared);
+    let readouts = wait_for_readouts_sorted(&shared, 2);
+    let _ = session.finish(Duration::from_secs(30));
+
+    assert!(shared.manifest().is_none());
+    assert_eq!(readouts.len(), 2, "both roots were hashed as files");
+    assert_eq!(shared.verification(), None);
+}
+
+/// A sidecar was found by name, not chosen by the user; when it names another
+/// file, the page must say so instead of silently leaving the file unchecked.
+#[test]
+fn a_sidecar_that_names_another_file_is_reported() {
+    let dir = TempDir::new("sidecar-unmatched");
+    let data = dir.file("payload.bin", b"sidecar bytes");
+    dir.file(
+        "payload.bin.sha256",
+        format!(
+            "{}  other.bin\n",
+            rusthashtab_sumfile::export::to_hex(&digest_for(&data, "SHA-256"), true)
+        )
+        .as_bytes(),
+    );
+
+    let mut display = display_one("SHA-256");
+    display.look_for_sumfiles = true;
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    let session = ReadoutSession::start(vec![data], display, 0isize, Arc::clone(&shared));
+
+    wait_until_complete(&shared);
+    let readouts = wait_for_readouts_sorted(&shared, 1);
+    let _ = session.finish(Duration::from_secs(30));
+
+    assert_eq!(readouts[0].match_state, MatchState::NotChecked);
+    let verification = shared
+        .verification()
+        .expect("a sidecar with no usable entry is still a source");
+    assert_eq!(verification.unmatched, 1);
+    assert!(!verification.had_error);
+    assert_eq!(verification.unreadable, 0);
+}
+
+/// A malformed sidecar is visible: the user must not be told a file is unchecked
+/// when the checksum file beside it was simply unreadable as a format.
+#[test]
+fn a_malformed_sidecar_is_reported_in_the_verification_info() {
+    let dir = TempDir::new("sidecar-malformed");
+    let data = dir.file("payload.bin", b"sidecar bytes");
+    dir.file("payload.bin.sha256", b"this is not a checksum line\n");
+
+    let mut display = display_one("SHA-256");
+    display.look_for_sumfiles = true;
+    let shared = Arc::new(rusthashtab_ui::session::Shared::new());
+    let session = ReadoutSession::start(vec![data], display, 0isize, Arc::clone(&shared));
+
+    wait_until_complete(&shared);
+    let _ = wait_for_readouts(&shared, 1);
+    let _ = session.finish(Duration::from_secs(30));
+
+    let verification = shared
+        .verification()
+        .expect("a malformed sidecar is still a source");
+    assert!(verification.had_error);
+    assert_eq!(verification.unreadable, 0);
 }
 
 // ---------------------------------------------------------------------------

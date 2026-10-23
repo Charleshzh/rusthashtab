@@ -9,8 +9,11 @@
 //!
 //! Each algorithm gets one boolean value named after it (`"SHA-256"`, `"K12-264"`,
 //! …). Non-algorithm options use descriptive names (`"DisplayUppercase"`,
-//! `"LookForSumfiles"`). Colours are not configurable yet, so there is no colour
-//! value in this layout.
+//! `"LookForSumfiles"`). Each of the five row classes has two colours -- a text
+//! and a background `COLORREF` -- plus one "paint this half" flag per colour, so
+//! turning a half off keeps the value the user picked instead of destroying it.
+//! The colour layout carries a version marker ([`COLOURS_VERSION`]) so a key
+//! written before the flags existed can be reset once, deliberately.
 //!
 //! # Why not a config file
 //!
@@ -231,10 +234,34 @@ pub struct Settings {
     pub display_monospace: bool,
     /// Look for a sumfile next to each file being hashed.
     pub look_for_sumfiles: bool,
+    /// Also hash the checksum file itself when one is read as a manifest.
+    ///
+    /// A checksum file is normally only a list of files to hash; its own digest
+    /// is rarely interesting and would add a row the user did not ask for. When
+    /// this is on, the manifest is hashed like any other selected file, which is
+    /// what someone auditing the checksum file's own contents wants.
+    pub hash_sumfile_too: bool,
+    /// Restrict a manifest run to the algorithm its file extension names.
+    ///
+    /// A `.sha256` file is written by a SHA-256 exporter, so hashing the files it
+    /// lists with every enabled algorithm wastes work and can present a match
+    /// against an algorithm the file never recorded. With this on, a recognised
+    /// extension narrows the run to that one algorithm; an unrecognised
+    /// extension leaves the enabled set alone. The narrowing is for this run
+    /// only -- it does not change the saved algorithm selection.
+    pub sumfile_algorithm_only: bool,
     /// Require a pasted whole line's file name to resolve by full path.
     pub verify_strict: bool,
     /// Rewrite the paste box to canonical hex after a successful check.
     pub verify_auto_format: bool,
+    /// Allow the clipboard to be used as the verification source.
+    ///
+    /// Off by default: reading the clipboard behind the user's back would turn
+    /// whatever they last copied into an expected digest, and a "mismatch"
+    /// against unrelated text is worse than not checking. When on, the page may
+    /// take the expected digest from the clipboard without the user pasting it
+    /// into the verify box.
+    pub verify_from_clipboard: bool,
     /// Colours for the five result classes.
     pub colours: RowColours,
     /// Uppercase hex when exporting sumfiles.
@@ -275,8 +302,11 @@ impl Default for Settings {
             display_uppercase: true,
             display_monospace: true,
             look_for_sumfiles: false,
+            hash_sumfile_too: false,
+            sumfile_algorithm_only: true,
             verify_strict: false,
             verify_auto_format: false,
+            verify_from_clipboard: false,
             colours: RowColours::default(),
             sumfile_uppercase: true,
             sumfile_unix_endings: true,
@@ -347,8 +377,11 @@ impl Settings {
             "display_uppercase" => "DisplayUppercase",
             "display_monospace" => "DisplayMonospace",
             "look_for_sumfiles" => "LookForSumfiles",
+            "hash_sumfile_too" => "HashSumfileToo",
+            "sumfile_algorithm_only" => "SumfileAlgorithmOnly",
             "verify_strict" => "VerifyStrict",
             "verify_auto_format" => "VerifyAutoFormat",
+            "verify_from_clipboard" => "VerifyFromClipboard",
             "sumfile_uppercase" => "SumfileUppercase",
             "sumfile_unix_endings" => "SumfileLF",
             "sumfile_double_space" => "SumfileDoubleSpace",
@@ -395,8 +428,8 @@ impl Settings {
 
     /// Write every setting to the registry.
     ///
-    /// Creates the key when it does not exist. The ten non-algorithm options are
-    /// written first as `DWORD`s, then one `DWORD` per entry in
+    /// Creates the key when it does not exist. Every non-algorithm option is
+    /// written first as a `DWORD`, then one `DWORD` per entry in
     /// `algorithm_names`, holding whether that position is enabled according to
     /// [`Settings::is_enabled`]. `is_enabled` is what the write goes through so
     /// that a settings object which was never loaded still persists the default
@@ -512,9 +545,17 @@ mod registry {
         settings.display_monospace =
             read_bool(&key, "DisplayMonospace", settings.display_monospace);
         settings.look_for_sumfiles = read_bool(&key, "LookForSumfiles", settings.look_for_sumfiles);
+        settings.hash_sumfile_too = read_bool(&key, "HashSumfileToo", settings.hash_sumfile_too);
+        settings.sumfile_algorithm_only = read_bool(
+            &key,
+            "SumfileAlgorithmOnly",
+            settings.sumfile_algorithm_only,
+        );
         settings.verify_strict = read_bool(&key, "VerifyStrict", settings.verify_strict);
         settings.verify_auto_format =
             read_bool(&key, "VerifyAutoFormat", settings.verify_auto_format);
+        settings.verify_from_clipboard =
+            read_bool(&key, "VerifyFromClipboard", settings.verify_from_clipboard);
 
         let defaults = settings.colours;
         let read_colour = |class, fallback: super::RowColour| super::RowColour {
@@ -625,8 +666,11 @@ mod registry {
         write_bool(key, "DisplayUppercase", settings.display_uppercase)?;
         write_bool(key, "DisplayMonospace", settings.display_monospace)?;
         write_bool(key, "LookForSumfiles", settings.look_for_sumfiles)?;
+        write_bool(key, "HashSumfileToo", settings.hash_sumfile_too)?;
+        write_bool(key, "SumfileAlgorithmOnly", settings.sumfile_algorithm_only)?;
         write_bool(key, "VerifyStrict", settings.verify_strict)?;
         write_bool(key, "VerifyAutoFormat", settings.verify_auto_format)?;
+        write_bool(key, "VerifyFromClipboard", settings.verify_from_clipboard)?;
         write_dword(key, "ColoursVersion", super::COLOURS_VERSION)?;
         for (class, colour) in [
             (super::ColourClass::Matched, settings.colours.matched),
@@ -826,8 +870,11 @@ mod tests {
             "display_uppercase",
             "display_monospace",
             "look_for_sumfiles",
+            "hash_sumfile_too",
+            "sumfile_algorithm_only",
             "verify_strict",
             "verify_auto_format",
+            "verify_from_clipboard",
             "sumfile_uppercase",
             "sumfile_unix_endings",
             "sumfile_double_space",
@@ -862,6 +909,39 @@ mod tests {
         assert_eq!(
             Settings::value_name("sumfile_forward_slashes"),
             Some("SumfileForwardSlash")
+        );
+        assert_eq!(
+            Settings::value_name("hash_sumfile_too"),
+            Some("HashSumfileToo")
+        );
+        assert_eq!(
+            Settings::value_name("sumfile_algorithm_only"),
+            Some("SumfileAlgorithmOnly")
+        );
+        assert_eq!(
+            Settings::value_name("verify_from_clipboard"),
+            Some("VerifyFromClipboard")
+        );
+    }
+
+    /// The defaults for the workflow options are part of the documented
+    /// behaviour, not an implementation detail: `SumfileAlgorithmOnly` defaults
+    /// *on* while the other two default off, and a test that only checked "some
+    /// value exists" would not notice the pair being swapped.
+    #[test]
+    fn the_workflow_options_default_to_the_documented_values() {
+        let settings = Settings::default();
+        assert!(
+            !settings.hash_sumfile_too,
+            "a manifest run must not hash the manifest itself unless asked"
+        );
+        assert!(
+            settings.sumfile_algorithm_only,
+            "a recognised sumfile extension must narrow the run to its algorithm"
+        );
+        assert!(
+            !settings.verify_from_clipboard,
+            "the clipboard is not a verification source unless the user opts in"
         );
     }
 
@@ -1043,8 +1123,11 @@ mod tests {
             display_uppercase: false,
             display_monospace: false,
             look_for_sumfiles: true,
+            hash_sumfile_too: true,
+            sumfile_algorithm_only: false,
             verify_strict: true,
             verify_auto_format: true,
+            verify_from_clipboard: true,
             colours: RowColours {
                 matched: RowColour {
                     text: 0x0012_3456,

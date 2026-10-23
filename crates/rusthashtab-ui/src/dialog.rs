@@ -47,9 +47,11 @@
 #![cfg(windows)]
 
 use crate::DialogState;
+use crate::SettingsChange;
 use crate::resource;
 use crate::session::{ReadoutSession, Shared, VerificationInfo};
 use crate::task::{Background, TaskError};
+use rusthashtab_hash::ALGORITHMS;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -199,6 +201,11 @@ fn on_init(hwnd: HWND, lparam: LPARAM) -> isize {
     // children; `on_set_font` re-measures when it arrives.
     let font = dialog_font(hwnd);
     state.mono_font = crate::listview::create_monospace_font(font);
+    // The clipboard is read once, here, before the controls are filled: the
+    // candidate may temporarily enable an algorithm, and the export selector has
+    // to be built from the resulting set. Reading is bounded (see
+    // `clipboard::read_text`) and skipped entirely when the setting is off.
+    state.clipboard_text = clipboard_candidate(hwnd, state);
     build_controls(hwnd, state, font);
     state.scan_phase = crate::ScanPhase::Discovering;
     set_control_state(hwnd, state);
@@ -320,6 +327,12 @@ fn install_tooltips(hwnd: HWND, state: &mut DialogState) {
         hwnd,
         resource::IDC_HASH_CANCEL,
         PWSTR(w!("Stop hashing and keep the results so far").0 as *mut u16),
+    );
+    add_tool(
+        tooltip,
+        hwnd,
+        resource::IDC_HASH_CURRENT_ONLY,
+        PWSTR(w!("Check the digest against every file, or only the selected row").0 as *mut u16),
     );
 }
 
@@ -495,6 +508,52 @@ fn selected_export_choice(hwnd: HWND, state: &DialogState) -> Option<crate::expo
     state.export_choices.get(data as usize).copied()
 }
 
+/// Turn the clipboard into a pending automatic check, when the setting asks for
+/// one.
+///
+/// The digest's length is the only thing a bare digest tells us about its
+/// algorithm, so when no enabled algorithm produces that length all implemented
+/// algorithms of that length are **temporarily** enabled -- this affects the
+/// current scan only and is never written to the settings store. If the clipboard
+/// is not a digest, or no algorithm can produce its length, there is no candidate
+/// and the page behaves as if the setting were off.
+///
+/// The raw text is kept so the check can be run after the scan finishes, when the
+/// list of jobs exists. It is not re-read later: what the user copied when they
+/// opened the page is the request.
+fn clipboard_candidate(hwnd: HWND, state: &mut DialogState) -> Option<String> {
+    if !state.settings.verify_from_clipboard {
+        return None;
+    }
+
+    let text = crate::clipboard::read_text(hwnd)?;
+    let pasted = crate::verify::parse_pasted_line(&text).ok()?;
+    let length = pasted.digest.len();
+
+    let already_usable = state.enabled.iter().enumerate().any(|(index, enabled)| {
+        *enabled
+            && ALGORITHMS
+                .get(index)
+                .is_some_and(|algorithm| algorithm.output_len == length)
+    });
+    if already_usable {
+        return Some(text);
+    }
+
+    let mut enabled_any = false;
+    for (index, algorithm) in ALGORITHMS.iter().enumerate() {
+        if algorithm.output_len == length
+            && algorithm.is_implemented()
+            && let Some(slot) = state.enabled.get_mut(index)
+        {
+            *slot = true;
+            enabled_any = true;
+        }
+    }
+
+    enabled_any.then_some(text)
+}
+
 /// Start the scan on the page's own thread.
 ///
 /// Returns immediately: the expansion of the selection and every file read happen on
@@ -504,6 +563,8 @@ fn start_hashing(hwnd: HWND, state: &mut DialogState) {
         enabled: state.enabled.clone(),
         uppercase: state.settings.display_uppercase,
         look_for_sumfiles: state.settings.look_for_sumfiles,
+        hash_sumfile_too: state.settings.hash_sumfile_too,
+        sumfile_algorithm_only: state.settings.sumfile_algorithm_only,
     };
     let shared = Arc::new(Shared::new());
     let session = ReadoutSession::start(
@@ -907,6 +968,7 @@ fn check_pasted(hwnd: HWND) {
         ),
         unmatched: 0,
         had_error: false,
+        unreadable: 0,
     });
 
     if state.settings.verify_auto_format {
@@ -1023,6 +1085,7 @@ fn on_verify_ready(hwnd: HWND, sequence: u32) {
                 source,
                 unmatched: matched.unmatched,
                 had_error: matched.had_error,
+                unreadable: 0,
             });
             rebuild_and_refresh(hwnd);
 
@@ -1195,18 +1258,26 @@ fn on_export_done(hwnd: HWND, sequence: u32) {
 }
 
 /// `Settings...`: show the modal settings dialog and apply what it returns.
+///
+/// A settings change is not automatically a new scan. Display-only changes are
+/// applied to the existing rows; only changes that alter what is hashed (the
+/// algorithm set, sidecar lookup, or the manifest options while a manifest scan is
+/// running) restart the scan. The decision itself is a pure function so it can be
+/// tested without a window.
 fn open_settings(hwnd: HWND) {
-    // SAFETY: `hwnd` is the page dialog.
-    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
-        return;
+    let (instance, current) = {
+        // SAFETY: `hwnd` is the page dialog.
+        let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+            return;
+        };
+        let Some(instance) = state.instance else {
+            // Only a page created by `page::add_page` has the module handle; a page
+            // hosted by a test does not, and has no template to open.
+            set_status_on(state.status, resource::STATUS_SETTINGS_UNAVAILABLE);
+            return;
+        };
+        (instance, state.settings.clone())
     };
-    let Some(instance) = state.instance else {
-        // Only a page created by `page::add_page` has the module handle; a page
-        // hosted by a test does not, and has no template to open.
-        set_status_on(state.status, resource::STATUS_SETTINGS_UNAVAILABLE);
-        return;
-    };
-    let current = state.settings.clone();
 
     let Some(updated) = crate::settings_dialog::show(hwnd, instance, &current) else {
         return;
@@ -1214,18 +1285,57 @@ fn open_settings(hwnd: HWND) {
 
     match updated.save(&crate::algorithm_names()) {
         Ok(()) => {
-            // SAFETY: `hwnd` is the page dialog and still live; `open_settings`
-            // was called from its own command handler.
-            let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
-                return;
-            };
-            state.settings = updated;
-            state.enabled = crate::enabled_algorithms(&state.settings);
-            state.palette = crate::listview::Palette::from_settings(
-                &state.settings,
-                crate::listview::high_contrast(),
-            );
-            restart_hashing(hwnd);
+            let manifest_mode = shared_state(hwnd)
+                .and_then(|shared| shared.manifest())
+                .is_some();
+            let effect = crate::settings_change(&current, &updated, manifest_mode);
+
+            {
+                // SAFETY: `hwnd` is the page dialog and still live; `open_settings`
+                // was called from its own command handler.
+                let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+                    return;
+                };
+                state.settings = updated;
+                state.palette = crate::listview::Palette::from_settings(
+                    &state.settings,
+                    crate::listview::high_contrast(),
+                );
+            }
+
+            match effect {
+                SettingsChange::Rescan => {
+                    // SAFETY: as above; the window is still live.
+                    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+                        return;
+                    };
+                    state.enabled = crate::enabled_algorithms(&state.settings);
+                    restart_hashing(hwnd);
+                }
+                SettingsChange::Redraw => {
+                    let uppercase = {
+                        // SAFETY: as above.
+                        let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+                            return;
+                        };
+                        state.settings.display_uppercase
+                    };
+                    if let Some(shared) = shared_state(hwnd) {
+                        shared.set_uppercase(uppercase);
+                    }
+                    rebuild_and_refresh(hwnd);
+                }
+                SettingsChange::None => {
+                    // SAFETY: as above.
+                    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+                        return;
+                    };
+                    set_status_on(
+                        state.status,
+                        crate::strings::text(crate::strings::Key::SettingsSaved),
+                    );
+                }
+            }
         }
         Err(error) => show_error(
             hwnd,
@@ -1303,7 +1413,10 @@ fn restart_hashing(hwnd: HWND) {
     state.verify_task = None;
     state.export_task = None;
     state.verify_source = None;
-
+    // The clipboard candidate is a page-open decision: it was already reduced to
+    // (possibly) a temporary algorithm set. A restart does not re-read the
+    // clipboard, so there is no pending check to carry across.
+    state.clipboard_text = None;
     state.rows.clear();
     state.scan_phase = crate::ScanPhase::Discovering;
     state.job_count = 0;
@@ -1857,6 +1970,11 @@ fn on_discovery(hwnd: HWND, count: usize) {
 }
 
 /// The job list is published; hashing is about to start.
+///
+/// The session may have changed the algorithm set since the page was built: a
+/// single checksum file can be interpreted as a manifest and temporarily enable
+/// the algorithm its extension names. The page adopts that set here, before it
+/// builds rows, so the list and the scan describe the same algorithms.
 fn on_jobs_ready(hwnd: HWND, count: usize) {
     // SAFETY: `hwnd` is the page dialog.
     let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
@@ -1864,9 +1982,21 @@ fn on_jobs_ready(hwnd: HWND, count: usize) {
     };
     state.job_count = count;
     state.scan_phase = crate::ScanPhase::Hashing;
+
+    if let Some(shared) = shared_state(hwnd) {
+        let effective = shared.display().enabled;
+        if effective != state.enabled && !effective.is_empty() {
+            state.enabled = effective;
+            fill_export_choices(hwnd, state);
+        }
+    }
+
     crate::listview::set_file_column_for_jobs(state.list, count);
+    // Rebuild rather than only refresh: a file result can arrive before this
+    // message is dispatched (the scan's workers post on their own threads), and
+    // those early rows were built with the pre-manifest algorithm set.
+    rebuild_and_refresh(hwnd);
     set_control_state(hwnd, state);
-    refresh_status(hwnd, state, &shared_state_or_empty(hwnd));
 }
 
 /// A shared-state handle for status functions that need counters, or an empty one.
@@ -1977,6 +2107,42 @@ fn on_scan_finished(hwnd: HWND) {
     if let Some(state) = unsafe { state(hwnd) } {
         set_control_state(hwnd, state);
     }
+    maybe_apply_clipboard_check(hwnd);
+}
+
+/// Run the pending clipboard check after a complete scan, if it is still wanted.
+///
+/// The conditions are deliberately narrow: a completed (not cancelled) scan, no
+/// other verification source in effect, and an empty Expected box. A manifest, an
+/// explicit checksum file, a sidecar, or a digest the user already typed all own
+/// the verdicts; an automatic check must not replace them.
+fn maybe_apply_clipboard_check(hwnd: HWND) {
+    // SAFETY: `hwnd` is the page dialog.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    if state.scan_phase != crate::ScanPhase::Finished {
+        state.clipboard_text = None;
+        return;
+    }
+    let Some(text) = state.clipboard_text.take() else {
+        return;
+    };
+
+    if shared_state(hwnd).is_some_and(|shared| shared.verification().is_some()) {
+        return;
+    }
+    // SAFETY: `hwnd` is the page dialog and the identifier is one its template
+    // declares.
+    let Some(edit) = (unsafe { control(hwnd, resource::IDC_HASH_EXPECTED) }) else {
+        return;
+    };
+    if !dialog_text(edit).trim().is_empty() {
+        return;
+    }
+
+    set_control_text(edit, &text);
+    check_pasted(hwnd);
 }
 
 /// Rewrite the status line from what the hashing thread reports.
@@ -2021,7 +2187,20 @@ fn refresh_status(hwnd: HWND, state: &DialogState, shared: &Arc<Shared>) {
     // file is a different statement from "3 matched" against a pasted digest, and
     // the counters stay the first thing on the line.
     if let Some(info) = shared.verification() {
-        text = resource::with_verification(text, &info.source, info.unmatched, info.had_error);
+        text = resource::with_verification(
+            text,
+            &info.source,
+            info.unmatched,
+            info.had_error,
+            info.unreadable,
+        );
+    }
+
+    // The counters say how many files matched; this says which one. Built from
+    // the rows the list is already showing, so a sorted or partially-filled result
+    // set still describes exactly what the user can see.
+    if let Some(detail) = crate::readout::match_detail(&state.rows) {
+        text = resource::with_match_detail(text, &detail);
     }
 
     set_status(status, &text);

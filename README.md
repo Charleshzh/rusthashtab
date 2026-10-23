@@ -7,12 +7,14 @@ file Properties dialog.
 
 Select any file, open **Properties**, and the **Hashes** tab shows its digest under
 every algorithm you have enabled — with a running progress bar. Paste a hash you were
-given and it is highlighted green or red as it matches. The context menu, standalone
+given and it is highlighted green or red as it matches; select a single checksum file
+and the files it lists are hashed and checked against it. The context menu, standalone
 mode, localization and installer are planned; see [Roadmap](#roadmap--路线图).
 
 > 选中任意文件打开**属性**，**Hashes** 标签页会列出所有已启用算法下的摘要，
-> 并带实时进度条。粘贴别人给你的哈希值，匹配与否会直接标色。右键菜单、独立运行模式、
-> 本地化与安装器仍在路线图中，见[路线图](#roadmap--路线图)。
+> 并带实时进度条。粘贴别人给你的哈希值，匹配与否会直接标色；只选中一个校验和文件时，
+> 页面会哈希并校验它列出的文件。右键菜单、独立运行模式、本地化与安装器仍在路线图中，
+> 见[路线图](#roadmap--路线图)。
 
 > **Bilingual document.** Every section is written in English first, then Chinese.
 > English is authoritative; if the two disagree, English wins. **When you change one
@@ -22,14 +24,18 @@ mode, localization and installer are planned; see [Roadmap](#roadmap--路线图)
 > **改动一种语言时，必须在同一次提交中同步另一种。**
 
 > **Status: alpha.** All 31 hash algorithms are implemented and externally verified, the
-> scan pipeline is done, and the Shell Properties page now verifies against pasted digests
+> scan pipeline is done, and the Shell Properties page verifies against pasted digests
 > and checksum files, exports them in every supported format, and has a settings dialog.
-> The context menu, localization, standalone mode and the installer are still to come.
-> See [Roadmap](#roadmap--路线图).
+> Workflows around checksum files are in place: a single selected checksum file is
+> interpreted as a manifest, sidecars are matched strictly, and an opt-in clipboard check
+> is available. The context menu, localization, standalone mode and the installer are
+> still to come. See [Roadmap](#roadmap--路线图).
 >
 > **状态：alpha。** 全部 31 种哈希算法已实现并通过外部校验，扫描管线已完成；Shell 属性页
 > 现在支持用粘贴的摘要或校验和文件进行校验、按所有支持格式导出，并有设置对话框。
-> 右键菜单、本地化、独立模式与安装器仍待开发。见[路线图](#roadmap--路线图)。
+> 校验和文件相关的工作流也已就位：只选一个校验和文件时会把它当清单解释，sidecar 采用严格
+> 匹配，并提供可选（默认关闭）的剪贴板自动校验。右键菜单、本地化、独立模式与安装器仍待开发。
+> 见[路线图](#roadmap--路线图)。
 
 ---
 
@@ -41,6 +47,11 @@ mode, localization and installer are planned; see [Roadmap](#roadmap--路线图)
 - **Verification** — paste a digest, or point it at a checksum file; matches are
   coloured green (secure) or amber (weak) against a red mismatch
 - **Checksum file support** — reads and writes `sha256sum`-style files, SFV, and corz `.hash`
+- **Checksum-file manifests** — select one checksum file and the files it lists are hashed
+  and checked; the extension can temporarily select the algorithm
+- **Strict sidecar verification** — `<file>.<extension>` is used only for that file and only
+  for enabled algorithms; entries naming other files are reported, not guessed
+- **Optional clipboard check** — use the digest you copied as the expected value (off by default)
 - **Native look** — a real Win32 dialog, DPI-aware, no bundled toolkit
 - **Multi-architecture** — x86, x64 and ARM64
 - **Long path support**
@@ -54,10 +65,110 @@ mode, localization and installer are planned; see [Roadmap](#roadmap--路线图)
 - **校验** —— 粘贴一段哈希，或指向校验和文件；匹配按绿（安全算法）或琥珀（弱算法）标色，
   不匹配标红
 - **校验和文件支持** —— 读写 `sha256sum` 风格文件、SFV 以及 corz `.hash`
+- **校验和文件清单模式** —— 只选一个校验和文件，就会哈希并校验它列出的文件；
+  扩展名可临时选择算法
+- **严格 sidecar 校验** —— `<文件>.<扩展名>` 只用于该文件、只使用已启用算法；
+  指向其它文件的条目会被报告，而不是猜测
+- **可选剪贴板校验** —— 用刚复制的摘要作为期望值（默认关闭）
 - **原生外观** —— 真正的 Win32 对话框，支持 DPI 缩放，不捆绑任何 GUI 工具包
 - **多架构** —— x86、x64 与 ARM64
 - **长路径支持**
 - **每个架构只有一个 DLL** —— CPU 特性派发在运行时完成，不存在需要挑选的按指令集拆分的二进制
+
+## Usage / 使用
+
+> The page is a property-sheet tab: select files or folders, open **Properties**, and
+> switch to **Hashes**. Everything below happens on that tab.
+>
+> 页面是属性页标签：选中文件或文件夹，打开**属性**，切到 **Hashes**。下面所有操作都在该标签页完成。
+
+### Hash files and folders / 哈希文件与文件夹
+
+Select any files or folders. Each file gets one row per enabled algorithm. A folder is
+walked recursively; reparse points inside it are not followed, and duplicate paths are
+hashed once. The first 1000 files are hashed, and the status line says how many were left
+out.
+
+> 选中任意文件或文件夹。每个文件按每个已启用算法产生一行。文件夹会递归展开；内部的重解析点
+> 不会被跟随，重复路径只哈希一次。最多哈希前 1000 个文件，状态行会说明省略了多少。
+
+### Verify a pasted digest / 校验粘贴的摘要
+
+Paste a bare hex or base64 digest, or a whole GNU/SFV line, into **Expected** and press
+**Check**. With **Current file only** clear the digest is compared against every file;
+tick it to compare only with the selected row. The status line names the matched file and
+algorithm after the counters.
+
+> 把裸十六进制/base64 摘要或整条 GNU/SFV 行粘贴到 **Expected**，点 **Check**。
+> 不勾 **Current file only** 时与全部文件比较；勾选后只比较当前选中行。状态行会在计数之后
+> 说明命中的文件与算法。
+
+### Verify a checksum file / 用校验和文件校验
+
+Press **Verify...** and choose a checksum file. The status line names the source and reports
+entries that matched no file, malformed lines, and unreadable checksum files.
+
+> 点 **Verify...** 选择校验和文件。状态行会写明来源，并报告没有匹配到文件的条目、
+> 无法解析的行以及不可读的校验和文件。
+
+### Interpret a checksum file as a manifest / 把校验和文件当清单
+
+Select exactly one checksum file whose extension is recognised (`*.sha256`, `*.md5`,
+`*.sha1`, `*.sha512`, `*.sfv`, `*.hash`, and the other registered algorithm extensions).
+The page parses it, hashes the files it lists, and uses its digests as the expected values.
+Relative entries resolve against the checksum file's directory; a listed file that no
+longer exists appears as an error row. The status line says `interpreted as sumfile`, and
+the extension can temporarily enable the algorithm it names — this is never written to
+the saved settings. In Settings, **Also hash the checksum file itself** controls whether
+the manifest joins the scan, and **Use only the algorithm from the file extension** controls
+whether the inferred algorithm replaces or is added to the enabled set. A `.hash` file names
+no single algorithm, so it keeps the enabled set.
+
+> 只选中一个扩展名受支持的校验和文件（`*.sha256`、`*.md5`、`*.sha1`、`*.sha512`、
+> `*.sfv`、`*.hash` 等已注册的算法扩展名）。页面会解析它、哈希其中列出的文件，并把清单里的
+> 摘要作为期望值。相对条目相对校验和文件所在目录解析；清单中已不存在的文件会显示为错误行。
+> 状态行会写 `interpreted as sumfile`，扩展名可临时启用它对应的算法——这**不会**写进已保存
+> 的设置。设置里的 **Also hash the checksum file itself** 控制清单文件本身是否也参与扫描，
+> **Use only the algorithm from the file extension** 控制推断算法是替换还是加入当前算法集合。
+> `.hash` 不指向单一算法，因此保持当前算法集合。
+
+### Sidecar checksum files / 旁边的校验和文件
+
+Turn on **Look for checksum files next to the hashed files**. For each file the page looks
+for `<file>.<extension>`, using the extensions of the algorithms that are actually enabled
+(`sfv` is included when CRC32 is enabled). A sidecar entry that names another file is
+counted as unmatched and is not used; malformed or unreadable sidecars are reported on the
+status line. In manifest mode sidecars are not consulted, because the manifest already
+supplies the expectations.
+
+> 打开 **Look for checksum files next to the hashed files**。页面会为每个文件查找
+> `<文件>.<扩展名>`，只使用实际启用的算法扩展名（CRC32 启用时包括 `sfv`）。sidecar 中
+> 指向其它文件的条目会按 unmatched 计数且不会被采用；无法解析或不可读的 sidecar 会在状态行
+> 报告。清单模式下不再读取 sidecar，因为清单本身已经提供了期望值。
+
+### Clipboard check / 剪贴板校验
+
+Turn on **Check a hash copied to the clipboard** to let the page use a digest you copied
+before opening the page. When the digest length has no enabled algorithm, the algorithms
+of that length are enabled for this page only. The check runs after a complete scan, and
+only when the Expected box is empty and no other verification source is in effect. It is
+off by default and is read once, when the page opens.
+
+> 打开 **Check a hash copied to the clipboard** 后，页面可以使用你在打开属性页之前复制的
+> 摘要。若该摘要长度没有对应的已启用算法，则只为当前页面临时启用该长度的算法。校验在扫描
+> 正常完成后执行，且仅当 Expected 输入框为空、没有其它校验来源时生效。该选项默认关闭，
+> 剪贴板只在页面打开时读取一次。
+
+### Export and settings / 导出与设置
+
+The format selector chooses what **Export...** writes and what **Copy checksums** puts on
+the clipboard. **Settings...** holds the algorithms, display colours, verification,
+checksum-file and export options. Colours, case and the monospace choice apply without
+re-hashing; changing the algorithm set or sidecar lookup re-runs the scan.
+
+> 格式下拉框决定 **Export...** 写出的内容和 **Copy checksums** 放到剪贴板的内容。
+> **Settings...** 里包含算法、显示颜色、校验、校验和文件与导出选项。颜色、大小写和等宽字体
+> 改动会立即生效而不重新哈希；修改算法集合或 sidecar 查找会重新扫描。
 
 ## Algorithms / 算法
 
@@ -512,6 +623,19 @@ scope.
 
 > **门禁：** `cargo xtask check`，外加清单模式与校验范围的真实页面测试。
 
+**Status: done — manual acceptance passed in a real `explorer.exe` Properties dialog on
+2026-10-24, and the automated gate is green.** The accepted flows cover a single selected
+checksum file being interpreted as a manifest, the extension temporarily selecting the
+algorithm (without changing the saved settings), strict sidecar matching, the all-files /
+current-file verification scope with the matched file and algorithm in the status line,
+the opt-in clipboard check, the new settings at 150%/200% DPI, and a clean close with
+`explorer.exe` still running.
+
+> **状态：已完成——2026-10-24 已在真实 `explorer.exe` 属性对话框中通过人工验收，自动门禁通过。**
+> 验收覆盖：单选校验和文件进入清单模式、扩展名临时选择算法（不改变已保存设置）、严格
+> sidecar 匹配、「全部文件 / 当前文件」校验作用域与状态行命中的文件×算法、可选的剪贴板
+> 自动校验、150%/200% DPI 下的新增设置项，以及关闭属性对话框后 `explorer.exe` 仍存活。
+
 ### Phase 7 — context menu, standalone mode, file associations / 右键菜单、独立模式、文件关联
 
 `IContextMenu`, a resizable windowed host that reuses the page, a standalone executable,
@@ -569,7 +693,7 @@ shipped file), and an install→use→uninstall pass on a clean VM.
 | Phase 3 property sheet page / 第三阶段属性页 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
 | Phase 4 checksum files, verification and settings / 第四阶段 —— 校验和文件、校验与设置 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
 | Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ✅ done, automated gate green, manual visual acceptance passed in a real explorer.exe Properties dialog on 2026-10-23 / 已完成，自动门禁通过，2026-10-23 已在真实 explorer.exe 属性对话框中通过人工视觉验收 |
-| Phase 6 workflows / 第六阶段 —— 工作流 | ⬜ not started / 未开始 |
+| Phase 6 workflows / 第六阶段 —— 工作流 | ✅ done, manual acceptance passed in a real explorer.exe Properties dialog on 2026-10-24 / 已完成，2026-10-24 已在真实 explorer.exe 属性对话框中通过人工验收 |
 | Phase 7 context menu, standalone mode, file associations / 第七阶段 —— 右键菜单、独立模式、文件关联 | ⬜ not started / 未开始 |
 | Phase 8 localization and optional network features / 第八阶段 —— 本地化与可选联网 | ⬜ not started / 未开始 |
 | Phase 9 release / 第九阶段 —— 发布 | ⬜ not started / 未开始 |

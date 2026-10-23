@@ -37,14 +37,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
-    LIST_VIEW_ITEM_STATE_FLAGS, LVIF_STATE, LVIS_SELECTED, LVITEMW, LVKF_CONTROL,
-    LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW, LVM_SETITEMSTATE, LVN_KEYDOWN,
-    NM_DBLCLK, NMHDR, NMLISTVIEW, NMLVKEYDOWN,
+    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, LIST_VIEW_ITEM_STATE_FLAGS, LVIF_STATE,
+    LVIS_SELECTED, LVITEMW, LVKF_CONTROL, LVM_GETCOLUMNWIDTH, LVM_GETITEMCOUNT, LVM_GETITEMTEXTW,
+    LVM_SETITEMSTATE, LVN_KEYDOWN, NM_DBLCLK, NMHDR, NMLISTVIEW, NMLVKEYDOWN,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_CLICK, CreateDialogParamW, DestroyWindow, GetDlgItem, GetNextDlgTabItem, IsWindow,
-    PostMessageW, SendMessageW, SetWindowTextW, WM_CLOSE, WM_NOTIFY,
+    BM_CLICK, CreateDialogParamW, DestroyWindow, GetDlgItem, GetNextDlgTabItem, GetWindowTextW,
+    IsWindow, PostMessageW, SendMessageW, SetWindowTextW, WM_CLOSE, WM_NOTIFY,
 };
 use windows::core::{PCWSTR, w};
 
@@ -258,6 +258,27 @@ impl HostedPage {
                 Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
             );
         }
+    }
+
+    /// Tick or untick one of the page's check boxes.
+    fn set_checked(&self, id: i32, checked: bool) {
+        let state = if checked { BST_CHECKED } else { BST_UNCHECKED };
+        // SAFETY: `id` names a check box in this page's template.
+        unsafe {
+            let _ = CheckDlgButton(self.hwnd, id, state);
+        }
+        pump();
+    }
+
+    /// The text of an arbitrary control on the page.
+    fn control_text(&self, id: i32) -> String {
+        let control = self.control(id);
+        let mut buffer = [0u16; 512];
+        // SAFETY: the buffer is a live local and the call writes at most its
+        // length; `control` belongs to this dialog.
+        let length = unsafe { GetWindowTextW(control, &mut buffer) };
+        let length = length.max(0) as usize;
+        String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
     }
 
     /// Ask the page to sort by one column, as the header subclass would.
@@ -1409,6 +1430,558 @@ fn a_column_header_click_sorts_the_rows() {
     page.sort_by(3); // descending
     assert_eq!(page.cell(0, 3), "b.bin");
     assert_eq!(page.cell(1, 3), "a.bin");
+    page.close();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: manifests, sidecar strictness, verification scope, clipboard
+// ---------------------------------------------------------------------------
+
+/// The core manifest workflow: a single `.sha256` file is interpreted, the files
+/// it lists are hashed, and its digest decides the colour. The extension's
+/// algorithm is enabled for this scan only.
+#[test]
+fn a_single_checksum_file_is_interpreted_as_a_manifest() {
+    let dir = TempDir::new("manifest");
+    let good = b"manifest good bytes";
+    let bad = b"manifest bad bytes";
+    dir.file("good.bin", good);
+    dir.file("bad.bin", bad);
+    let sumfile = dir.file(
+        "sums.sha256",
+        format!(
+            "{}  good.bin\n{}  bad.bin\n",
+            digest_hex("SHA-256", good),
+            "0".repeat(64)
+        )
+        .as_bytes(),
+    );
+
+    // Only MD5 is configured, so SHA-256 can only have come from the extension.
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("MD5"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![sumfile], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 0), "SHA-256");
+    assert_eq!(page.cell(0, 2), "matched");
+    assert_eq!(page.cell(1, 0), "SHA-256");
+    assert_eq!(page.cell(1, 2), "mismatch");
+    assert!(
+        page.status_text().contains("interpreted as sumfile"),
+        "status must say the file was interpreted, got {:?}",
+        page.status_text()
+    );
+    assert!(page.status_text().contains("SHA-256"));
+
+    // The inference is temporary: the page's settings still say MD5 only.
+    // SAFETY: `page` owns this state until `close`.
+    let configured = unsafe { (*page.state).settings.algorithms.clone() };
+    assert_eq!(configured, enabled_only("MD5"));
+
+    page.close();
+}
+
+/// `SumfileAlgorithmOnly` off turns the extension's algorithm into an addition
+/// rather than a replacement.
+#[test]
+fn sumfile_algorithm_only_off_keeps_the_configured_algorithms() {
+    let dir = TempDir::new("manifest-union");
+    let contents = b"manifest union bytes";
+    dir.file("payload.bin", contents);
+    let sumfile = dir.file(
+        "sums.sha256",
+        sumfile_body("SHA-256", contents, "payload.bin").as_bytes(),
+    );
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("MD5"),
+        sumfile_algorithm_only: false,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![sumfile], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 0), "MD5", "table order puts MD5 first");
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert_eq!(page.cell(1, 0), "SHA-256");
+    assert_eq!(page.cell(1, 2), "matched");
+
+    page.close();
+}
+
+/// `HashSumfileToo` hashes the manifest itself as well; it is the first job.
+#[test]
+fn hashing_the_sumfile_too_adds_it_as_a_row() {
+    let dir = TempDir::new("manifest-self");
+    let contents = b"manifest self bytes";
+    dir.file("payload.bin", contents);
+    let sumfile = dir.file(
+        "sums.sha256",
+        sumfile_body("SHA-256", contents, "payload.bin").as_bytes(),
+    );
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        hash_sumfile_too: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![sumfile], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 3), "sums.sha256");
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert_eq!(page.cell(1, 3), "payload.bin");
+    assert_eq!(page.cell(1, 2), "matched");
+
+    page.close();
+}
+
+/// SFV carries CRC32, which has no algorithm-owned extension; the manifest
+/// inference special-cases it.
+#[test]
+fn an_sfv_manifest_uses_crc32() {
+    let dir = TempDir::new("manifest-sfv");
+    let contents = b"sfv manifest bytes";
+    let data = dir.file("payload.bin", contents);
+    let crc = {
+        let mut hasher = rusthashtab_hash::registry::make("CRC32").expect("CRC32 exists");
+        hasher.update(contents);
+        rusthashtab_sumfile::export::to_hex(&hasher.finalize(), true)
+    };
+    let sumfile = dir.file("sums.sfv", format!("payload.bin {crc}\n").as_bytes());
+    assert!(data.is_file());
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![sumfile], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 0), "CRC32");
+    assert_eq!(page.cell(0, 2), "matched");
+
+    page.close();
+}
+
+/// An ordinary text file that happens to contain checksum-like lines is not a
+/// manifest: the extension gate keeps the page from hashing unrelated files.
+#[test]
+fn an_unrecognized_file_is_hashed_normally() {
+    let dir = TempDir::new("not-manifest");
+    let contents = b"normal bytes";
+    dir.file("payload.bin", contents);
+    let notes = dir.file(
+        "notes.txt",
+        sumfile_body("SHA-256", contents, "payload.bin").as_bytes(),
+    );
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![notes], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    assert_eq!(
+        page.cell(0, 3),
+        "notes.txt",
+        "the selected file itself is hashed"
+    );
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(!page.status_text().contains("interpreted as sumfile"));
+
+    page.close();
+}
+
+/// A checksum file with only a bare digest has no file name to act as a
+/// manifest; it is hashed as the selected file.
+#[test]
+fn a_bare_digest_sumfile_is_not_a_manifest() {
+    let dir = TempDir::new("bare-manifest");
+    let sumfile = dir.file(
+        "payload.sha256",
+        format!("{}\n", "AB".repeat(32)).as_bytes(),
+    );
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![sumfile], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 3), "payload.sha256");
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(!page.status_text().contains("interpreted as sumfile"));
+
+    page.close();
+}
+
+/// A manifest can name a file that no longer exists; the row must be an error,
+/// not a silent omission.
+#[test]
+fn a_manifest_with_a_missing_listed_file_shows_an_error_row() {
+    let dir = TempDir::new("manifest-missing");
+    let good = b"still here";
+    dir.file("good.bin", good);
+    let sumfile = dir.file(
+        "sums.sha256",
+        format!(
+            "{}  good.bin\n{}  gone.bin\n",
+            digest_hex("SHA-256", good),
+            "0".repeat(64)
+        )
+        .as_bytes(),
+    );
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![sumfile], settings);
+    page.wait_for_rows(2);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let status = page.status_text();
+        if status.contains("1 error") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the missing listed file never became an error: {status:?}"
+        );
+        pump();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let paths: Vec<String> = (0..2).map(|row| page.cell(row, 3)).collect();
+    assert!(paths.iter().any(|path| path == "gone.bin"));
+    let digests: Vec<String> = (0..2).map(|row| page.cell(row, 1)).collect();
+    assert!(digests.iter().any(|digest| digest.starts_with("Error")));
+
+    page.close();
+}
+
+/// A sidecar that names another file does not verify this one, and the page says
+/// so instead of leaving a silent "not checked".
+#[test]
+fn a_sidecar_naming_another_file_is_unmatched_and_visible() {
+    let dir = TempDir::new("sidecar-strict");
+    let contents = b"sidecar strict bytes";
+    let file = dir.file("payload.bin", contents);
+    std::fs::write(
+        dir.path().join("payload.bin.sha256"),
+        sumfile_body("SHA-256", contents, "other.bin"),
+    )
+    .expect("the sidecar must be writable");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_status_contains("1 entries matched no file");
+
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(
+        page.status_text()
+            .contains("checksum files beside the hashed files")
+    );
+
+    page.close();
+}
+
+/// A sidecar for an algorithm that is not being hashed is not read at all; if it
+/// were, its digest could be compared against a different algorithm of the same
+/// length.
+#[test]
+fn a_sidecar_for_a_disabled_algorithm_is_not_read() {
+    let dir = TempDir::new("sidecar-disabled");
+    let contents = b"sidecar disabled bytes";
+    let file = dir.file("payload.bin", contents);
+    std::fs::write(
+        dir.path().join("payload.bin.sha256"),
+        sumfile_body("SHA-256", contents, "payload.bin"),
+    )
+    .expect("the sidecar must be writable");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("MD5"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 0), "MD5");
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(!page.status_text().contains("checksum files beside"));
+
+    page.close();
+}
+
+/// A malformed sidecar is visible rather than silently ignored.
+#[test]
+fn a_malformed_sidecar_is_visible() {
+    let dir = TempDir::new("sidecar-malformed");
+    let file = dir.file("payload.bin", b"bytes");
+    std::fs::write(
+        dir.path().join("payload.bin.sha256"),
+        b"this is not a checksum line\n",
+    )
+    .expect("the sidecar must be writable");
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_status_contains("malformed lines ignored");
+
+    assert_eq!(page.cell(0, 2), "not checked");
+
+    page.close();
+}
+
+/// Current-file scope is explicit: only the selected row is compared, and the
+/// other file stays "not checked" rather than being accused of a mismatch.
+#[test]
+fn pasting_with_current_file_scope_leaves_other_files_unchecked() {
+    let dir = TempDir::new("scope-current");
+    let first = dir.file("a.bin", b"first");
+    let second_contents = b"second";
+    let second = dir.file("b.bin", second_contents);
+    assert!(first.is_file());
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![first, second], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+    page.select_row(1);
+    page.set_checked(resource::IDC_HASH_CURRENT_ONLY, true);
+
+    page.set_text(
+        resource::IDC_HASH_EXPECTED,
+        &digest_hex("SHA-256", second_contents),
+    );
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(
+        page.cell(0, 2),
+        "not checked",
+        "the other file was not targeted"
+    );
+    assert_eq!(page.cell(1, 2), "matched");
+    assert!(page.status_text().contains("current file"));
+
+    page.close();
+}
+
+/// With the default all-files scope, the status line names the file and algorithm
+/// that matched, not just the count.
+#[test]
+fn pasting_a_digest_lists_the_matched_file_and_algorithm() {
+    let dir = TempDir::new("scope-all");
+    let first_contents = b"first match";
+    let first = dir.file("a.bin", first_contents);
+    let second = dir.file("b.bin", b"second no match");
+    assert!(second.is_file());
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![first, second], settings);
+    page.wait_for_rows(2);
+    page.wait_for_finished();
+
+    page.set_text(
+        resource::IDC_HASH_EXPECTED,
+        &digest_hex("SHA-256", first_contents),
+    );
+    page.click(resource::IDC_HASH_CHECK);
+    pump();
+
+    assert_eq!(page.cell(0, 2), "matched");
+    assert_eq!(page.cell(1, 2), "mismatch");
+    let status = page.status_text();
+    assert!(status.contains("1 matched"), "got {status:?}");
+    assert!(status.contains("1 mismatched"), "got {status:?}");
+    assert!(
+        status.contains("matched: a.bin \u{00d7} SHA-256"),
+        "the status must name the matched file and algorithm, got {status:?}"
+    );
+
+    page.close();
+}
+
+/// Clipboard verification is opt-in; with the setting off the page behaves as if
+/// the clipboard were not there.
+#[test]
+fn clipboard_check_is_opt_in() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("clipboard-off");
+    let contents = b"clipboard bytes";
+    let file = dir.file("payload.bin", contents);
+    let digest = digest_hex("SHA-256", contents);
+    assert!(rusthashtab_ui::clipboard::copy(HWND::default(), &digest));
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        verify_from_clipboard: false,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    assert_eq!(page.cell(0, 2), "not checked");
+    assert!(page.control_text(resource::IDC_HASH_EXPECTED).is_empty());
+
+    page.close();
+}
+
+/// With the setting on, a digest copied before the page opens is applied after
+/// the scan finishes -- through the same Check path the user would use.
+#[test]
+fn clipboard_check_runs_after_a_complete_scan() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("clipboard-on");
+    let contents = b"clipboard auto bytes";
+    let file = dir.file("payload.bin", contents);
+    let digest = digest_hex("SHA-256", contents);
+    assert!(rusthashtab_ui::clipboard::copy(HWND::default(), &digest));
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        verify_from_clipboard: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+
+    let deadline = Instant::now() + DEADLINE;
+    while page.cell(0, 2) != "matched" {
+        assert!(
+            Instant::now() < deadline,
+            "the clipboard digest was never applied; status {:?}",
+            page.status_text()
+        );
+        pump();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(page.control_text(resource::IDC_HASH_EXPECTED), digest);
+
+    page.close();
+}
+
+/// When the clipboard digest's length has no enabled algorithm, the algorithms of
+/// that length are enabled for this page only; the saved setting is untouched.
+#[test]
+fn clipboard_check_enables_the_matching_length_algorithm() {
+    let _clipboard = CLIPBOARD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = TempDir::new("clipboard-enable");
+    let contents = b"clipboard enable bytes";
+    let file = dir.file("payload.bin", contents);
+    let digest = digest_hex("SHA-256", contents);
+    assert!(rusthashtab_ui::clipboard::copy(HWND::default(), &digest));
+
+    // Only MD5 is configured; no enabled algorithm can produce a 32-byte digest,
+    // so the page has to enable the same-length algorithms for this scan.
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("MD5"),
+        verify_from_clipboard: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+
+    let expected_rows = rusthashtab_hash::ALGORITHMS
+        .iter()
+        .filter(|algorithm| algorithm.output_len == 32 && algorithm.is_implemented())
+        .count();
+    // MD5 stays enabled; the same-length algorithms are added to it.
+    page.wait_for_rows(expected_rows + 1);
+
+    // SAFETY: `page` owns this state until `close`.
+    let enabled = unsafe { (*page.state).enabled.clone() };
+    // SAFETY: as above.
+    let configured = unsafe { (*page.state).settings.algorithms.clone() };
+    assert_eq!(
+        configured,
+        enabled_only("MD5"),
+        "the setting must not change"
+    );
+    assert_eq!(
+        enabled.iter().filter(|on| **on).count(),
+        expected_rows + 1,
+        "MD5 plus the same-length algorithms should be enabled for this page"
+    );
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let sha_row = (0..page.row_count())
+            .find(|row| page.cell(*row as i32, 0) == "SHA-256")
+            .expect("SHA-256 is one of the same-length algorithms");
+        if page.cell(sha_row as i32, 2) == "matched" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clipboard digest was never applied; status {:?}",
+            page.status_text()
+        );
+        pump();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    page.close();
+}
+
+/// The display-only case setting is visible immediately: lower-case output is
+/// what the page shows when the setting asks for it.
+#[test]
+fn display_uppercase_setting_is_visible() {
+    let dir = TempDir::new("display-case");
+    let contents = b"case bytes";
+    let expected = digest_hex("SHA-256", contents).to_lowercase();
+    let file = dir.file("payload.bin", contents);
+
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        display_uppercase: false,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+
+    assert_eq!(page.cell(0, 1), expected);
+
     page.close();
 }
 

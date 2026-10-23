@@ -38,6 +38,7 @@ pub mod dialog;
 pub mod export;
 #[cfg(windows)]
 pub mod listview;
+pub mod manifest;
 #[cfg(windows)]
 pub mod page;
 pub mod readout;
@@ -135,6 +136,58 @@ pub enum ScanPhase {
     Finished,
     /// The user asked to stop, or the scan reported that it could not finish.
     Cancelled,
+}
+
+/// How a settings change applies to the page that is already open.
+///
+/// A settings dialog returns one complete [`rusthashtab_settings::Settings`], but
+/// not every difference means the files have to be hashed again: colours, case
+/// and the monospace choice only change how the existing rows are drawn. The page
+/// asks this classification instead of restarting on every save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsChange {
+    /// Nothing the page is currently showing depends on the changed fields.
+    None,
+    /// Rebuild and repaint the existing rows; the scan keeps running.
+    Redraw,
+    /// The set of files to hash, or the algorithms to hash them with, changed.
+    Rescan,
+}
+
+/// Classify what a settings update means for the open page.
+///
+/// `manifest_mode` is whether the running scan was started by interpreting a
+/// checksum file as a manifest. The manifest options are part of the plan that
+/// produced the job list, so changing them matters only when such a plan exists;
+/// outside a manifest scan they name a future page's behaviour and must not cost
+/// a rescan.
+#[must_use]
+pub fn settings_change(
+    current: &rusthashtab_settings::Settings,
+    updated: &rusthashtab_settings::Settings,
+    manifest_mode: bool,
+) -> SettingsChange {
+    if enabled_algorithms(current) != enabled_algorithms(updated)
+        || current.look_for_sumfiles != updated.look_for_sumfiles
+    {
+        return SettingsChange::Rescan;
+    }
+
+    if manifest_mode
+        && (current.hash_sumfile_too != updated.hash_sumfile_too
+            || current.sumfile_algorithm_only != updated.sumfile_algorithm_only)
+    {
+        return SettingsChange::Rescan;
+    }
+
+    if current.display_uppercase != updated.display_uppercase
+        || current.display_monospace != updated.display_monospace
+        || current.colours != updated.colours
+    {
+        return SettingsChange::Redraw;
+    }
+
+    SettingsChange::None
 }
 
 /// Counters shown in the status line, in the order the UI displays them.
@@ -245,6 +298,13 @@ pub struct DialogState {
     /// what the status line will show once the match lands.
     #[cfg(windows)]
     pub verify_source: Option<String>,
+    /// A digest found on the clipboard when the page opened, waiting for the scan
+    /// to finish.
+    ///
+    /// `None` when the setting is off, the clipboard held no usable digest, or a
+    /// complete scan has already consumed it. The page never re-reads the
+    /// clipboard: what the user copied when they opened the page is the request.
+    pub clipboard_text: Option<String>,
 }
 
 impl DialogState {
@@ -295,6 +355,7 @@ impl DialogState {
             tooltip_status: Vec::new(),
             #[cfg(windows)]
             verify_source: None,
+            clipboard_text: None,
         }
     }
 
@@ -632,6 +693,137 @@ mod tests {
         assert_eq!(
             UiError::PageRefused.to_hresult(),
             windows::Win32::Foundation::E_FAIL
+        );
+    }
+
+    /// A display-only change repaints instead of hashing everything again.
+    #[test]
+    fn display_only_settings_redraw() {
+        let current = rusthashtab_settings::Settings::default();
+
+        let uppercase = rusthashtab_settings::Settings {
+            display_uppercase: false,
+            ..current.clone()
+        };
+        assert_eq!(
+            settings_change(&current, &uppercase, false),
+            SettingsChange::Redraw
+        );
+
+        let monospace = rusthashtab_settings::Settings {
+            display_monospace: false,
+            ..current.clone()
+        };
+        assert_eq!(
+            settings_change(&current, &monospace, false),
+            SettingsChange::Redraw
+        );
+
+        let default_colours = rusthashtab_settings::RowColours::default();
+        let coloured = rusthashtab_settings::Settings {
+            colours: rusthashtab_settings::RowColours {
+                mismatched: rusthashtab_settings::RowColour {
+                    background: 0x0012_3456,
+                    ..default_colours.mismatched
+                },
+                ..default_colours
+            },
+            ..current.clone()
+        };
+        assert_eq!(
+            settings_change(&current, &coloured, false),
+            SettingsChange::Redraw
+        );
+    }
+
+    /// Changing what is hashed restarts the scan.
+    #[test]
+    fn scan_affecting_settings_rescan() {
+        let current = rusthashtab_settings::Settings::default();
+
+        let mut algorithms = current.algorithms.clone();
+        algorithms.resize(rusthashtab_hash::ALGORITHMS.len(), false);
+        algorithms[rusthashtab_hash::ALGORITHMS.len() - 1] = true;
+        let changed_algorithms = rusthashtab_settings::Settings {
+            algorithms,
+            ..current.clone()
+        };
+        assert_eq!(
+            settings_change(&current, &changed_algorithms, false),
+            SettingsChange::Rescan
+        );
+
+        let sidecars = rusthashtab_settings::Settings {
+            look_for_sumfiles: true,
+            ..current.clone()
+        };
+        assert_eq!(
+            settings_change(&current, &sidecars, false),
+            SettingsChange::Rescan
+        );
+    }
+
+    /// The manifest options only affect a manifest scan; outside one they are a
+    /// preference for the next page and must not restart this one.
+    #[test]
+    fn manifest_options_rescan_only_in_manifest_mode() {
+        let current = rusthashtab_settings::Settings::default();
+        let updated = rusthashtab_settings::Settings {
+            hash_sumfile_too: true,
+            sumfile_algorithm_only: false,
+            ..current.clone()
+        };
+
+        assert_eq!(
+            settings_change(&current, &updated, false),
+            SettingsChange::None
+        );
+        assert_eq!(
+            settings_change(&current, &updated, true),
+            SettingsChange::Rescan
+        );
+    }
+
+    /// Options that only affect the next Check/Export run do not need any page
+    /// work at all.
+    #[test]
+    fn verification_and_export_options_do_nothing() {
+        let current = rusthashtab_settings::Settings::default();
+        let updated = rusthashtab_settings::Settings {
+            verify_strict: true,
+            verify_auto_format: true,
+            verify_from_clipboard: true,
+            sumfile_uppercase: false,
+            sumfile_unix_endings: false,
+            sumfile_double_space: true,
+            sumfile_forward_slashes: false,
+            sumfile_dot_hash_compatible: false,
+            sumfile_banner: false,
+            sumfile_banner_date: true,
+            ..current.clone()
+        };
+
+        assert_eq!(
+            settings_change(&current, &updated, false),
+            SettingsChange::None
+        );
+        assert_eq!(
+            settings_change(&current, &updated, true),
+            SettingsChange::None
+        );
+    }
+
+    /// An unchanged settings object must not trigger work.
+    #[test]
+    fn unchanged_settings_do_nothing() {
+        let current = rusthashtab_settings::Settings::default();
+        assert_eq!(
+            settings_change(&current, &current, false),
+            SettingsChange::None
+        );
+        assert_eq!(
+            settings_change(&current, &current, true),
+            SettingsChange::None
         );
     }
 }

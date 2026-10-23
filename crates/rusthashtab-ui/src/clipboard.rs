@@ -1,4 +1,4 @@
-//! Putting the selected rows on the clipboard as text.
+//! Reading and writing clipboard text.
 //!
 //! # Ownership, and the one rule that matters
 //!
@@ -13,6 +13,25 @@
 //! [`HandedOver`] has no way to free it. Every early return before that point frees
 //! the handle, and every return after it does not, because it cannot.
 //!
+//! The reading direction has the mirror-image rule: the clipboard owns the block
+//! [`read_text`] locks, so the lock is taken and released around the copy and the
+//! handle is never freed. The clipboard is closed on every path in both
+//! directions -- it is a machine-wide lock, and failing to release it would leave
+//! every other application unable to copy until this process exits.
+//!
+//! # Reading is bounded and total
+//!
+//! [`read_text`] exists for the one flow that needs the clipboard as input
+//! (verifying against a digest the user has already copied). It never fails
+//! visibly: a clipboard that another process holds, no text on it, empty text, or
+//! a block larger than [`MAX_CLIPBOARD_TEXT_UNITS`] are all `None`, which the
+//! caller treats the same way as "there was nothing on the clipboard". The bound
+//! exists because the block was allocated by another process: a shell extension
+//! must not copy an unbounded amount of another process's data into the
+//! property-sheet thread's heap on the strength of a size it did not choose.
+//! Refusing an oversized block rather than truncating it matters too -- a
+//! truncated digest would compare equal to the wrong value.
+//!
 //! # Why the text is tab separated
 //!
 //! The page is a table, and the two things people do with it are paste into a
@@ -23,11 +42,13 @@
 #![cfg(windows)]
 
 use crate::ListRow;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
 /// A global-memory handle the system now owns.
@@ -228,18 +249,151 @@ unsafe fn fill_clipboard(text: &str) -> bool {
     true
 }
 
+/// Most UTF-16 units [`read_text`] will accept from the clipboard.
+///
+/// A whole checksum line is a few hundred bytes, so 32 Ki units is far past any
+/// paste the page can use. The cap is counted in units rather than bytes because
+/// `CF_UNICODETEXT` is an array of `u16`, and because the terminator is one of
+/// them: the longest accepted text is one unit shorter than the cap.
+pub const MAX_CLIPBOARD_TEXT_UNITS: usize = 32 * 1024;
+
+/// Read the clipboard's Unicode text, if it holds usable, bounded text.
+///
+/// Every failure here is an ordinary condition on a machine where every
+/// application shares one clipboard: [`read_text`] returns `None` when the
+/// clipboard cannot be opened (another process holds it), when it holds no
+/// `CF_UNICODETEXT`, when the block cannot be locked or reports no size, when the
+/// text is empty, and when it is at least [`MAX_CLIPBOARD_TEXT_UNITS`] long or has
+/// no terminator within that bound. There is no error type because the caller has
+/// nothing better to do in those cases than carry on without a clipboard source.
+///
+/// `owner` is the window that becomes the clipboard owner while it is open; the
+/// page passes its own window. Win32 allows a null handle too, which is what the
+/// tests use. The clipboard is closed on every path.
+pub fn read_text(owner: HWND) -> Option<String> {
+    // SAFETY: `owner` is the page's window, a window on this thread (or null,
+    // which Win32 allows). `OpenClipboard` fails rather than faults when another
+    // process holds the clipboard, so the returned error is checked and not
+    // asserted away.
+    if unsafe { OpenClipboard(Some(owner)) }.is_err() {
+        return None;
+    }
+
+    // SAFETY: the clipboard was opened above, and the helper only locks and
+    // unlocks the block -- the clipboard, not this code, owns the handle. Every
+    // path out of the helper is followed by the close directly below, so the
+    // machine-wide lock cannot be left held.
+    let text = unsafe { read_open_clipboard() };
+    // SAFETY: the clipboard is open on this thread and is closed exactly once
+    // here; `CloseClipboard` takes no arguments and cannot fault on an open
+    // clipboard.
+    let _ = unsafe { CloseClipboard() };
+    text
+}
+
+/// Read `CF_UNICODETEXT` with the clipboard already open.
+///
+/// The block is locked only for the duration of the copy, and the lock is
+/// released before returning: the pointer is valid only while the clock is
+/// stopped in this way, because the system may otherwise move or free the block.
+///
+/// # Safety
+///
+/// The clipboard must be open on the calling thread, which is what
+/// [`OpenClipboard`] establishes and [`CloseClipboard`] undoes.
+unsafe fn read_open_clipboard() -> Option<String> {
+    // SAFETY: the caller opened the clipboard. `CF_UNICODETEXT` either returns a
+    // handle owned by the clipboard (which this code must not free) or fails.
+    let handle = unsafe { GetClipboardData(CF_UNICODETEXT.0 as u32) }.ok()?;
+    let global = HGLOBAL(handle.0);
+
+    // SAFETY: `global` is the clipboard's handle from the call above and the
+    // clipboard is still open, so the block is valid to lock. Locking does not
+    // take ownership; the handle stays the clipboard's to free.
+    let locked = unsafe { GlobalLock(global) };
+    if locked.is_null() {
+        return None;
+    }
+
+    // SAFETY: `global` is the handle the clipboard owns and `locked` is the
+    // pointer just obtained for it; `GlobalSize` reports the block's size in
+    // bytes and returns zero for a handle this API does not own, which the
+    // bounded reader treats as empty.
+    let bytes = unsafe { GlobalSize(global) };
+    // SAFETY: `locked` is a live pointer into the locked block and `bytes` is the
+    // size reported for that same block, so the pointer and unit count satisfy
+    // `bounded_text`'s contract.
+    let text = unsafe { bounded_text(locked.cast::<u16>(), bytes / core::mem::size_of::<u16>()) };
+
+    // SAFETY: `locked` came from `GlobalLock` on this handle and is released
+    // exactly once here; the handle itself remains owned by the clipboard.
+    let _ = unsafe { GlobalUnlock(global) };
+    text
+}
+
+/// Turn at most [`MAX_CLIPBOARD_TEXT_UNITS`] units of clipboard data into a
+/// `String`, stopping at the NUL terminator.
+///
+/// `count` is the unit count `GlobalSize` reported for the locked block. Only the
+/// first [`MAX_CLIPBOARD_TEXT_UNITS`] units are ever examined. When no terminator
+/// appears in that window the text is at least the cap long, which is refused as
+/// oversized instead of being truncated: a partly-read digest would silently be
+/// compared against the wrong bytes, which is worse than not checking at all.
+///
+/// # Safety
+///
+/// `units` must point at `count` readable `u16` values that stay valid for the
+/// duration of the call. The caller's locked clipboard block provides exactly
+/// that; no other pointer satisfies the contract.
+unsafe fn bounded_text(units: *const u16, count: usize) -> Option<String> {
+    let window = count.min(MAX_CLIPBOARD_TEXT_UNITS);
+    if window == 0 {
+        return None;
+    }
+
+    // SAFETY: `window <= count`, so this slice stays inside the `count` readable
+    // units the caller guarantees, and the block cannot change underneath the
+    // slice because the caller holds it locked.
+    let units = unsafe { core::slice::from_raw_parts(units, window) };
+    let length = units.iter().position(|&unit| unit == 0)?;
+    if length == 0 {
+        return None;
+    }
+
+    // `from_utf16_lossy` is the right conversion for data from another process:
+    // an unpaired surrogate is that process's bug, and the worst it should cost
+    // the user is a replacement character, not a failed read.
+    Some(String::from_utf16_lossy(&units[..length]))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use rusthashtab_scan::MatchState;
     use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard};
 
     // Each test runs on its own thread, so this starts at zero for every test and
     // rows created in one test get the IDs 0, 1, ... -- which lets the assertions
     // address rows the way the page does without hand-writing an ID per call.
     thread_local! {
         static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The clipboard is one machine-wide resource, not one per test. Two tests
+    /// that write it concurrently can empty or overwrite each other's contents
+    /// between a `copy` and the read that is supposed to observe it, so every
+    /// test that touches it -- on either side -- takes this lock.
+    static CLIPBOARD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialize the current test, recovering from a lock poisoned by an earlier
+    /// failing test: one genuine failure should not turn every later clipboard
+    /// test into a different failure.
+    fn clipboard_guard() -> MutexGuard<'static, ()> {
+        CLIPBOARD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn row(
@@ -440,10 +594,9 @@ mod tests {
     /// puts a known string on the clipboard and reads it back through the OS.
     #[test]
     fn copying_transfers_a_handle_the_system_can_read_back() {
-        // The imports are local to the test: production code never reads the
-        // clipboard, only writes it.
-        use windows::Win32::Foundation::HGLOBAL;
-        use windows::Win32::System::DataExchange::GetClipboardData;
+        // The clipboard is machine-wide, so this must not race the other real
+        // clipboard tests.
+        let _clipboard = clipboard_guard();
 
         // A null owner is allowed for the clipboard APIs.
         let owner = HWND(core::ptr::null_mut());
@@ -452,7 +605,9 @@ mod tests {
             panic!("copy failed; the clipboard may be held by another process");
         }
 
-        // Read it back through the OS rather than from our own state.
+        // Read it back through the raw OS calls rather than through `read_text`:
+        // this test is about what a *different* process would see, so the reader
+        // whose own behaviour is under test must not be the observer here.
         // SAFETY: the clipboard is opened immediately below; `CF_UNICODETEXT`
         // returns the handle we put there.
         unsafe {
@@ -474,5 +629,86 @@ mod tests {
 
             assert_eq!(read, marker, "the clipboard text is not what was copied");
         }
+    }
+
+    /// The reading direction of the same real clipboard: what `copy` writes must
+    /// be what `read_text` returns, including non-ASCII text and embedded CRLF,
+    /// which is the shape a copied selection has.
+    #[test]
+    fn read_text_round_trips_what_was_copied() {
+        let _clipboard = clipboard_guard();
+
+        let owner = HWND(core::ptr::null_mut());
+        let marker = "SHA-256  file.bin\r\n\u{2022}\u{00e9}\u{4e2d}";
+        if !copy(owner, marker) {
+            panic!("copy failed; the clipboard may be held by another process");
+        }
+
+        assert_eq!(read_text(owner).as_deref(), Some(marker));
+    }
+
+    /// Empty text is not a verification source. `copy("")` writes only the NUL
+    /// terminator, and the reader must report "nothing here" rather than an empty
+    /// `String` that the caller would have to special-case.
+    #[test]
+    fn read_text_returns_none_for_empty_text() {
+        let _clipboard = clipboard_guard();
+
+        let owner = HWND(core::ptr::null_mut());
+        if !copy(owner, "") {
+            panic!("copy failed; the clipboard may be held by another process");
+        }
+
+        assert_eq!(read_text(owner), None);
+    }
+
+    /// A block past the cap is refused, not truncated. The terminator counts as a
+    /// unit, so the longest accepted *text* is one unit shorter than the cap --
+    /// pinned here from both sides so an off-by-one in the bound is a test
+    /// failure rather than a silently shortened digest.
+    #[test]
+    fn read_text_accepts_one_unit_under_the_cap_and_refuses_the_cap() {
+        let _clipboard = clipboard_guard();
+
+        let owner = HWND(core::ptr::null_mut());
+        let largest = "a".repeat(MAX_CLIPBOARD_TEXT_UNITS - 1);
+        if !copy(owner, &largest) {
+            panic!("copy failed; the clipboard may be held by another process");
+        }
+        assert_eq!(
+            read_text(owner).as_deref(),
+            Some(largest.as_str()),
+            "text that fits under the cap must be read in full"
+        );
+
+        let oversized = "a".repeat(MAX_CLIPBOARD_TEXT_UNITS);
+        if !copy(owner, &oversized) {
+            panic!("copy failed; the clipboard may be held by another process");
+        }
+        assert_eq!(
+            read_text(owner),
+            None,
+            "an oversized block must be refused, not truncated"
+        );
+    }
+
+    /// A clipboard with no text on it is not an error: the page simply has no
+    /// clipboard source. This is the state of a fresh desktop, and it must not be
+    /// distinguishable from "another process holds the clipboard" to the caller.
+    #[test]
+    fn read_text_returns_none_when_the_clipboard_holds_no_text() {
+        let _clipboard = clipboard_guard();
+
+        let owner = HWND(core::ptr::null_mut());
+        // SAFETY: the clipboard is opened immediately below and closed exactly
+        // once; emptying it without writing anything leaves it in the state a
+        // fresh desktop has -- openable and holding no text.
+        unsafe {
+            OpenClipboard(Some(owner)).expect("the clipboard must be openable");
+            EmptyClipboard().expect("the clipboard must be emptyable");
+            CloseClipboard().expect("the clipboard must close");
+        }
+
+        assert_eq!(read_text(owner), None);
     }
 }

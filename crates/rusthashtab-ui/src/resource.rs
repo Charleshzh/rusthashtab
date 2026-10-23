@@ -86,6 +86,12 @@ pub const IDC_SETTINGS_COLOUR_TEXT_ENABLED: i32 = 2120;
 pub const IDC_SETTINGS_COLOUR_BG_ENABLED: i32 = 2121;
 /// The hex/off label under the live colour sample.
 pub const IDC_SETTINGS_COLOUR_PREVIEW_LABEL: i32 = 2122;
+/// Also hash the checksum file itself when a selection is a manifest.
+pub const IDC_SETTINGS_HASH_SUMFILE: i32 = 2123;
+/// Restrict a manifest scan to the algorithm its extension names.
+pub const IDC_SETTINGS_SUMFILE_ALGORITHM_ONLY: i32 = 2124;
+/// Check a digest found on the clipboard after the scan finishes.
+pub const IDC_SETTINGS_VERIFY_CLIPBOARD: i32 = 2125;
 
 /// Identifiers the dialog templates declare, in declaration order.
 ///
@@ -176,6 +182,18 @@ pub(crate) const TEMPLATE_IDENTIFIERS: &[(&str, u16)] = &[
     (
         "IDC_SETTINGS_COLOUR_PREVIEW_LABEL",
         IDC_SETTINGS_COLOUR_PREVIEW_LABEL as u16,
+    ),
+    (
+        "IDC_SETTINGS_HASH_SUMFILE",
+        IDC_SETTINGS_HASH_SUMFILE as u16,
+    ),
+    (
+        "IDC_SETTINGS_SUMFILE_ALGORITHM_ONLY",
+        IDC_SETTINGS_SUMFILE_ALGORITHM_ONLY as u16,
+    ),
+    (
+        "IDC_SETTINGS_VERIFY_CLIPBOARD",
+        IDC_SETTINGS_VERIFY_CLIPBOARD as u16,
     ),
 ];
 
@@ -287,18 +305,63 @@ pub fn sumfile_source(path: &std::path::Path) -> String {
     format!("checksum file: {name}")
 }
 
+/// The source label for a checksum file that was interpreted as a manifest.
+///
+/// The file name alone, like [`sumfile_source`], plus the inferred algorithm when
+/// the extension named one. The wording is what tells the user the page did not
+/// just hash the selected file.
+pub fn manifest_source(path: &std::path::Path, inferred: Option<&str>) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    match inferred {
+        Some(algorithm) => format!("checksum file: {name} (interpreted as sumfile: {algorithm})"),
+        None => format!("checksum file: {name} (interpreted as sumfile)"),
+    }
+}
+
 /// The status line once a verification source is in effect.
 ///
 /// `base` is the ordinary counter summary -- the counts are still the important
 /// part -- and the suffix says what they were counted against. Appending rather
 /// than replacing keeps one status line instead of a second control.
-pub fn with_verification(base: String, source: &str, unmatched: usize, had_error: bool) -> String {
+pub fn with_verification(
+    base: String,
+    source: &str,
+    unmatched: usize,
+    had_error: bool,
+    unreadable: usize,
+) -> String {
     let mut text = format!("{base}  \u{2022}  {source}");
     if unmatched > 0 {
         text.push_str(&format!("  \u{2022}  {unmatched} entries matched no file"));
     }
     if had_error {
         text.push_str("  \u{2022}  malformed lines ignored");
+    }
+    if unreadable == 1 {
+        text.push_str("  \u{2022}  1 checksum file could not be read");
+    } else if unreadable > 1 {
+        text.push_str(&format!(
+            "  \u{2022}  {unreadable} checksum files could not be read"
+        ));
+    }
+    text
+}
+
+/// Append the first matched `文件 × 算法` to the status line.
+///
+/// The counters say how many files matched; this says *which* one, which is the
+/// difference between "3 matched" and "this file matched under SHA-256" when a
+/// digest is checked against a whole selection.
+pub fn with_match_detail(base: String, detail: &crate::readout::MatchDetail) -> String {
+    let mut text = format!(
+        "{base}  \u{2022}  matched: {} \u{00d7} {}",
+        detail.display_path, detail.algorithm
+    );
+    if detail.more > 0 {
+        text.push_str(&format!(" (+{} more)", detail.more));
     }
     text
 }
@@ -416,16 +479,79 @@ mod tests {
     fn verification_suffix_appends_the_source_and_the_gaps() {
         let base = String::from("1 matched");
         assert_eq!(
-            with_verification(base.clone(), "checksum file: a.sha256", 0, false),
+            with_verification(base.clone(), "checksum file: a.sha256", 0, false, 0),
             "1 matched  \u{2022}  checksum file: a.sha256"
         );
         assert_eq!(
-            with_verification(base.clone(), "checksum file: a.sha256", 2, false),
+            with_verification(base.clone(), "checksum file: a.sha256", 2, false, 0),
             "1 matched  \u{2022}  checksum file: a.sha256  \u{2022}  2 entries matched no file"
         );
         assert_eq!(
-            with_verification(base, "checksum file: a.sha256", 0, true),
+            with_verification(base, "checksum file: a.sha256", 0, true, 0),
             "1 matched  \u{2022}  checksum file: a.sha256  \u{2022}  malformed lines ignored"
+        );
+    }
+
+    /// A sidecar that could not be read is a gap the counters cannot express.
+    #[test]
+    fn verification_suffix_reports_unreadable_sidecars() {
+        let base = String::from("1 matched");
+        assert_eq!(
+            with_verification(
+                base.clone(),
+                "checksum files beside the hashed files",
+                0,
+                false,
+                1
+            ),
+            "1 matched  \u{2022}  checksum files beside the hashed files  \
+             \u{2022}  1 checksum file could not be read"
+        );
+        assert!(
+            with_verification(base, "sidecars", 0, false, 3)
+                .contains("3 checksum files could not be read")
+        );
+    }
+
+    /// A manifest source names the file and, when known, the inferred algorithm:
+    /// "SHA-256" is what makes the temporary algorithm set explainable.
+    #[test]
+    fn a_manifest_source_names_the_file_and_the_inferred_algorithm() {
+        assert_eq!(
+            manifest_source(
+                std::path::Path::new(r"C:\dir\payload.sha256"),
+                Some("SHA-256")
+            ),
+            "checksum file: payload.sha256 (interpreted as sumfile: SHA-256)"
+        );
+        assert_eq!(
+            manifest_source(std::path::Path::new("payload.sfv"), None),
+            "checksum file: payload.sfv (interpreted as sumfile)"
+        );
+    }
+
+    /// The status line names the first matched file and algorithm; a count keeps
+    /// multi-file results bounded.
+    #[test]
+    fn a_match_detail_names_the_first_match() {
+        let detail = crate::readout::MatchDetail {
+            display_path: String::from("payload.bin"),
+            algorithm: "SHA-256",
+            more: 0,
+        };
+        assert_eq!(
+            with_match_detail(String::from("1 matched"), &detail),
+            "1 matched  \u{2022}  matched: payload.bin \u{00d7} SHA-256"
+        );
+
+        let detail = crate::readout::MatchDetail {
+            display_path: String::from("payload.bin"),
+            algorithm: "SHA-256",
+            more: 2,
+        };
+        assert_eq!(
+            with_match_detail(String::from("3 matched"), &detail),
+            "3 matched  \u{2022}  matched: payload.bin \u{00d7} SHA-256 (+2 more)"
         );
     }
 

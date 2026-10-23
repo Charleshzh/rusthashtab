@@ -172,6 +172,70 @@ pub fn rebuild_rows(
     (rows, counters)
 }
 
+/// How much of a file path the status line shows before truncating it.
+///
+/// The status line is one line wide; a manifest entry can carry a deep relative
+/// path that would push the counters off-screen. The full text remains available
+/// in the tooltip, which `set_status` keeps in step.
+const MATCH_DETAIL_PATH_CHARS: usize = 48;
+
+/// The first `文件 × 算法` match, for the status line.
+///
+/// One file can produce several `Matched` rows in principle (identical digests
+/// under different algorithms), so the detail is keyed by `job_index`: the user
+/// asked which file matched, not how many rows happened to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchDetail {
+    /// The matched file's display path, truncated for the status line.
+    pub display_path: String,
+    /// The matching algorithm's display name.
+    pub algorithm: &'static str,
+    /// How many other files also matched.
+    pub more: usize,
+}
+
+/// Summarise the matched files in `rows`.
+///
+/// Reads the rows the page already has rather than re-deriving verdicts from
+/// `Shared`: this runs on every status refresh, including mid-scan, and copying
+/// the whole result set there would be a per-message allocation of every digest.
+#[must_use]
+pub fn match_detail(rows: &[ListRow]) -> Option<MatchDetail> {
+    let mut matched: Vec<(usize, String, usize)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for row in rows {
+        let MatchState::Matched { algorithm, .. } = row.match_state else {
+            continue;
+        };
+        if seen.insert(row.job_index) {
+            matched.push((row.job_index, row.display_path.clone(), algorithm));
+        }
+    }
+
+    matched.sort_by_key(|(job_index, _, _)| *job_index);
+    let (_, display_path, algorithm) = matched.first()?;
+    let name = rusthashtab_hash::ALGORITHMS
+        .get(*algorithm)
+        .map_or("unknown", |algorithm| algorithm.name);
+
+    Some(MatchDetail {
+        display_path: short_path(display_path),
+        algorithm: name,
+        more: matched.len() - 1,
+    })
+}
+
+/// Truncate a path to the status line's budget, by characters rather than bytes.
+fn short_path(path: &str) -> String {
+    if path.chars().count() <= MATCH_DETAIL_PATH_CHARS {
+        return path.to_string();
+    }
+    let mut short: String = path.chars().take(MATCH_DETAIL_PATH_CHARS - 1).collect();
+    short.push('\u{2026}');
+    short
+}
+
 /// Recount the status line's four categories from the rows of one file.
 ///
 /// The categories are mutually exclusive and the order they are decided in is the
@@ -659,5 +723,106 @@ mod tests {
             &mut counters,
         );
         assert_eq!(counters.matched, u32::MAX);
+    }
+
+    /// A row carrying a verdict, for the status-detail tests.
+    fn list_row(job_index: usize, display_path: &str, state: MatchState) -> ListRow {
+        let algorithm = match state {
+            MatchState::Matched { algorithm, .. } => algorithm,
+            _ => usize::MAX,
+        };
+        ListRow {
+            id: crate::row_id(job_index, algorithm),
+            job_index,
+            algorithm,
+            digest_hex: String::new(),
+            match_state: state,
+            error: None,
+            display_path: display_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn match_detail_is_none_without_a_match() {
+        assert_eq!(match_detail(&[]), None);
+        assert_eq!(
+            match_detail(&[list_row(0, "a.bin", MatchState::NotChecked)]),
+            None
+        );
+        assert_eq!(
+            match_detail(&[list_row(0, "a.bin", MatchState::Mismatched)]),
+            None
+        );
+    }
+
+    /// One matched file gives its path and the algorithm that matched -- the
+    /// statement the status line could not make before.
+    #[test]
+    fn match_detail_names_the_file_and_algorithm() {
+        let sha256 = index_of("SHA-256");
+        let detail = match_detail(&[list_row(
+            0,
+            "payload.bin",
+            MatchState::Matched {
+                algorithm: sha256,
+                secure: true,
+            },
+        )])
+        .expect("a matched row has a detail");
+
+        assert_eq!(detail.display_path, "payload.bin");
+        assert_eq!(detail.algorithm, "SHA-256");
+        assert_eq!(detail.more, 0);
+    }
+
+    /// Several matching rows for one file are one match; several files are one
+    /// detail plus a count, in job order.
+    #[test]
+    fn match_detail_counts_files_not_rows() {
+        let sha256 = index_of("SHA-256");
+        let md5 = index_of("MD5");
+        let matched = MatchState::Matched {
+            algorithm: sha256,
+            secure: true,
+        };
+        let rows = vec![
+            list_row(1, "second.bin", matched),
+            list_row(0, "first.bin", matched),
+            // A second matched row for the same file must not be counted twice.
+            list_row(
+                0,
+                "first.bin",
+                MatchState::Matched {
+                    algorithm: md5,
+                    secure: false,
+                },
+            ),
+        ];
+
+        let detail = match_detail(&rows).expect("two files matched");
+        assert_eq!(detail.display_path, "first.bin", "job order decides first");
+        assert_eq!(detail.algorithm, "SHA-256");
+        assert_eq!(detail.more, 1);
+    }
+
+    /// A manifest can name a deeply nested file; the status line keeps a bounded
+    /// prefix so the counters stay visible.
+    #[test]
+    fn match_detail_truncates_a_long_path_by_characters() {
+        let path = format!("{}{}", "深层\\".repeat(20), "payload.bin");
+        let sha256 = index_of("SHA-256");
+        let detail = match_detail(&[list_row(
+            0,
+            &path,
+            MatchState::Matched {
+                algorithm: sha256,
+                secure: true,
+            },
+        )])
+        .expect("a matched row has a detail");
+
+        assert_eq!(detail.display_path.chars().count(), MATCH_DETAIL_PATH_CHARS);
+        assert!(detail.display_path.ends_with('\u{2026}'));
+        assert!(detail.display_path.starts_with("深层\\"));
     }
 }

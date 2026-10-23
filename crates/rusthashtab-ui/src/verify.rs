@@ -55,6 +55,12 @@
 //! behaviour. It is a separate entry point rather than something the page does
 //! unconditionally, because whether to look is a user setting
 //! (`Settings::look_for_sumfiles`) and the caller is the one that knows it.
+//!
+//! It is deliberately **stricter** than [`match_sumfile`]: a sidecar was found by
+//! name rather than chosen by the user, so every entry in it must name the file
+//! the sidecar belongs to. An entry naming another file is reported as unmatched
+//! instead of being attached to that other file, and only extensions of the
+//! algorithms actually being hashed are tried.
 
 use crate::JobSpec;
 use rusthashtab_hash::ALGORITHMS;
@@ -72,6 +78,20 @@ use std::path::{Component, Path, PathBuf};
 /// allocation for a file chosen by name (or found next to a hashed file), which
 /// must not be able to stall the page by pointing at a multi-gigabyte file.
 pub const MAX_SUMFILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Extension of an SFV checksum file.
+///
+/// Spelled out rather than taken from [`rusthashtab_hash::ALGORITHMS`]: CRC32, the
+/// algorithm SFV carries, deliberately has no registered extension of its own
+/// (the export selector uses `sfv` explicitly), so the sidecar lookup and the
+/// bare-digest rule need this one extra name.
+pub(crate) const SFV_EXTENSION: &str = "sfv";
+
+/// Extension of a corz `.hash` checksum file.
+///
+/// The format can mix algorithms, which is why it is accepted as a checksum-file
+/// extension but never used to infer one.
+pub(crate) const CORZ_EXTENSION: &str = "hash";
 
 /// The result of matching one checksum file against the scan's jobs.
 ///
@@ -199,46 +219,68 @@ pub fn match_sumfile(parsed: &ParseOutcome, sumfile: &Path, jobs: &[JobSpec]) ->
     }
 }
 
+/// What looking for sidecar checksum files found.
+///
+/// The counts exist so the page can say what happened. A sidecar that was found
+/// but could not be used is otherwise indistinguishable from one that was never
+/// there, and the user would be left believing a file had been checked when it
+/// had not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SidecarAttach {
+    /// Jobs that gained at least one new expected digest.
+    pub attached: usize,
+    /// Entries in read sidecars that named no file in the scan -- or, strictly,
+    /// named a different file than the one the sidecar belongs to.
+    pub unmatched: usize,
+    /// Whether any read sidecar contained a line that could not be parsed.
+    pub had_error: bool,
+    /// Sidecars that existed but could not be read (I/O error, or over the size
+    /// cap).
+    pub unreadable: usize,
+}
+
 /// Attach the expectations from checksum files found next to each file.
 ///
 /// For every job this looks for `<file name>.<extension>` in the job's own
-/// directory, for every extension registered in [`rusthashtab_hash::ALGORITHMS`]
-/// (for example `data.bin.sha256` next to `data.bin`), reads each one that
-/// exists, and keeps only the expectation that names the job being processed.
-/// Digests already present on the job are not added again.
+/// directory and reads each one that exists. The extension set is **the enabled
+/// algorithms' registered extensions**, plus `sfv` when CRC32 is enabled: a
+/// sidecar for an algorithm that is not being hashed cannot verify anything, and
+/// reading it anyway could compare its digest against a different algorithm of
+/// the same length and report a mismatch that is not real.
+///
+/// # Strictness
+///
+/// A sidecar was found by name, not chosen by the user, so it is only allowed to
+/// describe the file it sits next to. An entry with a path is resolved relative
+/// to the sidecar's own directory (absolute paths stand alone) and is used only
+/// when it names *that* job. Entries naming another file are counted in
+/// [`SidecarAttach::unmatched`] instead of being attached somewhere else; the
+/// basename fallback in [`match_sumfile`] is deliberately not used here.
+///
+/// A digest with no file name belongs to the file the sidecar is named after,
+/// which is exactly the job being processed.
+///
+/// Digests already present on the job are not added again. Directory listings are
+/// cached per directory, because the page usually hashes many files in the same
+/// folder and each job would otherwise re-enumerate it.
 ///
 /// Whether to call this at all is the caller's decision: it implements the
 /// user's "look for checksum files" setting, and only the page knows that
-/// setting. Returning `0` therefore also covers a page that never looked.
-///
-/// A sidecar that cannot be read, is too large, or turns out to be some other
-/// kind of file is skipped silently: it was found by name, not chosen by the
-/// user, so there is nothing to report and no reason to disturb a scan that is
-/// otherwise fine.
-///
-/// Directory listings are cached per directory, because the page usually hashes
-/// many files in the same folder and each job would otherwise re-enumerate it.
-///
-/// Returns the number of jobs that gained at least one new expected digest.
-pub fn attach_sidecars(jobs: &mut [FileJob]) -> usize {
+/// setting. An empty result therefore also covers a page that never looked.
+#[must_use]
+pub fn attach_sidecars(jobs: &mut [FileJob], enabled: &[bool]) -> SidecarAttach {
+    let mut totals = SidecarAttach::default();
     if jobs.is_empty() {
-        return 0;
+        return totals;
     }
 
-    // A read-only view of the jobs for the matcher. It is built up front so the
-    // matching below does not need the mutable borrow the additions require.
-    let specs: Vec<JobSpec> = jobs
-        .iter()
-        .map(|job| JobSpec {
-            path: job.path.clone(),
-            display_path: job.display_path.clone(),
-        })
-        .collect();
+    let extensions = enabled_sidecar_extensions(enabled);
+    if extensions.is_empty() {
+        return totals;
+    }
 
-    let extensions = registered_extensions();
     let mut directories: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut additions: Vec<Vec<Vec<u8>>> = vec![Vec::new(); jobs.len()];
-    let mut attached = 0;
 
     for (index, job) in jobs.iter().enumerate() {
         let (Some(parent), Some(file_name)) = (job.path.parent(), job.path.file_name()) else {
@@ -246,51 +288,97 @@ pub fn attach_sidecars(jobs: &mut [FileJob]) -> usize {
         };
         let parent = parent.to_path_buf();
         let file_name = file_name.to_string_lossy().to_lowercase();
+        let job_key = path_key(&job.path);
 
         let names = directories
             .entry(parent.clone())
             .or_insert_with(|| directory_names(&parent));
 
-        let mut candidates: Vec<PathBuf> = Vec::new();
         for extension in &extensions {
             let candidate = format!("{file_name}.{}", extension.to_lowercase());
-            if names.contains(&candidate) {
-                candidates.push(parent.join(candidate));
+            if !names.contains(&candidate) {
+                continue;
             }
-        }
-        if candidates.is_empty() {
-            continue;
-        }
+            let candidate = parent.join(candidate);
 
-        let mut added_here = false;
-        for candidate in candidates {
-            let Ok(parsed) = read_sumfile(&candidate) else {
-                continue;
-            };
-            let matched = match_sumfile(&parsed, &candidate, &specs);
-            let Some(digests) = matched.expected.get(index) else {
-                continue;
-            };
-            for digest in digests {
-                if jobs[index].expected.contains(digest) || additions[index].contains(digest) {
+            let parsed = match read_sumfile(&candidate) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    totals.unreadable = totals.unreadable.saturating_add(1);
                     continue;
                 }
-                additions[index].push(digest.clone());
-                added_here = true;
+            };
+            if parsed.had_error {
+                totals.had_error = true;
             }
-        }
-        if added_here {
-            attached += 1;
+
+            for entry in &parsed.entries {
+                if entry.path.trim().is_empty() {
+                    push_digest(&mut additions[index], &job.expected, &entry.digest);
+                    continue;
+                }
+
+                let raw = Path::new(&entry.path);
+                let resolved = if raw.has_root() {
+                    normalize_path(raw)
+                } else {
+                    normalize_path(&parent.join(raw))
+                };
+                if path_key(&resolved) == job_key {
+                    push_digest(&mut additions[index], &job.expected, &entry.digest);
+                } else {
+                    totals.unmatched = totals.unmatched.saturating_add(1);
+                }
+            }
         }
     }
 
     for (index, digests) in additions.into_iter().enumerate() {
+        if digests.is_empty() {
+            continue;
+        }
         if let Some(job) = jobs.get_mut(index) {
             job.expected.extend(digests);
+            totals.attached = totals.attached.saturating_add(1);
         }
     }
 
-    attached
+    totals
+}
+
+/// Add one digest to a job's pending sidecar expectations unless it is already
+/// there.
+fn push_digest(pending: &mut Vec<Vec<u8>>, existing: &[Vec<u8>], digest: &[u8]) {
+    if existing.iter().any(|known| known == digest) || pending.iter().any(|known| known == digest) {
+        return;
+    }
+    pending.push(digest.to_vec());
+}
+
+/// The checksum-file extensions a sidecar lookup may try, in algorithm-table
+/// order.
+///
+/// Only enabled algorithms contribute: a sidecar for an algorithm that is not
+/// being hashed cannot verify anything, and reading it anyway would let a
+/// same-length digest from another algorithm look like a mismatch. `sfv` is
+/// special-cased because CRC32 has no registered extension of its own.
+fn enabled_sidecar_extensions(enabled: &[bool]) -> Vec<&'static str> {
+    let mut seen = HashSet::new();
+    let mut extensions = Vec::new();
+    for (index, algorithm) in ALGORITHMS.iter().enumerate() {
+        if !enabled.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        if algorithm.name == "CRC32" && seen.insert(SFV_EXTENSION) {
+            extensions.push(SFV_EXTENSION);
+        }
+        for extension in algorithm.extensions {
+            if seen.insert(*extension) {
+                extensions.push(*extension);
+            }
+        }
+    }
+    extensions
 }
 
 /// Decode a digest pasted by the user.
@@ -579,37 +667,37 @@ fn is_bare_file_name(path: &Path) -> bool {
 ///
 /// Returns the name without the dot and extension, or `None` when the name ends
 /// in no registered extension. Matching is ASCII case-insensitive, like the file
-/// system that holds it.
+/// system that holds it. `sfv` and `hash` are included even though CRC32 and the
+/// corz format have no algorithm-owned extension: a bare digest in
+/// `payload.bin.hash` still names `payload.bin`.
 fn strip_registered_extension(name: &str) -> Option<&str> {
+    for extension in [SFV_EXTENSION, CORZ_EXTENSION] {
+        if let Some(stem) = strip_one_extension(name, extension) {
+            return Some(stem);
+        }
+    }
     for algorithm in ALGORITHMS {
         for extension in algorithm.extensions {
-            let Some(dot) = name.len().checked_sub(extension.len()) else {
-                continue;
-            };
-            if dot == 0 {
-                continue;
-            }
-            let (head, tail) = name.split_at(dot);
-            if head.ends_with('.') && tail.eq_ignore_ascii_case(extension) {
-                return Some(&head[..head.len() - 1]);
+            if let Some(stem) = strip_one_extension(name, extension) {
+                return Some(stem);
             }
         }
     }
     None
 }
 
-/// Every registered checksum-file extension, deduplicated, in table order.
-fn registered_extensions() -> Vec<&'static str> {
-    let mut seen = HashSet::new();
-    let mut extensions = Vec::new();
-    for algorithm in ALGORITHMS {
-        for extension in algorithm.extensions {
-            if seen.insert(*extension) {
-                extensions.push(*extension);
-            }
-        }
+/// Strip one known extension, if `name` ends in it.
+fn strip_one_extension<'a>(name: &'a str, extension: &str) -> Option<&'a str> {
+    let dot = name.len().checked_sub(extension.len())?;
+    if dot == 0 {
+        return None;
     }
-    extensions
+    let (head, tail) = name.split_at(dot);
+    if head.ends_with('.') && tail.eq_ignore_ascii_case(extension) {
+        Some(&head[..head.len() - 1])
+    } else {
+        None
+    }
 }
 
 /// The lower-cased names in a directory, for sidecar lookups.
@@ -1007,6 +1095,22 @@ mod tests {
         );
     }
 
+    /// Every algorithm enabled, as a fresh sidecar lookup in a test would have.
+    fn enabled_all() -> Vec<bool> {
+        vec![true; ALGORITHMS.len()]
+    }
+
+    /// Exactly one algorithm enabled, looked up by name.
+    fn enabled_only(name: &str) -> Vec<bool> {
+        let mut enabled = vec![false; ALGORITHMS.len()];
+        let index = ALGORITHMS
+            .iter()
+            .position(|algorithm| algorithm.name == name)
+            .expect("the algorithm is in the table");
+        enabled[index] = true;
+        enabled
+    }
+
     #[test]
     fn attach_sidecars_adds_the_digest_next_to_the_file() {
         let dir = TempDir::new("sidecar-hit");
@@ -1014,19 +1118,22 @@ mod tests {
         dir.write("data.bin.sha256", &format!("{SHA256_EMPTY}\n"));
 
         let mut jobs = vec![file_job(&target)];
-        assert_eq!(attach_sidecars(&mut jobs), 1);
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 1);
+        assert_eq!(result.unmatched, 0);
+        assert!(!result.had_error);
         assert_eq!(jobs[0].expected, vec![digest(SHA256_EMPTY)]);
     }
 
     #[test]
-    fn attach_sidecars_accumulates_every_registered_format() {
+    fn attach_sidecars_accumulates_every_enabled_format() {
         let dir = TempDir::new("sidecar-many");
         let target = dir.write("data.bin", "content");
         dir.write("data.bin.sha256", &format!("{SHA256_EMPTY}  data.bin\n"));
         dir.write("data.bin.md5", &format!("{MD5_EMPTY}  data.bin\n"));
 
         let mut jobs = vec![file_job(&target)];
-        assert_eq!(attach_sidecars(&mut jobs), 1);
+        assert_eq!(attach_sidecars(&mut jobs, &enabled_all()).attached, 1);
         // Candidates are tried in algorithm-table order, so MD5's extension is
         // found before SHA-256's. The order does not matter to verification --
         // `match_state` compares every digest -- but pinning it keeps the
@@ -1043,20 +1150,27 @@ mod tests {
         let target = dir.write("data.bin", "content");
 
         let mut jobs = vec![file_job(&target)];
-        assert_eq!(attach_sidecars(&mut jobs), 0);
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result, SidecarAttach::default());
         assert!(jobs[0].expected.is_empty());
     }
 
+    /// A malformed line is not fatal: the entries before it are still attached,
+    /// and the page can say that some lines were ignored.
     #[test]
-    fn attach_sidecars_ignores_an_unreadable_sidecar() {
+    fn a_malformed_sidecar_is_reported_but_earlier_entries_survive() {
         let dir = TempDir::new("sidecar-bad");
         let target = dir.write("data.bin", "content");
-        // Named like a sidecar, but not a checksum file at all.
-        dir.write("data.bin.sha256", "this is not a checksum line\n");
+        dir.write(
+            "data.bin.sha256",
+            &format!("{SHA256_EMPTY}  data.bin\nthis is not a checksum line\n"),
+        );
 
         let mut jobs = vec![file_job(&target)];
-        assert_eq!(attach_sidecars(&mut jobs), 0);
-        assert!(jobs[0].expected.is_empty());
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 1);
+        assert!(result.had_error);
+        assert_eq!(jobs[0].expected, vec![digest(SHA256_EMPTY)]);
     }
 
     #[test]
@@ -1067,14 +1181,18 @@ mod tests {
 
         let mut jobs = vec![file_job(&target)];
         jobs[0].expected.push(digest(SHA256_EMPTY));
-        assert_eq!(attach_sidecars(&mut jobs), 0, "nothing new was attached");
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 0, "nothing new was attached");
         assert_eq!(jobs[0].expected, vec![digest(SHA256_EMPTY)]);
     }
 
     #[test]
     fn attach_sidecars_with_no_jobs_does_nothing() {
         let mut jobs: Vec<FileJob> = Vec::new();
-        assert_eq!(attach_sidecars(&mut jobs), 0);
+        assert_eq!(
+            attach_sidecars(&mut jobs, &enabled_all()),
+            SidecarAttach::default()
+        );
     }
 
     /// The sidecar for one file must not leak onto another file in the same
@@ -1087,8 +1205,133 @@ mod tests {
         dir.write("first.bin.sha256", &format!("{SHA256_EMPTY}  first.bin\n"));
 
         let mut jobs = vec![file_job(&first), file_job(&second)];
-        assert_eq!(attach_sidecars(&mut jobs), 1);
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 1);
+        assert_eq!(result.unmatched, 0);
         assert_eq!(jobs[0].expected, vec![digest(SHA256_EMPTY)]);
         assert!(jobs[1].expected.is_empty());
+    }
+
+    /// A sidecar was found by name, not chosen by the user: an entry that names
+    /// another file must not be attached anywhere, and must be counted so the
+    /// page can say the sidecar did not verify this file.
+    #[test]
+    fn a_sidecar_entry_naming_another_file_is_unmatched() {
+        let dir = TempDir::new("sidecar-wrong-name");
+        let target = dir.write("data.bin", "content");
+        dir.write("data.bin.sha256", &format!("{SHA256_EMPTY}  other.bin\n"));
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 0);
+        assert_eq!(result.unmatched, 1);
+        assert!(jobs[0].expected.is_empty());
+    }
+
+    /// A nested name is a real constraint: it does not fall back to a basename
+    /// match, unlike an explicitly chosen checksum file.
+    #[test]
+    fn a_sidecar_with_a_nested_name_does_not_fall_back_to_the_job() {
+        let dir = TempDir::new("sidecar-nested");
+        let target = dir.write("data.bin", "content");
+        dir.write(
+            "data.bin.sha256",
+            &format!("{SHA256_EMPTY}  sub\\data.bin\n"),
+        );
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 0);
+        assert_eq!(result.unmatched, 1);
+    }
+
+    /// An absolute entry that really names the job is accepted.
+    #[test]
+    fn an_absolute_entry_naming_the_job_is_accepted() {
+        let dir = TempDir::new("sidecar-absolute");
+        let target = dir.write("data.bin", "content");
+        dir.write(
+            "data.bin.sha256",
+            &format!("{SHA256_EMPTY}  {}\n", target.display()),
+        );
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 1);
+        assert_eq!(jobs[0].expected, vec![digest(SHA256_EMPTY)]);
+    }
+
+    /// A sidecar for an algorithm that is not being hashed cannot verify
+    /// anything, and reading it could compare its digest against a different
+    /// algorithm of the same length. It is therefore not even looked at.
+    #[test]
+    fn a_sidecar_for_a_disabled_algorithm_is_not_read() {
+        let dir = TempDir::new("sidecar-disabled");
+        let target = dir.write("data.bin", "content");
+        dir.write("data.bin.sha256", &format!("{SHA256_EMPTY}  data.bin\n"));
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &enabled_only("MD5"));
+        assert_eq!(result, SidecarAttach::default());
+        assert!(jobs[0].expected.is_empty());
+    }
+
+    /// SFV has no algorithm-owned extension (CRC32 deliberately has none), so
+    /// the sidecar lookup special-cases it when CRC32 is enabled.
+    #[test]
+    fn an_sfv_sidecar_is_read_when_crc32_is_enabled() {
+        let dir = TempDir::new("sidecar-sfv");
+        let target = dir.write("data.bin", "content");
+        dir.write("data.bin.sfv", "data.bin 00000000\n");
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &enabled_only("CRC32"));
+        assert_eq!(result.attached, 1);
+        assert_eq!(jobs[0].expected, vec![digest("00000000")]);
+    }
+
+    /// A directory that happens to be named like a sidecar is found by name but
+    /// cannot be read; the page reports that rather than pretending it was not
+    /// there.
+    #[test]
+    fn an_unreadable_sidecar_is_counted() {
+        let dir = TempDir::new("sidecar-dir");
+        let target = dir.write("data.bin", "content");
+        fs::create_dir(dir.path().join("data.bin.sha256"))
+            .expect("the directory must be creatable");
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &enabled_all());
+        assert_eq!(result.attached, 0);
+        assert_eq!(result.unreadable, 1);
+    }
+
+    #[test]
+    fn a_sidecar_lookup_with_no_enabled_algorithms_does_nothing() {
+        let dir = TempDir::new("sidecar-none-enabled");
+        let target = dir.write("data.bin", "content");
+        dir.write("data.bin.sha256", &format!("{SHA256_EMPTY}  data.bin\n"));
+
+        let mut jobs = vec![file_job(&target)];
+        let result = attach_sidecars(&mut jobs, &vec![false; ALGORITHMS.len()]);
+        assert_eq!(result, SidecarAttach::default());
+        assert!(jobs[0].expected.is_empty());
+    }
+
+    /// `sfv` and `hash` are checksum-file extensions even though no algorithm
+    /// owns them, so a bare digest in such a file still names the file the name
+    /// describes.
+    #[test]
+    fn strip_registered_extension_recognizes_sfv_and_hash() {
+        assert_eq!(strip_registered_extension("data.bin.sfv"), Some("data.bin"));
+        assert_eq!(
+            strip_registered_extension("data.bin.HASH"),
+            Some("data.bin")
+        );
+        assert_eq!(
+            strip_registered_extension("data.bin.sha256"),
+            Some("data.bin")
+        );
+        assert_eq!(strip_registered_extension("data.bin"), None);
     }
 }
