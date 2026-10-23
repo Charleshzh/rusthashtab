@@ -31,20 +31,24 @@
 
 use crate::{algorithm_names, resource};
 use rusthashtab_settings::Settings;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateSolidBrush, DT_CENTER,
+    DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetSysColor,
+    GetSysColorBrush, HGDIOBJ, InvalidateRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+};
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, IsDlgButtonChecked, LIST_VIEW_ITEM_STATE_FLAGS,
-    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS,
-    LVM_GETITEMSTATE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVS_EX_CHECKBOXES, LVS_EX_FULLROWSELECT,
-    LVSCW_AUTOSIZE_USEHEADER,
+    BST_CHECKED, BST_UNCHECKED, CheckDlgButton, DRAWITEMSTRUCT, IsDlgButtonChecked,
+    LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVIS_STATEIMAGEMASK,
+    LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMSTATE, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVS_EX_CHECKBOXES,
+    LVS_EX_FULLROWSELECT, LVSCW_AUTOSIZE_USEHEADER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, DialogBoxParamW, EndDialog,
     GetDlgItem, MB_ICONWARNING, MB_OK, MessageBoxW, SendMessageW, SetWindowTextW, WM_COMMAND,
-    WM_INITDIALOG, WM_NCDESTROY,
+    WM_DRAWITEM, WM_GETFONT, WM_INITDIALOG, WM_NCDESTROY,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -198,6 +202,13 @@ extern "system" fn dialog_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam:
         }
         WM_COMMAND => {
             if on_command(hwnd, wparam) {
+                1
+            } else {
+                0
+            }
+        }
+        WM_DRAWITEM => {
+            if on_draw_item(hwnd, lparam) {
                 1
             } else {
                 0
@@ -414,6 +425,119 @@ fn read_colour_controls(hwnd: HWND, form: &mut SettingsForm) {
     colour.background_enabled = background_enabled;
 }
 
+/// Draw the live colour sample.
+///
+/// The control is a `SS_OWNERDRAW` static, not a label: a real sample is more
+/// useful than a hex string, because the user is choosing how the list will
+/// look, not a number. The top strip is the sample text on the chosen
+/// foreground/background; the bottom strip keeps the hex values readable on the
+/// dialog background.
+fn on_draw_item(hwnd: HWND, lparam: LPARAM) -> bool {
+    if lparam.0 == 0 {
+        return false;
+    }
+    let Some(state) = state(hwnd) else {
+        return false;
+    };
+    // SAFETY: `WM_DRAWITEM` passes a pointer to a `DRAWITEMSTRUCT` that is valid
+    // for the duration of the message; the caller owns it.
+    let draw = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+    if draw.CtlID != resource::IDC_SETTINGS_COLOUR_PREVIEW as u32 {
+        return false;
+    }
+
+    let class = selected_class(hwnd);
+    let colour = colour_of(&state.form.settings, class);
+    // SAFETY: `GetSysColor` reads a system colour table entry.
+    let system_text = COLORREF(unsafe { GetSysColor(COLOR_BTNTEXT) });
+    // SAFETY: as above.
+    let system_face = COLORREF(unsafe { GetSysColor(COLOR_BTNFACE) });
+    let text = if colour.text_enabled && colour.text != rusthashtab_settings::SYSTEM_COLOUR {
+        COLORREF(colour.text)
+    } else {
+        system_text
+    };
+    let background =
+        if colour.background_enabled && colour.background != rusthashtab_settings::SYSTEM_COLOUR {
+            COLORREF(colour.background)
+        } else {
+            system_face
+        };
+
+    let rect = draw.rcItem;
+    let sample_height = (rect.bottom - rect.top) * 2 / 3;
+    let mut sample = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.top + sample_height,
+    };
+    let mut labels = RECT {
+        left: rect.left + 3,
+        top: sample.bottom,
+        right: rect.right - 3,
+        bottom: rect.bottom,
+    };
+
+    // SAFETY: `draw.hDC` is the DC the dialog supplied for this item; the
+    // brushes and the font are selected only for the duration of this call.
+    unsafe {
+        let _ = FillRect(draw.hDC, &rect, GetSysColorBrush(COLOR_BTNFACE));
+        let brush = CreateSolidBrush(background);
+        if !brush.is_invalid() {
+            let _ = FillRect(draw.hDC, &sample, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+
+        let font = SendMessageW(draw.hwndItem, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0
+            as *mut core::ffi::c_void;
+        let old_font = if font.is_null() {
+            None
+        } else {
+            Some(SelectObject(draw.hDC, HGDIOBJ(font)))
+        };
+
+        let _ = SetBkMode(draw.hDC, TRANSPARENT);
+        let _ = SetTextColor(draw.hDC, text);
+        let mut sample_text: Vec<u16> = "0123456789ABCDEF".encode_utf16().collect();
+        let _ = DrawTextW(
+            draw.hDC,
+            &mut sample_text,
+            &mut sample,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+        );
+
+        // The hex values are secondary information; keep them on the dialog
+        // face so they stay readable whatever the sample colours are.
+        let _ = SetTextColor(draw.hDC, system_text);
+        let labels_text = format!(
+            "text {} / bg {}",
+            if colour.text_enabled {
+                colour_text(colour.text)
+            } else {
+                String::from("off")
+            },
+            if colour.background_enabled {
+                colour_text(colour.background)
+            } else {
+                String::from("off")
+            }
+        );
+        let mut labels_wide: Vec<u16> = labels_text.encode_utf16().collect();
+        let _ = DrawTextW(
+            draw.hDC,
+            &mut labels_wide,
+            &mut labels,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+
+        if let Some(old) = old_font {
+            let _ = SelectObject(draw.hDC, old);
+        }
+    }
+    true
+}
+
 /// Update the text preview for the selected class.
 fn update_colour_preview(hwnd: HWND, form: &SettingsForm) {
     let Some(preview) = control(hwnd, resource::IDC_SETTINGS_COLOUR_PREVIEW) else {
@@ -438,6 +562,7 @@ fn update_colour_preview(hwnd: HWND, form: &SettingsForm) {
     // SAFETY: `preview` is the dialog's static and the string outlives the call.
     unsafe {
         let _ = SetWindowTextW(preview, PCWSTR(wide.as_ptr()));
+        let _ = InvalidateRect(Some(preview), None, true);
     }
 }
 
@@ -789,6 +914,14 @@ fn read_options(hwnd: HWND, form: &mut SettingsForm) {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The preview's text half shows `off` for the system sentinel; the
+    /// owner-draw swatch uses the same predicate to decide whether to paint it.
+    #[test]
+    fn a_disabled_colour_half_is_labelled_off() {
+        assert_eq!(colour_text(rusthashtab_settings::SYSTEM_COLOUR), "off");
+        assert_eq!(colour_text(0x0017_AA2D), "#2DAA17");
+    }
 
     /// The defaults are exactly the four documented algorithms, at their real
     /// table positions. This is the regression guard for the settings loader
