@@ -80,6 +80,10 @@ pub const IDC_SETTINGS_COLOUR_TEXT: i32 = 2117;
 pub const IDC_SETTINGS_COLOUR_BG: i32 = 2118;
 /// Restore the default colours.
 pub const IDC_SETTINGS_COLOUR_DEFAULTS: i32 = 2119;
+/// Whether the selected class paints its foreground colour.
+pub const IDC_SETTINGS_COLOUR_TEXT_ENABLED: i32 = 2120;
+/// Whether the selected class paints its background colour.
+pub const IDC_SETTINGS_COLOUR_BG_ENABLED: i32 = 2121;
 
 /// Identifiers the dialog templates declare, in declaration order.
 ///
@@ -158,6 +162,14 @@ pub(crate) const TEMPLATE_IDENTIFIERS: &[(&str, u16)] = &[
     (
         "IDC_SETTINGS_COLOUR_DEFAULTS",
         IDC_SETTINGS_COLOUR_DEFAULTS as u16,
+    ),
+    (
+        "IDC_SETTINGS_COLOUR_TEXT_ENABLED",
+        IDC_SETTINGS_COLOUR_TEXT_ENABLED as u16,
+    ),
+    (
+        "IDC_SETTINGS_COLOUR_BG_ENABLED",
+        IDC_SETTINGS_COLOUR_BG_ENABLED as u16,
     ),
 ];
 

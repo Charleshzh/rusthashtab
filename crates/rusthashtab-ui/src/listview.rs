@@ -28,9 +28,9 @@
 use crate::{ListRow, resource};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FF_MODERN,
-    FIXED_PITCH, GetDC, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HGDIOBJ,
-    InvalidateRect, LOGFONTW, ReleaseDC, SelectObject,
+    COLOR_WINDOWTEXT, CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, FF_MODERN, FIXED_PITCH,
+    GetDC, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HGDIOBJ, InvalidateRect,
+    LOGFONTW, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::{
@@ -45,41 +45,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETHIGHCONTRAST, SendMessageW, SystemParametersInfoW, WM_GETFONT, WM_SETFONT, WM_SETREDRAW,
 };
 
-/// The colour a row is drawn in when a digest matched an expected value: a dark
-/// green, `#008B00`, written `0x00BBGGRR` because that is `COLORREF`'s order.
-#[cfg(test)]
-const MATCHED_COLOR: ColorDef = ColorDef(0x0000_8B00);
-/// The colour a row is drawn in when a digest had an expected value and missed it:
-/// a dark red, `#C00000`, in `COLORREF` order.
-#[cfg(test)]
-const MISMATCHED_COLOR: ColorDef = ColorDef(0x0000_00C0);
-/// The colour a row is drawn in when an expected value matched only under an
-/// algorithm that is not cryptographically secure: dark goldenrod, `#B8860B`, in
-/// `COLORREF` order.
+/// The Digest column's index in the template.
 ///
-/// Deliberately neither green nor red. A CRC32 collision is evidence, not proof,
-/// and painting it like a SHA-256 match would let a weak check pass for a strong
-/// one -- which is the whole reason the comparison layer reports `secure`.
-#[cfg(test)]
-const WEAK_MATCH_COLOR: ColorDef = ColorDef(0x000B_86B8);
-
-/// A `COLORREF`, spelled `0x00BBGGRR`.
-///
-/// Wrapped because that byte order is the opposite of how anyone writes a colour,
-/// and a bare literal here would be read as `0xRRGGBB` by everyone including the
-/// author. It was: the first version of both constants above was in `RGB` order,
-/// and [`tests::the_colours_are_spelled_in_colorref_order`] is what caught it.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColorDef(u32);
-
-#[cfg(test)]
-impl ColorDef {
-    /// The `COLORREF` the GDI APIs want.
-    fn colorref(self) -> COLORREF {
-        COLORREF(self.0)
-    }
-}
+/// The verdict colour is painted only here; the other columns stay on the
+/// sheet's normal background.
+pub const DIGEST_SUBITEM: i32 = 1;
 
 /// Add the page's columns to a list view that already exists.
 ///
@@ -682,11 +652,11 @@ pub fn colour_for(state: rusthashtab_scan::MatchState, failed: bool) -> RowColou
 /// thousands of times for one scroll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    matched: (COLORREF, COLORREF),
-    weak: (COLORREF, COLORREF),
-    mismatched: (COLORREF, COLORREF),
-    error: (COLORREF, COLORREF),
-    neutral: (COLORREF, COLORREF),
+    matched: (Option<COLORREF>, Option<COLORREF>),
+    weak: (Option<COLORREF>, Option<COLORREF>),
+    mismatched: (Option<COLORREF>, Option<COLORREF>),
+    error: (Option<COLORREF>, Option<COLORREF>),
+    neutral: (Option<COLORREF>, Option<COLORREF>),
 }
 
 impl Default for Palette {
@@ -704,27 +674,17 @@ impl Palette {
     /// still carries the meaning, so nothing is lost.
     pub fn from_settings(settings: &rusthashtab_settings::Settings, high_contrast: bool) -> Self {
         let system_text = system_colour(COLOR_WINDOWTEXT);
-        let system_background = system_colour(COLOR_WINDOW);
         let resolve = |colour: rusthashtab_settings::RowColour| {
-            if high_contrast
-                || colour.text == rusthashtab_settings::SYSTEM_COLOUR
-                || colour.background == rusthashtab_settings::SYSTEM_COLOUR
-            {
-                let text = if high_contrast || colour.text == rusthashtab_settings::SYSTEM_COLOUR {
-                    system_text
-                } else {
-                    COLORREF(colour.text)
-                };
-                let background =
-                    if high_contrast || colour.background == rusthashtab_settings::SYSTEM_COLOUR {
-                        system_background
-                    } else {
-                        COLORREF(colour.background)
-                    };
-                (text, background)
-            } else {
-                (COLORREF(colour.text), COLORREF(colour.background))
+            if high_contrast {
+                // Keep the text readable but drop the fill: a high-contrast
+                // theme already owns the background.
+                return (Some(system_text), None);
             }
+            let text = colour.has_text().then_some(COLORREF(colour.text));
+            let background = colour
+                .has_background()
+                .then_some(COLORREF(colour.background));
+            (text, background)
         };
 
         let colours = settings.colours;
@@ -737,8 +697,9 @@ impl Palette {
         }
     }
 
-    /// The text and background for one class.
-    pub fn for_class(&self, class: RowColour) -> (COLORREF, COLORREF) {
+    /// The text and background for one class; `None` means "leave the system
+    /// value alone" (no colour for that half).
+    pub fn for_class(&self, class: RowColour) -> (Option<COLORREF>, Option<COLORREF>) {
         match class {
             RowColour::Matched => self.matched,
             RowColour::MatchedWeak => self.weak,
@@ -841,34 +802,47 @@ pub unsafe fn custom_draw_with_palette(
     }
 
     if stage == (CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0) {
-        // In owner-data mode the item spec is the row index: the control has no
-        // per-item storage, so there is no `lParam` to read.
-        let row_index = custom.nmcd.dwItemSpec;
         let mut flags = CDRF_DODEFAULT;
 
-        if let Some(row) = rows.get(row_index) {
-            let (text, background) =
-                palette.for_class(colour_for(row.match_state, row.error.is_some()));
-            custom.clrText = text;
-            // A selected row must keep the system highlight; painting a custom
-            // background over it would make the selection disappear.
-            if (custom.nmcd.uItemState.0 & CDIS_SELECTED.0) == 0 {
-                custom.clrTextBk = background;
-            }
-            flags = CDRF_NEWFONT;
-        }
+        // Only the Digest cell carries the verdict colour. Painting the whole
+        // row makes a multi-file result sheet read as a wall of colour, and it
+        // hides the algorithm/file columns the user needs to tell rows apart.
+        // This is deliberately the same shape as the reference behaviour: the
+        // colour is a cell attribute, not a row attribute.
+        if custom.iSubItem == DIGEST_SUBITEM {
+            // In owner-data mode the item spec is the row index: the control has
+            // no per-item storage, so there is no `lParam` to read.
+            let row_index = custom.nmcd.dwItemSpec;
+            if let Some(row) = rows.get(row_index) {
+                let (text, background) =
+                    palette.for_class(colour_for(row.match_state, row.error.is_some()));
 
-        // Column 1 is Digest; the other columns keep the sheet's UI font.
-        if custom.iSubItem == 1 && monospace_font != 0 {
-            // SAFETY: `hdc` is the DC the control is painting into, and
-            // `monospace_font` is a live font owned by the page.
-            unsafe {
-                SelectObject(
-                    custom.nmcd.hdc,
-                    HGDIOBJ(monospace_font as *mut core::ffi::c_void),
-                );
+                if let Some(text) = text {
+                    custom.clrText = text;
+                    flags = CDRF_NEWFONT;
+                }
+                // A selected row must keep the system highlight; painting a
+                // custom background over it would make the selection disappear.
+                if let Some(background) = background
+                    && (custom.nmcd.uItemState.0 & CDIS_SELECTED.0) == 0
+                {
+                    custom.clrTextBk = background;
+                    flags = CDRF_NEWFONT;
+                }
             }
-            flags = CDRF_NEWFONT;
+
+            // The digest is the only column that can use the monospace face.
+            if monospace_font != 0 {
+                // SAFETY: `hdc` is the DC the control is painting into, and
+                // `monospace_font` is a live font owned by the page.
+                unsafe {
+                    SelectObject(
+                        custom.nmcd.hdc,
+                        HGDIOBJ(monospace_font as *mut core::ffi::c_void),
+                    );
+                }
+                flags = CDRF_NEWFONT;
+            }
         }
 
         return Some(flags as isize);
@@ -899,66 +873,50 @@ mod tests {
         static NEXT_ID: Cell<u64> = const { Cell::new(0) };
     }
 
-    /// The colours must be in `COLORREF` order, which is `0x00BBGGRR` -- the
-    /// opposite of how a colour is written everywhere else.
-    ///
-    /// This test is not decoration. The first version of both constants above was
-    /// written in `RGB` order, which compiles, draws a plausible colour, and is
-    /// simply the wrong one: green became blue. The assertion is on the decoded
-    /// channels rather than on the byte pattern, so the intent is visible.
+    /// A high-contrast theme keeps the verdict text but drops the custom fill:
+    /// the theme owns the background, and a fixed green/red block may be
+    /// unreadable under it.
     #[test]
-    fn the_colours_are_spelled_in_colorref_order() {
-        // A `COLORREF` is decoded as red in the *low* byte.
-        let red = |colour: ColorDef| (colour.0 & 0xFF) as u8;
-        let green = |colour: ColorDef| ((colour.0 >> 8) & 0xFF) as u8;
-        let blue = |colour: ColorDef| ((colour.0 >> 16) & 0xFF) as u8;
-        let reserved = |colour: ColorDef| (colour.0 >> 24) as u8;
-
+    fn high_contrast_keeps_text_and_drops_the_fill() {
+        let palette = Palette::from_settings(&rusthashtab_settings::Settings::default(), true);
+        for class in [
+            RowColour::Matched,
+            RowColour::MatchedWeak,
+            RowColour::Mismatched,
+            RowColour::Error,
+            RowColour::Neutral,
+        ] {
+            assert_eq!(palette.for_class(class).1, None, "{class:?} kept a fill");
+        }
         assert_eq!(
-            reserved(MATCHED_COLOR),
-            0,
-            "the reserved byte must be clear"
+            palette.for_class(RowColour::Matched).0,
+            Some(system_colour(COLOR_WINDOWTEXT))
         );
-        assert_eq!(
-            reserved(MISMATCHED_COLOR),
-            0,
-            "the reserved byte must be clear"
-        );
-
-        // Dark green: green, and only green.
-        assert!(
-            green(MATCHED_COLOR) > 0x40,
-            "the matched colour is not green"
-        );
-        assert_eq!(red(MATCHED_COLOR), 0);
-        assert_eq!(blue(MATCHED_COLOR), 0);
-
-        // Dark red: red, and only red.
-        assert!(
-            red(MISMATCHED_COLOR) > 0x40,
-            "the mismatched colour is not red"
-        );
-        assert_eq!(green(MISMATCHED_COLOR), 0);
-        assert_eq!(blue(MISMATCHED_COLOR), 0);
-
-        assert_ne!(MATCHED_COLOR, MISMATCHED_COLOR);
     }
 
-    /// The weak-match colour is decoded the same way, and has to be a colour that
-    /// reads as neither "good" nor "bad": red and green both high, blue low.
+    /// The default palette is the reference scheme: white on green, white on
+    /// amber, white on red, red text with no fill for an error, and no colour at
+    /// all for an unchecked row.
     #[test]
-    fn the_weak_match_colour_is_a_distinct_goldenrod() {
-        let red = (WEAK_MATCH_COLOR.0 & 0xFF) as u8;
-        let green = ((WEAK_MATCH_COLOR.0 >> 8) & 0xFF) as u8;
-        let blue = ((WEAK_MATCH_COLOR.0 >> 16) & 0xFF) as u8;
-        let reserved = (WEAK_MATCH_COLOR.0 >> 24) as u8;
-
-        assert_eq!(reserved, 0, "the reserved byte must be clear");
-        assert!(red > 0x40, "dark goldenrod has a strong red channel");
-        assert!(green > 0x40, "dark goldenrod has a strong green channel");
-        assert!(blue < 0x40, "dark goldenrod has almost no blue");
-        assert_ne!(WEAK_MATCH_COLOR, MATCHED_COLOR);
-        assert_ne!(WEAK_MATCH_COLOR, MISMATCHED_COLOR);
+    fn the_default_palette_is_white_on_colour_and_error_is_text_only() {
+        let palette = Palette::default();
+        assert_eq!(
+            palette.for_class(RowColour::Matched),
+            (Some(COLORREF(0x00FF_FFFF)), Some(COLORREF(0x0017_AA2D)))
+        );
+        assert_eq!(
+            palette.for_class(RowColour::MatchedWeak),
+            (Some(COLORREF(0x00FF_FFFF)), Some(COLORREF(0x0017_52AA)))
+        );
+        assert_eq!(
+            palette.for_class(RowColour::Mismatched),
+            (Some(COLORREF(0x00FF_FFFF)), Some(COLORREF(0x0017_37E6)))
+        );
+        assert_eq!(
+            palette.for_class(RowColour::Error),
+            (Some(COLORREF(0x0017_37FF)), None)
+        );
+        assert_eq!(palette.for_class(RowColour::Neutral), (None, None));
     }
 
     /// A weak match and a secure match must be visibly different: conflating them
@@ -1077,10 +1035,11 @@ mod tests {
         assert_eq!(answer, Some(CDRF_NOTIFYSUBITEMDRAW as isize));
     }
 
-    /// At the subitem stage the matched row gets the match colour; the answer has to
-    /// ask for a repaint (`CDRF_NEWFONT`) or the colour would not take effect.
+    /// Only the Digest cell gets the class colour and fill. Colouring the whole
+    /// row would hide the algorithm/file columns and make a multi-file sheet a
+    /// wall of colour.
     #[test]
-    fn the_sub_item_stage_sets_the_text_colour() {
+    fn only_the_digest_cell_gets_the_class_colour() {
         let rows = vec![
             row_for(
                 MatchState::Matched {
@@ -1097,23 +1056,61 @@ mod tests {
                 None,
             ),
             row_for(MatchState::Mismatched, None),
+            row_for(MatchState::Mismatched, Some(5)),
             row_for(MatchState::NotChecked, None),
         ];
 
         let palette = Palette::default();
-        let expected = [
-            (0usize, palette.for_class(RowColour::Matched).0),
-            (1, palette.for_class(RowColour::MatchedWeak).0),
-            (2, palette.for_class(RowColour::Mismatched).0),
-            (3, palette.for_class(RowColour::Neutral).0),
+        let cases = [
+            (0usize, RowColour::Matched),
+            (1, RowColour::MatchedWeak),
+            (2, RowColour::Mismatched),
+            (3, RowColour::Error),
+            (4, RowColour::Neutral),
         ];
-        for (row, colour) in expected {
+        for (row, class) in cases {
+            let (text, background) = palette.for_class(class);
             let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(row));
-            draw.iSubItem = 1;
+            draw.iSubItem = DIGEST_SUBITEM;
             // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
             let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
+
+            if text.is_none() && background.is_none() {
+                assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
+                continue;
+            }
             assert_eq!(answer, Some(CDRF_NEWFONT as isize));
-            assert_eq!(draw.clrText, colour, "row {row} was not given its colour");
+            if let Some(text) = text {
+                assert_eq!(draw.clrText, text, "row {row} text");
+            }
+            if let Some(background) = background {
+                assert_eq!(draw.clrTextBk, background, "row {row} background");
+            }
+        }
+    }
+
+    /// The other columns are deliberately left to the control's default drawing.
+    #[test]
+    fn a_non_digest_cell_is_not_coloured() {
+        let rows = vec![row_for(
+            MatchState::Matched {
+                algorithm: 0,
+                secure: true,
+            },
+            None,
+        )];
+        for sub_item in [0, 2, 3] {
+            let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(0));
+            draw.iSubItem = sub_item;
+            // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+            let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
+            assert_eq!(
+                answer,
+                Some(CDRF_DODEFAULT as isize),
+                "subitem {sub_item} must not be painted"
+            );
+            assert_eq!(draw.clrText, COLORREF(0));
+            assert_eq!(draw.clrTextBk, COLORREF(0));
         }
     }
 
@@ -1137,7 +1134,7 @@ mod tests {
         // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
         let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
         assert_eq!(answer, Some(CDRF_DODEFAULT as isize));
-        assert_eq!(draw.clrText, ColorDef(0).colorref());
+        assert_eq!(draw.clrText, COLORREF(0));
     }
 
     /// Stages we do not colour must still be answered with default painting.

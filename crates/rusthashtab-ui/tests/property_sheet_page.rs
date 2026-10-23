@@ -960,6 +960,66 @@ fn the_custom_draw_answer_travels_through_the_dialog_message_result() {
     page.close();
 }
 
+/// The real page paints the matched Digest cell white-on-green and leaves the
+/// other cells alone. This is the visual shape the reference implementation
+/// shows; colouring the whole row was the defect found in visual acceptance.
+#[test]
+fn the_page_paints_only_the_matched_digest_cell() {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::Controls::{
+        CDDS_ITEMPREPAINT, CDDS_SUBITEM, CDRF_NEWFONT, NM_CUSTOMDRAW, NMCUSTOMDRAW_DRAW_STAGE,
+        NMLVCUSTOMDRAW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_NOTIFY;
+
+    let dir = TempDir::new("digest-cell-colour");
+    let contents = b"matched bytes";
+    let file = dir.file("payload.bin", contents);
+    dir.file(
+        "payload.bin.sha256",
+        format!("{}  payload.bin\n", digest_hex("SHA-256", contents)).as_bytes(),
+    );
+    let settings = rusthashtab_settings::Settings {
+        algorithms: enabled_only("SHA-256"),
+        look_for_sumfiles: true,
+        ..rusthashtab_settings::Settings::default()
+    };
+    let page = HostedPage::open(vec![file], settings);
+    page.wait_for_rows(1);
+    page.wait_for_finished();
+
+    let send = |sub_item: i32| {
+        let mut draw = NMLVCUSTOMDRAW::default();
+        draw.nmcd.hdr.idFrom = resource::IDC_HASH_LIST as usize;
+        draw.nmcd.hdr.code = NM_CUSTOMDRAW;
+        draw.nmcd.dwDrawStage = NMCUSTOMDRAW_DRAW_STAGE(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0);
+        draw.nmcd.dwItemSpec = 0;
+        draw.iSubItem = sub_item;
+        // SAFETY: `page.hwnd` is live and `draw` outlives the call.
+        let answer = unsafe {
+            SendMessageW(
+                page.hwnd,
+                WM_NOTIFY,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut draw as *mut NMLVCUSTOMDRAW as isize)),
+            )
+        };
+        (answer.0, draw.clrText, draw.clrTextBk)
+    };
+
+    let (answer, text, background) = send(1);
+    assert_eq!(answer, CDRF_NEWFONT as isize);
+    assert_eq!(text, COLORREF(0x00FF_FFFF), "matched text is white");
+    assert_eq!(background, COLORREF(0x0017_AA2D), "matched fill is green");
+
+    let (answer, text, background) = send(0);
+    assert_eq!(answer, 0, "the Algorithm cell must not be custom-painted");
+    assert_eq!(text, COLORREF(0));
+    assert_eq!(background, COLORREF(0));
+
+    page.close();
+}
+
 /// The finished status line must count every file exactly once, with the verdict
 /// each file got from its own sidecar -- one match, one mismatch.
 #[test]

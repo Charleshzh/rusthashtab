@@ -248,7 +248,7 @@ fn on_init(hwnd: HWND, lparam: LPARAM) {
     autosize_algorithm_column(list);
     fill_options(hwnd, &state.form);
     fill_colour_classes(hwnd);
-    update_colour_preview(hwnd, &state.form);
+    update_colour_controls(hwnd, &state.form);
 }
 
 /// The five colour classes, in the order the selector lists them.
@@ -341,15 +341,77 @@ fn colour_of_mut(
     }
 }
 
-/// Render one colour as `#RRGGBB`, or `system` for the sentinel.
+/// Render one colour as `#RRGGBB`, or `off` for the sentinel.
 fn colour_text(colour: u32) -> String {
     if colour == rusthashtab_settings::SYSTEM_COLOUR {
-        return String::from("system");
+        return String::from("off");
     }
     let red = colour & 0xFF;
     let green = (colour >> 8) & 0xFF;
     let blue = (colour >> 16) & 0xFF;
     format!("#{red:02X}{green:02X}{blue:02X}")
+}
+
+/// Tick the two enabled boxes and redraw the preview for the selected class.
+fn update_colour_controls(hwnd: HWND, form: &SettingsForm) {
+    let class = selected_class(hwnd);
+    let colour = colour_of(&form.settings, class);
+    let text_state = if colour.text_enabled {
+        BST_CHECKED
+    } else {
+        BST_UNCHECKED
+    };
+    let background_state = if colour.background_enabled {
+        BST_CHECKED
+    } else {
+        BST_UNCHECKED
+    };
+    // SAFETY: both identifiers are check boxes this dialog declares.
+    unsafe {
+        let _ = CheckDlgButton(hwnd, resource::IDC_SETTINGS_COLOUR_TEXT_ENABLED, text_state);
+        let _ = CheckDlgButton(
+            hwnd,
+            resource::IDC_SETTINGS_COLOUR_BG_ENABLED,
+            background_state,
+        );
+    }
+    update_colour_preview(hwnd, form);
+}
+
+/// Apply the two enabled check boxes to the selected class.
+///
+/// The colour value is kept while a half is disabled, so re-enabling restores
+/// the user's previous choice rather than falling back to black or white.
+fn apply_colour_checkboxes(hwnd: HWND, form: &mut SettingsForm) {
+    let class = selected_class(hwnd);
+    // SAFETY: both identifiers name check boxes this dialog declares.
+    let text_enabled = unsafe {
+        IsDlgButtonChecked(hwnd, resource::IDC_SETTINGS_COLOUR_TEXT_ENABLED) == BST_CHECKED.0
+    };
+    // SAFETY: as above.
+    let background_enabled = unsafe {
+        IsDlgButtonChecked(hwnd, resource::IDC_SETTINGS_COLOUR_BG_ENABLED) == BST_CHECKED.0
+    };
+    let colour = colour_of_mut(&mut form.settings, class);
+    colour.text_enabled = text_enabled;
+    colour.background_enabled = background_enabled;
+}
+
+/// Read the enabled check boxes back into the settings, without touching the
+/// stored colour values.
+fn read_colour_controls(hwnd: HWND, form: &mut SettingsForm) {
+    // SAFETY: both identifiers name check boxes this dialog declares.
+    let text_enabled = unsafe {
+        IsDlgButtonChecked(hwnd, resource::IDC_SETTINGS_COLOUR_TEXT_ENABLED) == BST_CHECKED.0
+    };
+    // SAFETY: as above.
+    let background_enabled = unsafe {
+        IsDlgButtonChecked(hwnd, resource::IDC_SETTINGS_COLOUR_BG_ENABLED) == BST_CHECKED.0
+    };
+    let class = selected_class(hwnd);
+    let colour = colour_of_mut(&mut form.settings, class);
+    colour.text_enabled = text_enabled;
+    colour.background_enabled = background_enabled;
 }
 
 /// Update the text preview for the selected class.
@@ -360,9 +422,17 @@ fn update_colour_preview(hwnd: HWND, form: &SettingsForm) {
     let class = selected_class(hwnd);
     let colour = colour_of(&form.settings, class);
     let text = format!(
-        "{} / {}",
-        colour_text(colour.text),
-        colour_text(colour.background)
+        "text {} / bg {}",
+        if colour.text_enabled {
+            colour_text(colour.text)
+        } else {
+            String::from("off")
+        },
+        if colour.background_enabled {
+            colour_text(colour.background)
+        } else {
+            String::from("off")
+        }
     );
     let wide: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
     // SAFETY: `preview` is the dialog's static and the string outlives the call.
@@ -456,6 +526,13 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
     // `CBN_SELCHANGE` is 1. The class selector only changes the preview; the
     // settings object is updated when a colour is actually picked.
     if id == resource::IDC_SETTINGS_COLOUR_CLASS && code == 1 {
+        update_colour_controls(hwnd, &state.form);
+        return true;
+    }
+    if id == resource::IDC_SETTINGS_COLOUR_TEXT_ENABLED
+        || id == resource::IDC_SETTINGS_COLOUR_BG_ENABLED
+    {
+        apply_colour_checkboxes(hwnd, &mut state.form);
         update_colour_preview(hwnd, &state.form);
         return true;
     }
@@ -499,15 +576,17 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
                 fill_algorithms(list, &state.form);
             }
             fill_options(hwnd, &state.form);
-            update_colour_preview(hwnd, &state.form);
+            update_colour_controls(hwnd, &state.form);
             true
         }
         resource::IDC_SETTINGS_COLOUR_TEXT => {
             let class = selected_class(hwnd);
             let current = colour_of(&state.form.settings, class);
             if let Some(colour) = pick_colour(hwnd, current.text, COLOR_WINDOWTEXT) {
-                colour_of_mut(&mut state.form.settings, class).text = colour;
-                update_colour_preview(hwnd, &state.form);
+                let stored = colour_of_mut(&mut state.form.settings, class);
+                stored.text = colour;
+                stored.text_enabled = true;
+                update_colour_controls(hwnd, &state.form);
             }
             true
         }
@@ -516,13 +595,14 @@ fn on_command(hwnd: HWND, wparam: WPARAM) -> bool {
             let current = colour_of(&state.form.settings, class);
             if let Some(colour) = pick_colour(hwnd, current.background, COLOR_WINDOW) {
                 colour_of_mut(&mut state.form.settings, class).background = colour;
-                update_colour_preview(hwnd, &state.form);
+                colour_of_mut(&mut state.form.settings, class).background_enabled = true;
+                update_colour_controls(hwnd, &state.form);
             }
             true
         }
         resource::IDC_SETTINGS_COLOUR_DEFAULTS => {
             state.form.settings.colours = rusthashtab_settings::RowColours::default();
-            update_colour_preview(hwnd, &state.form);
+            update_colour_controls(hwnd, &state.form);
             true
         }
         _ => false,
@@ -702,6 +782,7 @@ fn read_options(hwnd: HWND, form: &mut SettingsForm) {
             form.set_algorithm(index, is_checked(list, index));
         }
     }
+    read_colour_controls(hwnd, form);
 }
 
 #[cfg(test)]

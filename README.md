@@ -471,7 +471,8 @@ all-algorithm target remain follow-ups recorded in the internal closure notes; t
 do not change the feature set below. The page now sorts by any column, copies through double-click, the
 context menu, `Ctrl+C` and the Copy button, cancels without blocking the dialog
 thread, keeps rows in job order while results arrive, hides the File column for a
-single file, paints five configurable row classes (with a high-contrast fallback),
+single file, paints the Digest cell for five classes with independently enabled
+foreground/background colours (with a high-contrast fallback),
 exports an explicitly selected format to a file or the clipboard, and accepts a
 bare hex/base64 digest or a whole GNU/SFV line for verification over all files or
 the current one. On the performance side the scan chooses file-level or
@@ -483,7 +484,8 @@ progress and can be cancelled.
 > 人工视觉验收与内部 150 MiB/s 全算法目标仍作为后续事项记录在内部收口记录中，不影响下面的
 > 功能范围。页面现在可按任意列
 > 排序，支持双击、右键、`Ctrl+C` 与 Copy 按钮复制，取消不会阻塞对话框线程，结果到达时始终
-> 按 job 序插入，单文件时隐藏 File 列，5 类行颜色可配置（高对比模式回退到系统色），
+> 按 job 序插入，单文件时隐藏 File 列，只给 Digest 单元格按 5 类状态上色，前景/背景可分别启用
+> （高对比模式回退到系统色），
 > 可显式选择导出格式并导出到文件或剪贴板，校验支持裸 hex/base64 或 GNU/SFV 整行，可作用于
 > 全部文件或当前文件。性能方面，扫描按文件数、算法数与核数选择文件级或算法组级调度，
 > 重复路径在 1000 文件上限之前去除，发现阶段有进度且可取消。

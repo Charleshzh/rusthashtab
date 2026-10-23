@@ -59,19 +59,37 @@ pub const SYSTEM_COLOUR: u32 = u32::MAX;
 /// Foreground and background for one row class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowColour {
-    /// Text colour, `0x00BBGGRR`, or [`SYSTEM_COLOUR`].
+    /// Text colour, `0x00BBGGRR`. Ignored when [`RowColour::text_enabled`] is
+    /// false; kept so toggling the checkbox off and on does not lose the colour.
     pub text: u32,
-    /// Background colour, `0x00BBGGRR`, or [`SYSTEM_COLOUR`].
+    /// Background colour, `0x00BBGGRR`. Ignored when
+    /// [`RowColour::background_enabled`] is false.
     pub background: u32,
+    /// Whether the foreground colour is painted.
+    pub text_enabled: bool,
+    /// Whether the background colour is painted.
+    pub background_enabled: bool,
 }
 
 impl RowColour {
-    /// Both halves from the system.
+    /// Neither half painted; both colours keep the system sentinel.
     pub const fn system() -> Self {
         Self {
             text: SYSTEM_COLOUR,
             background: SYSTEM_COLOUR,
+            text_enabled: false,
+            background_enabled: false,
         }
+    }
+
+    /// Whether a foreground colour is enabled for this class.
+    pub const fn has_text(&self) -> bool {
+        self.text_enabled
+    }
+
+    /// Whether a background colour is enabled for this class.
+    pub const fn has_background(&self) -> bool {
+        self.background_enabled
     }
 }
 
@@ -115,26 +133,43 @@ pub struct RowColours {
 }
 
 impl Default for RowColours {
-    /// Chosen for contrast on the default window background, not copied from any
-    /// other implementation. Backgrounds start as the system window colour so a
-    /// page that never opens the colour settings looks native.
+    /// The colour scheme the page has always shown in this project's reference
+    /// implementation: white text on a coloured Hash/Digest cell for a match,
+    /// weak match and mismatch; red text with no fill for a read error; and no
+    /// colour at all for an unchecked row.
+    ///
+    /// Only the Digest cell is painted. The Algorithm, Match and File cells stay
+    /// on the sheet's normal background, which is what makes a row scannable
+    /// instead of a solid block of colour.
     fn default() -> Self {
         Self {
             matched: RowColour {
-                text: 0x0000_6B00, // dark green: #006B00
-                background: SYSTEM_COLOUR,
+                // White on RGB(45,170,23).
+                text: 0x00FF_FFFF,
+                background: 0x0017_AA2D,
+                text_enabled: true,
+                background_enabled: true,
             },
             weak: RowColour {
-                text: 0x0000_6D8A, // dark goldenrod: #8A6D00
-                background: SYSTEM_COLOUR,
+                // White on RGB(170,82,23).
+                text: 0x00FF_FFFF,
+                background: 0x0017_52AA,
+                text_enabled: true,
+                background_enabled: true,
             },
             mismatched: RowColour {
-                text: 0x0020_00B0, // dark red: #B00020
-                background: SYSTEM_COLOUR,
+                // White on RGB(230,55,23).
+                text: 0x00FF_FFFF,
+                background: 0x0017_37E6,
+                text_enabled: true,
+                background_enabled: true,
             },
             error: RowColour {
-                text: 0x0000_00A0, // dark red: #A00000
+                // Red text, no fill.
+                text: 0x0017_37FF,
                 background: SYSTEM_COLOUR,
+                text_enabled: true,
+                background_enabled: false,
             },
             neutral: RowColour::system(),
         }
@@ -154,6 +189,25 @@ pub fn colour_value_name(class: ColourClass, part: ColourPart) -> &'static str {
         (ColourClass::Error, ColourPart::Background) => "ColourErrorBackground",
         (ColourClass::Neutral, ColourPart::Text) => "ColourNeutralText",
         (ColourClass::Neutral, ColourPart::Background) => "ColourNeutralBackground",
+    }
+}
+
+/// The registry value name for one colour half's enable flag.
+///
+/// Kept separate from the colour value so turning a half off does not destroy the
+/// colour the user picked: re-enabling restores it.
+pub fn colour_enabled_value_name(class: ColourClass, part: ColourPart) -> &'static str {
+    match (class, part) {
+        (ColourClass::Matched, ColourPart::Text) => "ColourMatchedTextEnabled",
+        (ColourClass::Matched, ColourPart::Background) => "ColourMatchedBackgroundEnabled",
+        (ColourClass::Weak, ColourPart::Text) => "ColourWeakTextEnabled",
+        (ColourClass::Weak, ColourPart::Background) => "ColourWeakBackgroundEnabled",
+        (ColourClass::Mismatched, ColourPart::Text) => "ColourMismatchTextEnabled",
+        (ColourClass::Mismatched, ColourPart::Background) => "ColourMismatchBackgroundEnabled",
+        (ColourClass::Error, ColourPart::Text) => "ColourErrorTextEnabled",
+        (ColourClass::Error, ColourPart::Background) => "ColourErrorBackgroundEnabled",
+        (ColourClass::Neutral, ColourPart::Text) => "ColourNeutralTextEnabled",
+        (ColourClass::Neutral, ColourPart::Background) => "ColourNeutralBackgroundEnabled",
     }
 }
 
@@ -454,70 +508,34 @@ mod registry {
             read_bool(&key, "VerifyAutoFormat", settings.verify_auto_format);
 
         let defaults = settings.colours;
-        let read = |class, part, fallback| {
-            read_dword(&key, super::colour_value_name(class, part)).unwrap_or(fallback)
+        let read_colour = |class, fallback: super::RowColour| super::RowColour {
+            text: read_dword(
+                &key,
+                super::colour_value_name(class, super::ColourPart::Text),
+            )
+            .unwrap_or(fallback.text),
+            background: read_dword(
+                &key,
+                super::colour_value_name(class, super::ColourPart::Background),
+            )
+            .unwrap_or(fallback.background),
+            text_enabled: read_bool(
+                &key,
+                super::colour_enabled_value_name(class, super::ColourPart::Text),
+                fallback.text_enabled,
+            ),
+            background_enabled: read_bool(
+                &key,
+                super::colour_enabled_value_name(class, super::ColourPart::Background),
+                fallback.background_enabled,
+            ),
         };
         settings.colours = super::RowColours {
-            matched: super::RowColour {
-                text: read(
-                    super::ColourClass::Matched,
-                    super::ColourPart::Text,
-                    defaults.matched.text,
-                ),
-                background: read(
-                    super::ColourClass::Matched,
-                    super::ColourPart::Background,
-                    defaults.matched.background,
-                ),
-            },
-            weak: super::RowColour {
-                text: read(
-                    super::ColourClass::Weak,
-                    super::ColourPart::Text,
-                    defaults.weak.text,
-                ),
-                background: read(
-                    super::ColourClass::Weak,
-                    super::ColourPart::Background,
-                    defaults.weak.background,
-                ),
-            },
-            mismatched: super::RowColour {
-                text: read(
-                    super::ColourClass::Mismatched,
-                    super::ColourPart::Text,
-                    defaults.mismatched.text,
-                ),
-                background: read(
-                    super::ColourClass::Mismatched,
-                    super::ColourPart::Background,
-                    defaults.mismatched.background,
-                ),
-            },
-            error: super::RowColour {
-                text: read(
-                    super::ColourClass::Error,
-                    super::ColourPart::Text,
-                    defaults.error.text,
-                ),
-                background: read(
-                    super::ColourClass::Error,
-                    super::ColourPart::Background,
-                    defaults.error.background,
-                ),
-            },
-            neutral: super::RowColour {
-                text: read(
-                    super::ColourClass::Neutral,
-                    super::ColourPart::Text,
-                    defaults.neutral.text,
-                ),
-                background: read(
-                    super::ColourClass::Neutral,
-                    super::ColourPart::Background,
-                    defaults.neutral.background,
-                ),
-            },
+            matched: read_colour(super::ColourClass::Matched, defaults.matched),
+            weak: read_colour(super::ColourClass::Weak, defaults.weak),
+            mismatched: read_colour(super::ColourClass::Mismatched, defaults.mismatched),
+            error: read_colour(super::ColourClass::Error, defaults.error),
+            neutral: read_colour(super::ColourClass::Neutral, defaults.neutral),
         };
         settings.sumfile_uppercase =
             read_bool(&key, "SumfileUppercase", settings.sumfile_uppercase);
@@ -611,6 +629,16 @@ mod registry {
                 key,
                 super::colour_value_name(class, super::ColourPart::Background),
                 colour.background,
+            )?;
+            write_bool(
+                key,
+                super::colour_enabled_value_name(class, super::ColourPart::Text),
+                colour.text_enabled,
+            )?;
+            write_bool(
+                key,
+                super::colour_enabled_value_name(class, super::ColourPart::Background),
+                colour.background_enabled,
             )?;
         }
         write_bool(key, "SumfileUppercase", settings.sumfile_uppercase)?;
@@ -745,6 +773,34 @@ mod tests {
         let settings = Settings::default();
         assert!(!settings.is_enabled(99, &names()));
         assert!(!settings.is_enabled(0, &[]));
+    }
+
+    /// The colour and enabled-flag registry names are all distinct, so one
+    /// class's colour cannot overwrite another class's flag.
+    #[test]
+    fn every_colour_half_has_distinct_value_and_enabled_names() {
+        use super::{ColourClass, ColourPart, colour_enabled_value_name, colour_value_name};
+        let classes = [
+            ColourClass::Matched,
+            ColourClass::Weak,
+            ColourClass::Mismatched,
+            ColourClass::Error,
+            ColourClass::Neutral,
+        ];
+        let parts = [ColourPart::Text, ColourPart::Background];
+        let mut names = std::collections::HashSet::new();
+        for class in classes {
+            for part in parts {
+                assert!(
+                    names.insert(colour_value_name(class, part)),
+                    "duplicate colour name for {class:?}/{part:?}"
+                );
+                assert!(
+                    names.insert(colour_enabled_value_name(class, part)),
+                    "duplicate enabled name for {class:?}/{part:?}"
+                );
+            }
+        }
     }
 
     /// Every field has a value name, and every name is distinct. A duplicate
@@ -978,6 +1034,8 @@ mod tests {
                 matched: RowColour {
                     text: 0x0012_3456,
                     background: 0x0065_4321,
+                    text_enabled: false,
+                    background_enabled: true,
                 },
                 ..RowColours::default()
             },
