@@ -49,6 +49,15 @@ pub const MACHINE_FORCE_DISABLE_LOOKUP: &str = "ForceDisableLookup";
 /// A per-user language override, holding an LCID.
 pub const LANG_ID_OVERRIDE: &str = "LangIdOverride";
 
+/// Version of the colour layout in the registry.
+///
+/// Version 1 stored only ten colour values. Version 2 adds a separate enable flag
+/// per half and changes the defaults from text-only colours to the reference
+/// white-on-fill scheme. A key without this marker predates the flags, so its
+/// colour values are ignored once and replaced with the new defaults; otherwise
+/// an old dark-green text value would be paired with a new green fill.
+pub const COLOURS_VERSION: u32 = 2;
+
 /// The sentinel a colour uses to mean "whatever the system uses".
 ///
 /// A `COLORREF` has only 24 meaningful bits; the reserved high byte is free, so a
@@ -530,13 +539,18 @@ mod registry {
                 fallback.background_enabled,
             ),
         };
-        settings.colours = super::RowColours {
-            matched: read_colour(super::ColourClass::Matched, defaults.matched),
-            weak: read_colour(super::ColourClass::Weak, defaults.weak),
-            mismatched: read_colour(super::ColourClass::Mismatched, defaults.mismatched),
-            error: read_colour(super::ColourClass::Error, defaults.error),
-            neutral: read_colour(super::ColourClass::Neutral, defaults.neutral),
-        };
+        // A key written before the enable flags existed has colour values but no
+        // version marker. Pairing an old dark-green text with the new green fill
+        // would be unreadable, so that one upgrade resets to the new defaults.
+        if read_dword(&key, "ColoursVersion").unwrap_or(0) >= super::COLOURS_VERSION {
+            settings.colours = super::RowColours {
+                matched: read_colour(super::ColourClass::Matched, defaults.matched),
+                weak: read_colour(super::ColourClass::Weak, defaults.weak),
+                mismatched: read_colour(super::ColourClass::Mismatched, defaults.mismatched),
+                error: read_colour(super::ColourClass::Error, defaults.error),
+                neutral: read_colour(super::ColourClass::Neutral, defaults.neutral),
+            };
+        }
         settings.sumfile_uppercase =
             read_bool(&key, "SumfileUppercase", settings.sumfile_uppercase);
         settings.sumfile_unix_endings = read_bool(&key, "SumfileLF", settings.sumfile_unix_endings);
@@ -613,6 +627,7 @@ mod registry {
         write_bool(key, "LookForSumfiles", settings.look_for_sumfiles)?;
         write_bool(key, "VerifyStrict", settings.verify_strict)?;
         write_bool(key, "VerifyAutoFormat", settings.verify_auto_format)?;
+        write_dword(key, "ColoursVersion", super::COLOURS_VERSION)?;
         for (class, colour) in [
             (super::ColourClass::Matched, settings.colours.matched),
             (super::ColourClass::Weak, settings.colours.weak),

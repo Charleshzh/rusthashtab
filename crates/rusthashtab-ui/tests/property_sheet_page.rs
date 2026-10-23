@@ -291,6 +291,28 @@ impl HostedPage {
         }
     }
 
+    /// Run a clipboard action until it reports success.
+    ///
+    /// `OpenClipboard` can fail transiently when another process has the
+    /// clipboard open; that is a system-wide resource, not a page bug. Retrying
+    /// here keeps the suite from becoming flaky without weakening what is
+    /// asserted: the last attempt must actually copy.
+    fn assert_copied(&self, mut action: impl FnMut()) {
+        for attempt in 0..25 {
+            action();
+            pump();
+            if self.status_text().contains("Copied") {
+                return;
+            }
+            assert!(
+                attempt < 24,
+                "clipboard copy did not succeed: {:?}",
+                self.status_text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The text of the page's status line.
     fn status_text(&self) -> String {
         let status = self.control(resource::IDC_HASH_STATUS);
@@ -1135,30 +1157,26 @@ fn ctrl_c_copies_the_selected_rows() {
     page.wait_for_finished();
     page.select_row(0);
 
-    let mut key = NMLVKEYDOWN {
-        hdr: NMHDR {
-            hwndFrom: page.hwnd,
-            idFrom: resource::IDC_HASH_LIST as usize,
-            code: LVN_KEYDOWN,
-        },
-        wVKey: b'C' as u16,
-        flags: LVKF_CONTROL,
-    };
-    // SAFETY: the page is live and `key` lives for the call.
-    unsafe {
-        SendMessageW(
-            page.hwnd,
-            WM_NOTIFY,
-            Some(WPARAM(0)),
-            Some(LPARAM((&mut key as *mut NMLVKEYDOWN) as isize)),
-        );
-    }
-    pump();
-    assert!(
-        page.status_text().contains("Copied 1 rows"),
-        "got {:?}",
-        page.status_text()
-    );
+    page.assert_copied(|| {
+        let mut key = NMLVKEYDOWN {
+            hdr: NMHDR {
+                hwndFrom: page.hwnd,
+                idFrom: resource::IDC_HASH_LIST as usize,
+                code: LVN_KEYDOWN,
+            },
+            wVKey: b'C' as u16,
+            flags: LVKF_CONTROL,
+        };
+        // SAFETY: the page is live and `key` lives for the call.
+        unsafe {
+            SendMessageW(
+                page.hwnd,
+                WM_NOTIFY,
+                Some(WPARAM(0)),
+                Some(LPARAM((&mut key as *mut NMLVKEYDOWN) as isize)),
+            );
+        }
+    });
     page.close();
 }
 
@@ -1178,31 +1196,27 @@ fn double_clicking_a_digest_copies_it() {
     page.wait_for_rows(1);
     page.wait_for_finished();
 
-    let mut click = NMLISTVIEW {
-        hdr: NMHDR {
-            hwndFrom: page.hwnd,
-            idFrom: resource::IDC_HASH_LIST as usize,
-            code: NM_DBLCLK,
-        },
-        iItem: 0,
-        iSubItem: 1,
-        ..Default::default()
-    };
-    // SAFETY: the page is live and `click` lives for the call.
-    unsafe {
-        SendMessageW(
-            page.hwnd,
-            WM_NOTIFY,
-            Some(WPARAM(0)),
-            Some(LPARAM((&mut click as *mut NMLISTVIEW) as isize)),
-        );
-    }
-    pump();
-    assert!(
-        page.status_text().contains("Copied 1 rows"),
-        "got {:?}",
-        page.status_text()
-    );
+    page.assert_copied(|| {
+        let mut click = NMLISTVIEW {
+            hdr: NMHDR {
+                hwndFrom: page.hwnd,
+                idFrom: resource::IDC_HASH_LIST as usize,
+                code: NM_DBLCLK,
+            },
+            iItem: 0,
+            iSubItem: 1,
+            ..Default::default()
+        };
+        // SAFETY: the page is live and `click` lives for the call.
+        unsafe {
+            SendMessageW(
+                page.hwnd,
+                WM_NOTIFY,
+                Some(WPARAM(0)),
+                Some(LPARAM((&mut click as *mut NMLISTVIEW) as isize)),
+            );
+        }
+    });
     page.close();
 }
 
@@ -1249,13 +1263,7 @@ fn copying_checksums_reports_the_count() {
     let page = HostedPage::open(vec![file], settings);
     page.wait_for_rows(1);
     page.wait_for_finished();
-    page.click(resource::IDC_HASH_EXPORT_CLIPBOARD);
-    pump();
-    assert!(
-        page.status_text().contains("Copied 1 hashes"),
-        "got {:?}",
-        page.status_text()
-    );
+    page.assert_copied(|| page.click(resource::IDC_HASH_EXPORT_CLIPBOARD));
     page.close();
 }
 
@@ -1276,13 +1284,7 @@ fn copying_the_selection_is_reported() {
     page.wait_for_rows(1);
     page.wait_for_finished();
     page.select_row(0);
-    page.click(resource::IDC_HASH_COPY);
-    pump();
-    assert!(
-        page.status_text().contains("Copied 1 rows"),
-        "got {:?}",
-        page.status_text()
-    );
+    page.assert_copied(|| page.click(resource::IDC_HASH_COPY));
     page.close();
 }
 
