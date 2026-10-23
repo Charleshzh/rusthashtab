@@ -49,6 +49,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     let mut scheduling: Option<String> = None;
     let mut files = 1usize;
     let mut all_algorithms = true;
+    let mut single_algorithm: Option<String> = None;
     let mut groups: Option<usize> = None;
 
     let mut i = 0;
@@ -75,14 +76,28 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 i += 2;
             }
             "--algorithms" => {
-                all_algorithms = match args.get(i + 1).map(String::as_str) {
-                    Some("default") => false,
-                    Some("all") => true,
+                match args.get(i + 1).map(String::as_str) {
+                    Some("default") => {
+                        all_algorithms = false;
+                        single_algorithm = None;
+                    }
+                    Some("all") => {
+                        all_algorithms = true;
+                        single_algorithm = None;
+                    }
+                    Some(name)
+                        if registry::ALGORITHMS
+                            .iter()
+                            .any(|algorithm| algorithm.name == name) =>
+                    {
+                        all_algorithms = false;
+                        single_algorithm = Some(name.to_string());
+                    }
                     _ => {
-                        eprintln!("bench: --algorithms needs default or all");
+                        eprintln!("bench: --algorithms needs default, all, or an algorithm name");
                         return ExitCode::from(2);
                     }
-                };
+                }
                 i += 2;
             }
             "--groups" => {
@@ -131,7 +146,16 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     let skip = passes / 5; // 20% trimmed from each end
 
     if let Some(mode) = scheduling {
-        return report_scan(size, passes, skip, files, &mode, all_algorithms, groups);
+        return report_scan(ScanOptions {
+            size,
+            passes,
+            skip,
+            files,
+            mode: &mode,
+            all_algorithms,
+            single_algorithm: single_algorithm.as_deref(),
+            forced_groups: groups,
+        });
     }
 
     if combined {
@@ -210,16 +234,30 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Measure the real scan pipeline under one scheduling policy.
-fn report_scan(
+/// The independent knobs of one real-scan measurement.
+struct ScanOptions<'a> {
     size: usize,
     passes: usize,
     skip: usize,
     files: usize,
-    mode: &str,
+    mode: &'a str,
     all_algorithms: bool,
+    single_algorithm: Option<&'a str>,
     forced_groups: Option<usize>,
-) -> ExitCode {
+}
+
+/// Measure the real scan pipeline under one scheduling policy.
+fn report_scan(options: ScanOptions<'_>) -> ExitCode {
+    let ScanOptions {
+        size,
+        passes,
+        skip,
+        files,
+        mode,
+        all_algorithms,
+        single_algorithm,
+        forced_groups,
+    } = options;
     let scheduling = match mode {
         "auto" => Scheduling::Auto,
         "file" => Scheduling::FileLevel,
@@ -276,7 +314,10 @@ fn report_scan(
     let defaults = ["MD5", "SHA-1", "SHA-256", "SHA-512"];
     let enabled: Vec<bool> = registry::ALGORITHMS
         .iter()
-        .map(|algorithm| all_algorithms || defaults.contains(&algorithm.name))
+        .map(|algorithm| match single_algorithm {
+            Some(name) => algorithm.name == name,
+            None => all_algorithms || defaults.contains(&algorithm.name),
+        })
         .collect();
 
     let mut times = Vec::with_capacity(passes);
@@ -310,7 +351,7 @@ fn report_scan(
     let mibps = (size as f64 / (1 << 20) as f64) / average;
     println!(
         "scheduling {mode}, {files} file(s), {} algorithms, {} MiB, {passes} passes: {mibps:.1} MiB/s",
-        if all_algorithms { "all" } else { "default 4" },
+        single_algorithm.unwrap_or(if all_algorithms { "all" } else { "default 4" }),
         size / (1 << 20)
     );
     ExitCode::SUCCESS

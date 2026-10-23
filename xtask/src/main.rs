@@ -124,7 +124,7 @@ cargo xtask <command>
   bench     Measure throughput per algorithm, the combined set with
             --combined, or the real scan pipeline with --scheduling.
             --passes N   --size MiB   --filter SUBSTR   --combined
-            --scheduling auto|file|algorithm   --algorithms default|all
+            --scheduling auto|file|algorithm   --algorithms default|all|NAME
             --files N   --groups N
 
   audit     Print the correctness-coverage map: which algorithm is validated by
