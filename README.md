@@ -465,10 +465,10 @@ large result sets.
 > 真正生效的等宽字体、显式导出格式下拉与剪贴板导出、剪贴板驱动的校验。性能方面：
 > 组合吞吐基准、重复路径去重、扫描自有线程上的单文件算法并行，以及大结果集的渲染改进。
 
-**Status: done — the automated gate passes and the page is verified in a real
-property sheet.** A manual visual pass in `explorer.exe` and the internal 150 MiB/s
-all-algorithm target remain follow-ups recorded in the internal closure notes; they
-do not change the feature set below. The page now sorts by any column, copies through double-click, the
+**Status: done — manual visual acceptance passed in a real `explorer.exe` Properties
+dialog on 2026-10-23, and the automated gate is green.** The internal 150 MiB/s
+all-algorithm target remains a recorded performance gap; it does not change the
+feature set below. The page now sorts by any column, copies through double-click, the
 context menu, `Ctrl+C` and the Copy button, cancels without blocking the dialog
 thread, keeps rows in job order while results arrive, hides the File column for a
 single file, paints the Digest cell for five classes with independently enabled
@@ -480,9 +480,9 @@ algorithm-group scheduling from the file count, algorithm count and core count,
 duplicate paths are removed before the 1000-file cap, and discovery reports
 progress and can be cancelled.
 
-> **状态：已完成——自动门禁通过，页面已在真实属性表中验证。** 真实 `explorer.exe` 的
-> 人工视觉验收与内部 150 MiB/s 全算法目标仍作为后续事项记录在内部收口记录中，不影响下面的
-> 功能范围。页面现在可按任意列
+> **状态：已完成——2026-10-23 已在真实 `explorer.exe` 属性对话框中通过人工视觉验收，
+> 自动门禁通过。** 内部 150 MiB/s 全算法目标仍作为已知性能差距记录，不影响下面的功能范围。
+> 页面现在可按任意列
 > 排序，支持双击、右键、`Ctrl+C` 与 Copy 按钮复制，取消不会阻塞对话框线程，结果到达时始终
 > 按 job 序插入，单文件时隐藏 File 列，只给 Digest 单元格按 5 类状态上色，前景/背景可分别启用
 > （高对比模式回退到系统色），
@@ -566,7 +566,7 @@ shipped file), and an install→use→uninstall pass on a clean VM.
 | Phase 2 scan pipeline / 第二阶段扫描管线 | ✅ done / 已完成 |
 | Phase 3 property sheet page / 第三阶段属性页 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
 | Phase 4 checksum files, verification and settings / 第四阶段 —— 校验和文件、校验与设置 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
-| Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ✅ done, automated gate green, verified in a real property sheet; explorer visual pass tracked as a follow-up / 已完成，自动门禁通过，已在真实属性表中验证；explorer 视觉验收作为后续事项跟踪 |
+| Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ✅ done, automated gate green, manual visual acceptance passed in a real explorer.exe Properties dialog on 2026-10-23 / 已完成，自动门禁通过，2026-10-23 已在真实 explorer.exe 属性对话框中通过人工视觉验收 |
 | Phase 6 workflows / 第六阶段 —— 工作流 | ⬜ not started / 未开始 |
 | Phase 7 context menu, standalone mode, file associations / 第七阶段 —— 右键菜单、独立模式、文件关联 | ⬜ not started / 未开始 |
 | Phase 8 localization and optional network features / 第八阶段 —— 本地化与可选联网 | ⬜ not started / 未开始 |
