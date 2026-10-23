@@ -467,8 +467,9 @@ large result sets.
 
 **Status: done — manual visual acceptance passed in a real `explorer.exe` Properties
 dialog on 2026-10-23, and the automated gate is green.** The internal 150 MiB/s
-all-algorithm target remains a recorded performance gap; it does not change the
-feature set below. The page now sorts by any column, copies through double-click, the
+all-algorithm target was not reached and is accepted as a documented gap in the
+internal closure record (64 MiB: 131.6–140.4 MiB/s at 20 passes); it does not change
+the feature set below. The page now sorts by any column, copies through double-click, the
 context menu, `Ctrl+C` and the Copy button, cancels without blocking the dialog
 thread, keeps rows in job order while results arrive, hides the File column for a
 single file, paints the Digest cell for five classes with independently enabled
@@ -482,8 +483,8 @@ duplicate paths are removed before the 1000-file cap, and discovery reports
 progress and can be cancelled.
 
 > **状态：已完成——2026-10-23 已在真实 `explorer.exe` 属性对话框中通过人工视觉验收，
-> 自动门禁通过。** 内部 150 MiB/s 全算法目标仍作为已知性能差距记录，不影响下面的功能范围。
-> 页面现在可按任意列
+> 自动门禁通过。** 内部 150 MiB/s 全算法目标未达成，已按计划在内部收口记录中书面接受为
+> 已知差距（64 MiB、20 轮：131.6–140.4 MiB/s），不影响下面的功能范围。页面现在可按任意列
 > 排序，支持双击、右键、`Ctrl+C` 与 Copy 按钮复制，取消不会阻塞对话框线程，结果到达时始终
 > 按 job 序插入，单文件时隐藏 File 列，只给 Digest 单元格按 5 类状态上色，前景/背景可分别启用
 > （设置页有真实颜色样本，高对比模式回退到系统色），
