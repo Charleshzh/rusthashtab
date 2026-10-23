@@ -291,16 +291,83 @@ fn assign_algorithms(active: &[usize], groups: usize) -> Vec<Vec<usize>> {
 
 /// A rough relative cost for one algorithm.
 ///
-/// The absolute values do not matter, only the ratios. Keep this table in step
-/// with the bench output when an algorithm changes materially; the default is
-/// deliberately not zero, so an unlisted algorithm is still scheduled.
+/// The absolute values do not matter, only the ratios. Values are
+/// `round(10000 / MiB/s)` from the release `cargo xtask bench --size 64
+/// --passes 5` table (2026-10-23), so a group's load is proportional to the CPU
+/// time it will spend on one MiB.
+///
+/// The previous table had two problems: it named `eD2k-ED2K` and
+/// `ParallelHash*` instead of the real registry names, so those fell through to
+/// the default; and it valued GOST/SHA3/K12 far above their measured cost while
+/// undervaluing MD5/RipeMD/QuickXor. That made the greedy assignment put two
+/// slow Keccak algorithms on one thread while another idled. Keep this table in
+/// step with the bench output when an algorithm changes materially; the default
+/// is deliberately not zero, so an unlisted algorithm is still scheduled.
 fn cost(index: usize) -> u32 {
     match ALGORITHMS.get(index).map(|algorithm| algorithm.name) {
-        Some("GOST 2012 (512)") | Some("GOST 2012 (256)") => 120,
-        Some("SHA3-512") | Some("SHA3-384") | Some("SHA3-256") | Some("SHA3-224") => 55,
-        Some("K12-264") | Some("ParallelHash256-528") | Some("ParallelHash128-256") => 60,
-        Some("BLAKE2sp") | Some("eD2k-ED2K") | Some("eD2k-EMule") => 35,
-        Some("RipeMD160") | Some("MD4") => 20,
+        Some("GOST 2012 (256)") | Some("GOST 2012 (512)") => 47,
+        Some("SHA3-512") => 28,
+        Some("SHA3-384") => 19,
+        Some("SHA3-256") => 15,
+        Some("SHA3-224") => 14,
+        Some("PH256-528") => 15,
+        Some("PH128-264") => 12,
+        Some("RipeMD160") => 28,
+        Some("MD5") => 13,
+        Some("QuickXorHash") => 13,
+        Some("SHA-384") | Some("SHA-512") => 10,
+        Some("MD4") => 8,
+        Some("eD2k") | Some("eD2k (Old)") => 8,
+        Some("K12-264") | Some("K12-256") | Some("K12-512") => 7,
+        Some("SHA-1") => 4,
+        Some("CRC64") => 3,
+        Some("SHA-224") | Some("SHA-256") | Some("Blake2sp") => 3,
+        Some("XXH32") | Some("XXH64") | Some("BLAKE3") | Some("BLAKE3-512") => 2,
+        Some("CRC32") | Some("XXH3-64") | Some("XXH3-128") => 1,
         _ => 10,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn index_of(name: &str) -> usize {
+        ALGORITHMS
+            .iter()
+            .position(|algorithm| algorithm.name == name)
+            .expect("the algorithm is in the table")
+    }
+
+    /// The two algorithms whose names were wrong in the old cost table must not
+    /// fall through to the default again.
+    #[test]
+    fn the_cost_table_names_the_measured_algorithms() {
+        assert_eq!(cost(index_of("eD2k")), 8);
+        assert_eq!(cost(index_of("eD2k (Old)")), 8);
+        assert_eq!(cost(index_of("PH128-264")), 12);
+        assert_eq!(cost(index_of("PH256-528")), 15);
+        assert_eq!(cost(index_of("GOST 2012 (256)")), 47);
+        assert_eq!(cost(index_of("SHA3-512")), 28);
+    }
+
+    /// Seven groups is the one-file policy on an eight-core machine; the
+    /// measured weights should spread 31 algorithms almost evenly.
+    #[test]
+    fn seven_groups_get_balanced_loads() {
+        let active: Vec<usize> = (0..ALGORITHMS.len()).collect();
+        let buckets = assign_algorithms(&active, 7);
+        let loads: Vec<u32> = buckets
+            .iter()
+            .map(|bucket| bucket.iter().map(|index| cost(*index)).sum())
+            .collect();
+        let total: u32 = loads.iter().sum();
+        let max = loads.iter().copied().max().unwrap_or(0);
+        assert_eq!(buckets.iter().map(Vec::len).sum::<usize>(), active.len());
+        assert!(
+            max <= total.div_ceil(7) + 2,
+            "loads {loads:?} are not balanced around {total}/7"
+        );
     }
 }
