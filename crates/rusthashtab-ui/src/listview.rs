@@ -34,7 +34,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDIS_SELECTED, CDRF_DODEFAULT, CDRF_NEWFONT,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT, CDRF_NEWFONT,
     CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW,
     HDM_SETITEMW, HEADER_CONTROL_FORMAT_FLAGS, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
     LVCOLUMNW, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_GETHEADER, LVM_GETNEXTITEM,
@@ -821,11 +821,11 @@ pub unsafe fn custom_draw_with_palette(
                     custom.clrText = text;
                     flags = CDRF_NEWFONT;
                 }
-                // A selected row must keep the system highlight; painting a
-                // custom background over it would make the selection disappear.
-                if let Some(background) = background
-                    && (custom.nmcd.uItemState.0 & CDIS_SELECTED.0) == 0
-                {
+                // Paint the fill even on a selected row. The control's
+                // selection highlight is drawn under the cell; leaving the
+                // background unset here made white matched text invisible on a
+                // selected row because the default background was still light.
+                if let Some(background) = background {
                     custom.clrTextBk = background;
                     flags = CDRF_NEWFONT;
                 }
@@ -1087,6 +1087,30 @@ mod tests {
                 assert_eq!(draw.clrTextBk, background, "row {row} background");
             }
         }
+    }
+
+    /// A selected row still gets the Digest fill. Skipping it made white
+    /// matched text disappear on a selected row, because the default cell
+    /// background was left light.
+    #[test]
+    fn a_selected_digest_cell_still_gets_its_fill() {
+        use windows::Win32::UI::Controls::CDIS_SELECTED;
+
+        let rows = vec![row_for(
+            MatchState::Matched {
+                algorithm: 0,
+                secure: true,
+            },
+            None,
+        )];
+        let mut draw = custom_draw_at(CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0, Some(0));
+        draw.iSubItem = DIGEST_SUBITEM;
+        draw.nmcd.uItemState.0 |= CDIS_SELECTED.0;
+        // SAFETY: `draw` is a live `NMLVCUSTOMDRAW` for this call.
+        let answer = unsafe { custom_draw(draw_ptr(&mut draw), &rows, 0) };
+        assert_eq!(answer, Some(CDRF_NEWFONT as isize));
+        assert_eq!(draw.clrText, COLORREF(0x00FF_FFFF));
+        assert_eq!(draw.clrTextBk, COLORREF(0x0017_AA2D));
     }
 
     /// The other columns are deliberately left to the control's default drawing.
