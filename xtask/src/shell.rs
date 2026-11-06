@@ -1,6 +1,15 @@
-//! `cargo xtask shell-check` -- build the shell extension, and optionally register
-//! it, so the page can be looked at inside the real `explorer.exe` Properties
-//! dialog.
+//! `cargo xtask shell-check` -- build the shell extension DLL and the standalone
+//! launcher EXE, and optionally register the extension, so the page can be looked
+//! at inside the real `explorer.exe` Properties dialog.
+//!
+//! # Two artifacts, one registration
+//!
+//! Phase 7 ships a pair: `rusthashtab_shell.dll` is the COM server and owns the
+//! property page, the context menu and the standalone window; `rusthashtab.exe` is
+//! a thin launcher that loads that DLL from its own directory and calls its
+//! `StandaloneEntryW` export. Only the DLL is registered -- the EXE needs no
+//! registry entry, because it is started directly -- so `--register` and
+//! `--unregister` still run `regsvr32` against the DLL alone.
 //!
 //! # Why this is not part of `check`
 //!
@@ -15,8 +24,10 @@
 //! `tests/property_sheet_page.rs` hosts the page in a real dialog and checks that
 //! results appear, and `tests/session.rs` checks the hashing. What neither can reach
 //! is the property sheet itself: `PropertySheetW` is modal, and the page only has to
-//! receive messages. So the last step -- "does this appear in a file's Properties
-//! dialog without taking the desktop down" -- is a human looking at it, and this
+//! receive messages. The context menu and the standalone window sit in the same
+//! blind spot: they need a real shell, a real desktop and a human deciding whether
+//! they look right. So the last step -- "does this appear where a user expects it,
+//! and does closing it leave explorer alive" -- is a human looking at it, and this
 //! command exists to make that step a single command rather than an afternoon of
 //! `regsvr32` archaeology.
 
@@ -25,6 +36,13 @@ use std::process::{Command, ExitCode};
 
 /// The shipping target, the only one this command builds.
 const TARGET: &str = "x86_64-pc-windows-msvc";
+
+/// The registered shell extension.
+const DLL_NAME: &str = "rusthashtab_shell.dll";
+
+/// The standalone launcher. It loads the DLL from its own directory at run time,
+/// so it must be copied to wherever the DLL ends up.
+const EXE_NAME: &str = "rusthashtab.exe";
 
 /// What to do to the registry, if anything.
 enum Registry {
@@ -64,14 +82,19 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     };
 
     // A release build, because the DLL is about to be loaded into explorer.exe and a
-    // debug one links a different CRT and is far slower at hashing.
-    println!("=== building the shell extension ({TARGET}, release) ===");
+    // debug one links a different CRT and is far slower at hashing. The launcher is
+    // built in the same profile so the pair that is printed is the pair that ships.
+    println!(
+        "=== building the shell extension and the standalone launcher ({TARGET}, release) ==="
+    );
     let built = Command::new("cargo")
         .current_dir(&workspace)
         .args([
             "build",
             "--package",
             "rusthashtab-shell",
+            "--package",
+            "rusthashtab-standalone",
             "--release",
             "--target",
             TARGET,
@@ -89,50 +112,72 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         }
     }
 
-    let dll = workspace
-        .join("target")
-        .join(TARGET)
-        .join("release")
-        .join("rusthashtab_shell.dll");
-    if !dll.is_file() {
-        eprintln!(
-            "shell-check: the build reported success but produced no DLL at {}",
-            dll.display()
-        );
+    let release = workspace.join("target").join(TARGET).join("release");
+    let dll = release.join(DLL_NAME);
+    let exe = release.join(EXE_NAME);
+
+    // Both artifacts are checked for the same reason: "the build succeeded" is a
+    // statement about exit codes, not about files. A missing launcher means the
+    // standalone mode does not exist; a missing DLL means the registered extension
+    // does not either.
+    println!("\n=== artifacts ===");
+    let mut produced = true;
+    for (kind, path) in [("DLL", &dll), ("EXE", &exe)] {
+        if !path.is_file() {
+            eprintln!(
+                "shell-check: the build reported success but produced no {kind} at {}",
+                path.display()
+            );
+            produced = false;
+            continue;
+        }
+        println!("{}", path.display());
+        match std::fs::metadata(path) {
+            Ok(metadata) => println!("  {} bytes", metadata.len()),
+            Err(error) => println!("  (could not stat it: {error})"),
+        }
+    }
+    if !produced {
         return ExitCode::FAILURE;
     }
 
-    println!("\n=== artifact ===");
-    println!("{}", dll.display());
-    match std::fs::metadata(&dll) {
-        Ok(metadata) => println!("  {} bytes", metadata.len()),
-        Err(error) => println!("  (could not stat it: {error})"),
-    }
-
     // `regsvr32` is how a user would register it by hand, so using it here means the
-    // path that gets tested is the documented one rather than a private call.
+    // path that gets tested is the documented one rather than a private call. It is
+    // given the DLL only: the launcher needs no registration.
     match action {
         Registry::Untouched => {
-            println!("\nnot touching the registry. To try the page in explorer:");
+            println!("\nnot touching the registry. To try the extension in explorer:");
             println!("  cargo xtask shell-check --register");
-            println!("  ... open a file's Properties dialog, switch to the Hashes tab ...");
+            println!("  ... right-click a file and choose Hashes (on Windows 11 that item");
+            println!("      lives under \"Show more options\"); resize and close the window ...");
+            println!("  ... launch the launcher directly with the files to hash:");
+            println!("      \"{}\" <file> [<file> ...]", exe.display());
+            println!("  ... then open a checksum file via \"Open with\" -> rustHashTab ...");
             println!("  cargo xtask shell-check --unregister");
         }
         Registry::Register => {
-            println!("\n=== registering (per user) ===");
+            println!("\n=== registering the extension (per user) ===");
             if !regsvr32(&dll, true) {
                 return ExitCode::FAILURE;
             }
             println!("\n=== now look at it ===");
-            println!("  1. In explorer, right-click any file and choose Properties.");
-            println!("  2. Switch to the Hashes tab.");
-            println!("  3. It should list a digest per enabled algorithm and fill the bar.");
-            println!("  4. Select a row and press Copy to put it on the clipboard.");
-            println!("  5. Close the dialog. explorer must still be running.");
+            println!(
+                "The launcher needs no registration: it loads the DLL from its own directory."
+            );
+            println!("  1. In explorer, right-click any file and choose Hashes. On Windows 11");
+            println!("     that entry is under \"Show more options\".");
+            println!("  2. A window should open. Resize it, then close it. explorer must");
+            println!("     still be running.");
+            println!("  3. Launch the standalone launcher with the files to hash:");
+            println!("       \"{}\" <file> [<file> ...]", exe.display());
+            println!("     It should list a digest per enabled algorithm and fill the bar.");
+            println!("  4. Open a file's Properties dialog and switch to the Hashes tab.");
+            println!("  5. Open a checksum file via \"Open with\" -> rustHashTab and check");
+            println!("     that its entries are listed and verified against the files.");
             println!("  6. Then run: cargo xtask shell-check --unregister");
-            println!("\nIf the tab does not appear, the shell has not noticed the new");
-            println!("handler yet. Signing out and back in is the reliable fix; the");
-            println!("registration itself is already written.");
+            println!("\nIf the context-menu item or the tab does not appear, the shell has not");
+            println!("noticed the new handler yet. Signing out and back in is the reliable fix;");
+            println!("the registration itself is already written.");
         }
         Registry::Unregister => {
             println!("\n=== unregistering ===");

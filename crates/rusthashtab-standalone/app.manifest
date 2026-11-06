@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Side-by-side application manifest for rusthashtab.exe.
+
+  The launcher ships no resources of its own: the dialog templates and the
+  version resource live in rusthashtab_shell.dll, so this file is not embedded
+  in the executable. `build.rs` copies it next to the executable as
+  `rusthashtab.exe.manifest`, which is where Windows looks when the executable
+  has no manifest resource.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="rustHashTab.Standalone"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+  <description>rustHashTab</description>
+
+  <!-- Common Controls v6. Without this dependency the window would fall back to
+       the version 5 comctl32, which lacks the visual styles and the message
+       behaviour the list view and progress bar are built against. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- Never request elevation: the standalone window reads and hashes files the
+       invoking user can already read, exactly like the property page. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Windows 10 and Windows 11 share this GUID; the launcher supports nothing
+       older, so no other supportedOS entry is listed. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- Per-monitor DPI awareness v2, so the window is resized and re-laid-out
+           by Windows when it crosses a monitor with a different scale factor.
+           `main.rs` calls SetProcessDpiAwarenessContext as a belt-and-braces
+           fallback for the case where the loader did not apply this manifest. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- Older spelling for Windows 8.1; harmless where dpiAwareness exists. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <!-- The launcher passes file paths through untouched; do not silently fail
+           on paths longer than MAX_PATH. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

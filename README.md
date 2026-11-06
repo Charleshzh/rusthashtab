@@ -8,13 +8,17 @@ file Properties dialog.
 Select any file, open **Properties**, and the **Hashes** tab shows its digest under
 every algorithm you have enabled — with a running progress bar. Paste a hash you were
 given and it is highlighted green or red as it matches; select a single checksum file
-and the files it lists are hashed and checked against it. The context menu, standalone
-mode, localization and installer are planned; see [Roadmap](#roadmap--路线图).
+and the files it lists are hashed and checked against it. The same results are
+available from the right-click **Hashes** command and from the standalone
+`rusthashtab.exe`, and our checksum-file extensions can be opened with rustHashTab
+through **Open with**. Localization and the installer are still planned; see
+[Roadmap](#roadmap--路线图).
 
 > 选中任意文件打开**属性**，**Hashes** 标签页会列出所有已启用算法下的摘要，
 > 并带实时进度条。粘贴别人给你的哈希值，匹配与否会直接标色；只选中一个校验和文件时，
-> 页面会哈希并校验它列出的文件。右键菜单、独立运行模式、本地化与安装器仍在路线图中，
-> 见[路线图](#roadmap--路线图)。
+> 页面会哈希并校验它列出的文件。同样的结果也可以通过右键 **Hashes** 和独立运行的
+> `rusthashtab.exe` 打开；我们生成的校验和扩展名可以在**打开方式**中选择 rustHashTab。
+> 本地化与安装器仍在路线图中，见[路线图](#roadmap--路线图)。
 
 > **Bilingual document.** Every section is written in English first, then Chinese.
 > English is authoritative; if the two disagree, English wins. **When you change one
@@ -23,18 +27,21 @@ mode, localization and installer are planned; see [Roadmap](#roadmap--路线图)
 > **本文档为中英双语。** 每节先英文、后中文。以英文为准；两者若有出入，以英文为准。
 > **改动一种语言时，必须在同一次提交中同步另一种。**
 
-> **Status: alpha.** All 31 hash algorithms are implemented and externally verified, the
-> scan pipeline is done, and the Shell Properties page verifies against pasted digests
-> and checksum files, exports them in every supported format, and has a settings dialog.
-> Workflows around checksum files are in place: a single selected checksum file is
-> interpreted as a manifest, sidecars are matched strictly, and an opt-in clipboard check
-> is available. The context menu, localization, standalone mode and the installer are
-> still to come. See [Roadmap](#roadmap--路线图).
+> **Status: beta candidate.** All 31 hash algorithms are implemented and externally
+> verified, the scan pipeline is done, and the Shell Properties page verifies against
+> pasted digests and checksum files, exports them in every supported format, and has a
+> settings dialog. Workflows around checksum files are in place: a single selected
+> checksum file is interpreted as a manifest, sidecars are matched strictly, and an
+> opt-in clipboard check is available. The context menu, the standalone launcher and
+> Open With registration are implemented and accepted in a real `explorer.exe`
+> (2026-11-06); localization and installer work are still pending. See
+> [Roadmap](#roadmap--路线图).
 >
-> **状态：alpha。** 全部 31 种哈希算法已实现并通过外部校验，扫描管线已完成；Shell 属性页
-> 现在支持用粘贴的摘要或校验和文件进行校验、按所有支持格式导出，并有设置对话框。
+> **状态：beta 候选。** 全部 31 种哈希算法已实现并通过外部校验，扫描管线已完成；Shell
+> 属性页现在支持用粘贴的摘要或校验和文件进行校验、按所有支持格式导出，并有设置对话框。
 > 校验和文件相关的工作流也已就位：只选一个校验和文件时会把它当清单解释，sidecar 采用严格
-> 匹配，并提供可选（默认关闭）的剪贴板自动校验。右键菜单、本地化、独立模式与安装器仍待开发。
+> 匹配，并提供可选（默认关闭）的剪贴板自动校验。右键菜单、独立启动器与“打开方式”注册
+> 已实现，并已于 2026-11-06 在真实 `explorer.exe` 中验收；本地化与安装器仍待完成。
 > 见[路线图](#roadmap--路线图)。
 
 ---
@@ -52,6 +59,10 @@ mode, localization and installer are planned; see [Roadmap](#roadmap--路线图)
 - **Strict sidecar verification** — `<file>.<extension>` is used only for that file and only
   for enabled algorithms; entries naming other files are reported, not guessed
 - **Optional clipboard check** — use the digest you copied as the expected value (off by default)
+- **Right-click Hashes** — the same page in a resizable window for the selected files or folder
+- **Standalone mode** — `rusthashtab.exe <path>...`; no arguments opens no window
+- **Open With registration** — checksum extensions can be opened with rustHashTab; existing
+  default associations are never changed
 - **Native look** — a real Win32 dialog, DPI-aware, no bundled toolkit
 - **Multi-architecture** — x86, x64 and ARM64
 - **Long path support**
@@ -70,6 +81,9 @@ mode, localization and installer are planned; see [Roadmap](#roadmap--路线图)
 - **严格 sidecar 校验** —— `<文件>.<扩展名>` 只用于该文件、只使用已启用算法；
   指向其它文件的条目会被报告，而不是猜测
 - **可选剪贴板校验** —— 用刚复制的摘要作为期望值（默认关闭）
+- **右键 Hashes** —— 在可缩放窗口中为所选文件或文件夹打开同一页面
+- **独立模式** —— `rusthashtab.exe <路径>...`；无参数时不打开窗口
+- **打开方式注册** —— 校验和扩展名可用 rustHashTab 打开；绝不改变已有的默认关联
 - **原生外观** —— 真正的 Win32 对话框，支持 DPI 缩放，不捆绑任何 GUI 工具包
 - **多架构** —— x86、x64 与 ARM64
 - **长路径支持**
@@ -159,6 +173,61 @@ off by default and is read once, when the page opens.
 > 正常完成后执行，且仅当 Expected 输入框为空、没有其它校验来源时生效。该选项默认关闭，
 > 剪贴板只在页面打开时读取一次。
 
+### Right-click Hashes / 右键 Hashes
+
+Select one or more files, or a folder, right-click, and choose **Hashes**. The same
+results page opens in a resizable top-level window, with the same verification, export
+and settings controls as the Properties tab. On Windows 11 this classic command appears
+under **Show more options**. The command is not offered on shortcuts: the shell marks
+that menu as a verb-only menu, and hashing the `.lnk` file is almost never what the user
+meant. Closing the window cancels the scan and waits for its workers before the window
+goes away.
+
+> 选中一个或多个文件，或一个文件夹，右键选择 **Hashes**。同一个结果页面会在可缩放的
+> 顶层窗口中打开，校验、导出与设置控件与属性页完全相同。在 Windows 11 上，这个传统命令
+> 位于 **显示更多选项** 中。快捷方式上不会出现该命令：shell 会把那种菜单标记为仅动词，
+> 而哈希 `.lnk` 文件几乎总不是用户的本意。关闭窗口会取消扫描并等待其工作线程结束。
+
+### Standalone mode / 独立模式
+
+Run `rusthashtab.exe` with the files or folders to hash:
+
+```powershell
+rusthashtab.exe "C:\downloads\payload.bin"
+rusthashtab.exe "C:\downloads" "C:\other\file.iso"
+```
+
+It opens the same window and uses the same settings as the Properties tab. A single
+checksum file is interpreted as a manifest, as in the tab. With no arguments it exits
+with code 0 without opening a window. The executable is a thin launcher: it loads
+`rusthashtab_shell.dll` from its own directory, so the two files must be kept together.
+
+> 用要哈希的文件或文件夹运行 `rusthashtab.exe`：
+>
+> ```powershell
+> rusthashtab.exe "C:\downloads\payload.bin"
+> rusthashtab.exe "C:\downloads" "C:\other\file.iso"
+> ```
+>
+> 它打开与属性页相同的窗口并使用相同设置。只选一个校验和文件时同样会按清单解释。
+> 无参数时它不打开窗口，退出码为 0。这个可执行文件只是薄启动器：它从自身目录加载
+> `rusthashtab_shell.dll`，所以两个文件必须放在一起。
+
+### Open With / 打开方式
+
+For every checksum-file extension rustHashTab can produce, registration adds rustHashTab
+to the **Open with** list. It deliberately **does not** make rustHashTab the default
+handler and never changes an existing default; choosing rustHashTab from Open with (or
+setting it as the default yourself) is the user's decision. For a local build,
+`cargo xtask shell-check --register` builds both artifacts and writes the per-user
+registration; `--unregister` removes exactly what it wrote.
+
+> 对 rustHashTab 能生成的每一种校验和扩展名，注册会把 rustHashTab 加入**打开方式**
+> 列表。它刻意**不**把自己设为默认程序，也绝不改变已有的默认关联；从“打开方式”里选择
+> rustHashTab（或用户自己把它设为默认）是用户的决定。本地构建时，
+> `cargo xtask shell-check --register` 会构建两个产物并写入按用户的注册；
+> `--unregister` 只删除它自己写入的内容。
+
 ### Export and settings / 导出与设置
 
 The format selector chooses what **Export...** writes and what **Copy checksums** puts on
@@ -226,6 +295,17 @@ cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D war
 cargo fmt --all
 ```
 
+To try a local per-user build (property page, right-click command and Open With
+registration), `cargo xtask shell-check --register` builds both the DLL and the
+standalone EXE and registers them under `HKCU`; `cargo xtask shell-check --unregister`
+removes exactly what it wrote. Do not run it on a machine where the extension is already
+installed by an installer.
+
+> 要试用本地按用户构建（属性页、右键命令与“打开方式”注册），运行
+> `cargo xtask shell-check --register`：它会构建 DLL 与独立 EXE，并写入 `HKCU`；
+> `cargo xtask shell-check --unregister` 只删除它自己写入的内容。不要在已经由安装器
+> 安装了本扩展的机器上运行它。
+
 Pass `--target` explicitly. Without it cargo builds for the **host**, which on a machine whose
 `rustup` default host is GNU means the MinGW build rather than the MSVC one that ships — a
 green test run then says nothing about the artifact users get.
@@ -290,21 +370,22 @@ crates/
   rusthashtab-settings   persisted user settings
   rusthashtab-scan       file discovery and the concurrent hashing pipeline
   rusthashtab-net        reputation/update scaffolding, not wired into the UI yet
-  rusthashtab-ui         Win32 dialog UI and the property sheet page
-  rusthashtab-shell      the shell extension DLL: COM plumbing and registration
+  rusthashtab-ui         Win32 dialog UI: property sheet page, settings, window host
+  rusthashtab-shell      the shell extension DLL: COM, registration, context menu, entry points
+  rusthashtab-standalone the thin rusthashtab.exe launcher: loads the DLL, calls StandaloneEntryW
 xtask/                   developer automation: verification, benchmarks, pre-commit gate
 docs/internal/           design notes and research -- NOT shipped / 不随发行物发布
 ```
 
 Each crate has one job. The shell-extension DLL is thin: it implements COM, registers
-itself, and delegates everything else to `rusthashtab-ui`, which is an ordinary library
-and can therefore be tested by an ordinary test binary.
+itself, hosts the window, and delegates everything else to `rusthashtab-ui`, which is an
+ordinary library and can therefore be tested by an ordinary test binary. The standalone
+executable does not link the UI: it loads the DLL at runtime, so the dialog resources and
+the page logic exist once.
 
-> 每个 crate 只负责一件事。shell 扩展 DLL 本身很薄：它只实现 COM、完成注册，其余全部
-> 委派给 `rusthashtab-ui`——那是一个普通库，因此可以用普通的测试二进制来测。
-
-> 每个 crate 只负责一件事。shell 扩展 DLL 本身很薄：它只实现 COM、创建属性页，其余全部
-> 委派出去。
+> 每个 crate 只负责一件事。shell 扩展 DLL 本身很薄：它只实现 COM、完成注册、承载窗口，
+> 其余全部委派给 `rusthashtab-ui`——那是一个普通库，因此可以用普通的测试二进制来测。
+> 独立可执行文件不链接 UI：它在运行时加载 DLL，因此对话框资源和页面逻辑只有一份。
 
 ## Correctness / 正确性
 
@@ -503,8 +584,10 @@ Properties dialog and hashes the selection there.
 * Every COM invariant the contributors' notes call out has a test: panic containment at
   the vtable slot, `Agile = false`, independent and saturating lock and object counts,
   and no global thread pool.
-* Registration is a real round trip against `HKCU` — register, read the values back,
-  unregister, confirm they are gone — and it is per-user, so installing needs no
+* Registration is exercised as a round trip against a scratch classes root — register,
+  read the values back, unregister, confirm they are gone — so the test suite never
+  touches the user's real associations. The real per-user `HKCU` registration is
+  exercised by `cargo xtask shell-check --register` in the manual pass, and it needs no
   elevation.
 * **The dialog template is checked to be in the shipped DLL.**
   `the_dll_contains_the_pages_dialog_template` opens the built DLL as a data file and
@@ -520,8 +603,9 @@ Properties dialog and hashes the selection there.
 >   会打开页面、从列表控件里读回摘要，并与算法对同一批字节的输出比对。
 > * 贡献者文档点明的每一条 COM 不变式都有测试：vtable 槽位处的 panic 收容、`Agile = false`、
 >   模块锁计数与对象计数彼此独立且饱和、不使用全局线程池。
-> * 注册是**真实**的 `HKCU` 往返：注册、读回、注销、确认已删除。而且它是按用户的，
->   安装不需要提权。
+> * 注册测试在**scratch classes root** 上做往返：注册、读回、注销、确认已删除，
+>   因此测试套件不会碰用户的真实关联。真实的按用户 `HKCU` 注册由人工验收中的
+>   `cargo xtask shell-check --register` 覆盖，且不需要提权。
 > * **对话框模板「在不在发行 DLL 里」是被检查的。**
 >   `the_dll_contains_the_pages_dialog_template` 把构建出的 DLL 当数据文件打开，
 >   断言 `RT_DIALOG 101` 能从中取到。这条检查之所以存在，是因为页面曾经在
@@ -636,19 +720,40 @@ the opt-in clipboard check, the new settings at 150%/200% DPI, and a clean close
 > sidecar 匹配、「全部文件 / 当前文件」校验作用域与状态行命中的文件×算法、可选的剪贴板
 > 自动校验、150%/200% DPI 下的新增设置项，以及关闭属性对话框后 `explorer.exe` 仍存活。
 
-### Phase 7 — context menu, standalone mode, file associations / 右键菜单、独立模式、文件关联
+### Phase 7 — context menu, standalone mode, Open With / 右键菜单、独立模式、打开方式
 
-`IContextMenu`, a resizable windowed host that reuses the page, a standalone executable,
-and associations for the checksum extensions we produce.
+`IContextMenu` with a dedicated STA window thread, a resizable top-level host that reuses
+the page, a thin `rusthashtab.exe` launcher that loads the DLL and calls
+`StandaloneEntryW`, and per-user Open With registration for the checksum extensions we
+produce. Registration never writes an extension's default value.
 
-> `IContextMenu`、可缩放且复用属性页的独立窗口宿主、独立可执行文件，以及我们生成的
-> 校验和扩展名关联。
+> `IContextMenu` 与专用 STA 窗口线程、复用同一页面的可缩放顶层宿主、加载 DLL 并调用
+> `StandaloneEntryW` 的薄 `rusthashtab.exe` 启动器，以及为我们生成的校验和扩展名写入的
+> 按用户“打开方式”注册。注册绝不写扩展名的默认值。
 
-**Gate / 门禁:** `cargo xtask check` plus a manual `explorer.exe` pass covering the menu,
-standalone window, associations and closing the page cleanly.
+**Gate / 门禁:** `cargo xtask check` (three targets, including the release DLL and EXE
+artifact tests) plus a manual `explorer.exe` pass covering the menu, standalone window,
+Open With registration, resizing and closing the page cleanly.
 
-> **门禁：** `cargo xtask check`，外加一次真实 `explorer.exe` 人工验收，覆盖右键菜单、
-> 独立窗口、文件关联与关闭页面的清理。
+> **门禁：** `cargo xtask check`（三个 target，包括 release DLL 与 EXE 的产物测试），
+> 外加一次真实 `explorer.exe` 人工验收，覆盖右键菜单、独立窗口、打开方式注册、
+> 缩放与关闭页面的清理。
+
+**Status: done — automated gate green, and manual `explorer.exe` acceptance passed on
+2026-11-06** (right-click Hashes, the Hashes tab, Open With and the standalone launcher;
+150%/200% DPI was not re-tested in that pass — the layout it reuses was accepted in
+Phase 5, and the window host reuses that layout code). The context-menu window runs on
+its own STA thread inside the DLL, precisely so closing it cannot block the shell's UI
+thread. The standalone launcher was exercised end-to-end against the real release pair
+(open, resize, close, exit 0), and the context-menu `InvokeCommand` path was exercised
+against the real DLL with a visible window.
+
+> **状态：已完成——自动门禁全绿，2026-11-06 已在真实 `explorer.exe` 通过人工验收**
+> （右键 Hashes、属性页 Hashes 标签、打开方式、独立启动器；本次未复测 150%/200% DPI，
+> 页面布局已在 Phase 5 验收，窗口宿主复用同一布局代码）。
+> 右键窗口跑在 DLL 自己的 STA 线程上，正是为了让关闭它不会阻塞 shell 的 UI 线程。
+> 独立启动器已对照真实 release 产物完成端到端验证（打开、缩放、关闭、退出码 0），
+> 右键 `InvokeCommand` 也已在真实 DLL 上通过可见窗口验证。
 
 ### Phase 8 — localization and optional network features / 本地化与可选联网功能
 
@@ -694,7 +799,7 @@ shipped file), and an install→use→uninstall pass on a clean VM.
 | Phase 4 checksum files, verification and settings / 第四阶段 —— 校验和文件、校验与设置 | ✅ done, verified in a real Properties dialog / 已完成，已在真实属性对话框中验收 |
 | Phase 5 page completion and performance / 第五阶段 —— 页面补全与性能 | ✅ done, automated gate green, manual visual acceptance passed in a real explorer.exe Properties dialog on 2026-10-23 / 已完成，自动门禁通过，2026-10-23 已在真实 explorer.exe 属性对话框中通过人工视觉验收 |
 | Phase 6 workflows / 第六阶段 —— 工作流 | ✅ done, manual acceptance passed in a real explorer.exe Properties dialog on 2026-10-24 / 已完成，2026-10-24 已在真实 explorer.exe 属性对话框中通过人工验收 |
-| Phase 7 context menu, standalone mode, file associations / 第七阶段 —— 右键菜单、独立模式、文件关联 | ⬜ not started / 未开始 |
+| Phase 7 context menu, standalone mode, Open With / 第七阶段 —— 右键菜单、独立模式、打开方式 | ✅ done, automated gate green, manual explorer.exe acceptance passed on 2026-11-06 (DPI re-test deferred) / 已完成，自动门禁通过，2026-11-06 已在真实 explorer.exe 通过人工验收（DPI 未复测） |
 | Phase 8 localization and optional network features / 第八阶段 —— 本地化与可选联网 | ⬜ not started / 未开始 |
 | Phase 9 release / 第九阶段 —— 发布 | ⬜ not started / 未开始 |
 

@@ -103,6 +103,18 @@ pub enum Key {
     ExportFormatMismatch,
     /// A copied checksum set; `{}` is the number of entries.
     CopiedHashes,
+    /// The context-menu command's label, and the property page's tab title.
+    ContextMenuHashes,
+    /// The context-menu command's help text.
+    ContextMenuHelp,
+    /// The title of the standalone/context-menu window.
+    WindowTitle,
+    /// The friendly name of the checksum-file ProgId.
+    ChecksumFileType,
+    /// A window could not be opened; `{}` is the error.
+    WindowOpenFailed,
+    /// The context-menu window did not become ready in time.
+    WindowStartTimeout,
 }
 
 /// The English text for a key.
@@ -149,6 +161,12 @@ pub fn text(key: Key) -> &'static str {
         Key::ColourGroupLabel => "Colours",
         Key::ExportFormatMismatch => "The file name does not match the selected format",
         Key::CopiedHashes => "Copied {} hashes",
+        Key::ContextMenuHashes => "Hashes",
+        Key::ContextMenuHelp => "Show hashes for the selected files",
+        Key::WindowTitle => "rustHashTab",
+        Key::ChecksumFileType => "rustHashTab checksum file",
+        Key::WindowOpenFailed => "rustHashTab could not open its window: {}",
+        Key::WindowStartTimeout => "rustHashTab did not open its window in time",
     }
 }
 
@@ -193,6 +211,12 @@ pub fn all() -> &'static [Key] {
         Key::ColourGroupLabel,
         Key::ExportFormatMismatch,
         Key::CopiedHashes,
+        Key::ContextMenuHashes,
+        Key::ContextMenuHelp,
+        Key::WindowTitle,
+        Key::ChecksumFileType,
+        Key::WindowOpenFailed,
+        Key::WindowStartTimeout,
     ]
 }
 

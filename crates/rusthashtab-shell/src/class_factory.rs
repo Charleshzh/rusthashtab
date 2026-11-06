@@ -332,9 +332,16 @@ mod tests {
         let refused = unsafe { create_instance(&factory, None, &stranger, &mut out) };
         assert!(refused.is_err());
         assert!(
-            clean(),
-            "a refused CreateInstance left the object count raised"
+            out.is_null(),
+            "a refused CreateInstance must not leave a pointer behind"
         );
+        // The process-wide count is deliberately **not** read back here. A sibling
+        // test may create, drop, or pin an object between the refused call and this
+        // observation (the new IContextMenu tests do), so "clean now" is not a
+        // property this call can be blamed for. The construction/destruction balance
+        // is covered by the live-object sequence above, and the refusal path's
+        // pointer contract is covered here and in
+        // `a_refused_interface_does_not_leak_an_object`.
     }
 
     /// Aggregation is refused rather than half-supported.

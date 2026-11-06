@@ -75,7 +75,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetParent, GetWindowTextW, MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MessageBoxW, SendMessageW, SetWindowTextW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY, WM_SETFONT, WS_POPUP,
+    WM_GETFONT, WM_INITDIALOG, WM_NCDESTROY, WM_NOTIFY, WM_SETFONT, WM_SIZE, WS_POPUP,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -126,6 +126,14 @@ pub extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam
             on_destroy(hwnd);
             1
         }
+        WM_SIZE => {
+            // Only the standalone host resizes the page; the property sheet lays it
+            // out once. Reflowing is cheap and idempotent, so no distinction is
+            // needed: a page that never sees `WM_SIZE` simply keeps its template
+            // geometry.
+            resize_controls(hwnd, lparam);
+            1
+        }
         WM_NCDESTROY => {
             // Runs *before* anything else, because a message already in the queue
             // will still be dispatched here after this returns; it must not find a
@@ -168,6 +176,42 @@ pub extern "system" fn dlg_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam
     }
 }
 
+/// The dialog procedure for a dialog created **directly**, with the state pointer
+/// in `WM_INITDIALOG`'s `lParam`.
+///
+/// # Why a wrapper is needed at all
+///
+/// `comctl32` sends a property sheet page `WM_INITDIALOG` with a copy of the
+/// `PROPSHEETPAGEW` as `lParam`, and the page procedure reads the `DialogState`
+/// pointer out of that structure. A dialog created with `CreateDialogParamW` --
+/// which is how the standalone host builds the page -- passes the caller's own
+/// `lParam` instead. This wraps that pointer in the structure `dlg_proc` expects
+/// for that one message and forwards every other message unchanged, so the host
+/// and the shell exercise exactly the same procedure.
+///
+/// [`crate::page::test_dlg_proc`] is the public spelling of this hook; it
+/// delegates here. Keeping one implementation is what lets the windowed host use
+/// the shipping code path rather than a copy of it.
+pub(crate) extern "system" fn direct_dialog_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> isize {
+    if message != WM_INITDIALOG {
+        return dlg_proc(hwnd, message, wparam, lparam);
+    }
+
+    // The page procedure reads `(*page).lParam`, which is the caller's state
+    // pointer here. The local is borrowed only for the duration of the call.
+    let mut page = PROPSHEETPAGEW {
+        lParam: lparam,
+        ..Default::default()
+    };
+    let translated = LPARAM((&mut page as *mut PROPSHEETPAGEW) as isize);
+    dlg_proc(hwnd, message, wparam, translated)
+}
+
 /// `WM_INITDIALOG`: take ownership of the state and start hashing.
 fn on_init(hwnd: HWND, lparam: LPARAM) -> isize {
     if lparam.0 == 0 {
@@ -207,6 +251,11 @@ fn on_init(hwnd: HWND, lparam: LPARAM) -> isize {
     // `clipboard::read_text`) and skipped entirely when the setting is off.
     state.clipboard_text = clipboard_candidate(hwnd, state);
     build_controls(hwnd, state, font);
+    // The template's geometry is the only description of where the controls
+    // belong, and `WM_SIZE` needs it before it can reflow anything. Capturing it
+    // here, after `build_controls` has found every control, is what makes the
+    // baseline complete.
+    state.layout = crate::layout::capture(hwnd);
     state.scan_phase = crate::ScanPhase::Discovering;
     set_control_state(hwnd, state);
     start_hashing(hwnd, state);
@@ -615,6 +664,29 @@ fn on_destroy(hwnd: HWND) {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(tooltip);
         }
     }
+}
+
+/// `WM_SIZE`: reflow the controls from the geometry captured in `WM_INITDIALOG`.
+///
+/// The property sheet never resizes its pages, so this message only arrives from
+/// the standalone host. A page captured without a baseline (or before
+/// `WM_INITDIALOG`) has nothing to reflow and simply keeps its current geometry.
+fn resize_controls(hwnd: HWND, lparam: LPARAM) {
+    // The dialog manager packs the new client size into `lParam` exactly as
+    // `WM_SIZE` documents: width in the low word, height in the high word. Reading
+    // it from the message rather than calling `GetClientRect` again keeps this in
+    // step with the message that triggered it.
+    let width = (lparam.0 as u32 & 0xffff) as i32;
+    let height = ((lparam.0 as u32 >> 16) & 0xffff) as i32;
+
+    // SAFETY: `hwnd` is the page dialog; the state is cleared on `WM_NCDESTROY`.
+    let Some(state) = (unsafe { crate::dialog::state(hwnd) }) else {
+        return;
+    };
+    let Some(baseline) = state.layout.as_ref() else {
+        return;
+    };
+    crate::layout::apply(baseline, width, height);
 }
 
 /// `WM_SETFONT` from the property sheet manager.
@@ -2291,27 +2363,49 @@ fn set_control_text(control: HWND, text: &str) {
     }
 }
 
-/// The font the property sheet selected for the page.
+/// The font the page should measure against.
 ///
-/// `comctl32` sends `WM_SETFONT` to the page and then to its children, so asking the
-/// parent is how the page learns the font before it has to measure anything. A font
-/// that cannot be determined becomes `0`, and every caller treats that as "use the
-/// default".
+/// # Why there are three candidates
+///
+/// In the property sheet, `comctl32` sends `WM_SETFONT` to the page and then to
+/// its children, so the page normally learns the font from its parent. That order
+/// is kept first so the shell's chosen face always wins.
+///
+/// In the standalone window nobody sends `WM_SETFONT` at all. The page and its
+/// parent answer `WM_GETFONT` with "no font", but the controls were created from
+/// a `DS_SETFONT` template and the dialog manager did set the template's font on
+/// them, so asking the list view recovers exactly the face the template asked
+/// for. That is what keeps the list monospace when the display setting asks for a
+/// monospace digest column: the derived face is measured from the real one rather
+/// than from the system default.
+///
+/// A font that cannot be determined becomes `0`, and every caller treats that as
+/// "use the default".
 fn dialog_font(hwnd: HWND) -> isize {
-    // SAFETY: both handles are live windows or null, which the API accepts.
+    // SAFETY: every handle below is a live window or a control this dialog
+    // declares; `WM_GETFONT` takes no parameters and returns a borrowed font
+    // handle that outlives this call.
     unsafe {
-        let parent = GetParent(hwnd).unwrap_or_default();
-        if parent.is_invalid() {
-            return 0;
+        let own = SendMessageW(hwnd, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+        if own != 0 {
+            return own;
         }
-        SendMessageW(
-            parent,
-            windows::Win32::UI::WindowsAndMessaging::WM_GETFONT,
-            Some(WPARAM(0)),
-            Some(LPARAM(0)),
-        )
-        .0
+
+        if let Ok(parent) = GetParent(hwnd)
+            && !parent.is_invalid()
+        {
+            let inherited = SendMessageW(parent, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+            if inherited != 0 {
+                return inherited;
+            }
+        }
+
+        if let Some(list) = control(hwnd, resource::IDC_HASH_LIST) {
+            return SendMessageW(list, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+        }
     }
+
+    0
 }
 
 /// The state behind a window, or `None` once `WM_NCDESTROY` has run.

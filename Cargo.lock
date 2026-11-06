@@ -478,6 +478,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusthashtab-standalone"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "rusthashtab-sumfile"
 version = "0.1.0"
 dependencies = [

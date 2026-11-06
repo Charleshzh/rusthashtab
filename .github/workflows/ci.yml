@@ -203,7 +203,7 @@ jobs:
                        '.cargo/config.toml', '.gitignore', 'LICENSE-MIT')
           # CLAUDE.md is git-ignored, but scan it whenever a local checkout has it.
           if (Test-Path 'CLAUDE.md') { $shipped += 'CLAUDE.md' }
-          $shipped += (Get-ChildItem crates -Recurse -File -Include *.rs, *.toml, *.rc |
+          $shipped += (Get-ChildItem crates -Recurse -File -Include *.rs, *.toml, *.rc, *.manifest |
                        ForEach-Object FullName)
 
           # Split so this file does not match its own source text.

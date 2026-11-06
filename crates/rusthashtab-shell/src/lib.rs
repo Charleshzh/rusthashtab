@@ -9,8 +9,11 @@
 //!
 //! * `DllMain`, and the four standard exports `DllGetClassObject`,
 //!   `DllCanUnloadNow`, `DllRegisterServer`, `DllUnregisterServer`;
+//! * the standalone launcher's entry point, `StandaloneEntryW`, which is not a
+//!   COM export but is reached through this DLL's export table;
 //! * the class factory;
-//! * `IShellExtInit` (the selection) and `IShellPropSheetExt` (the page).
+//! * `IShellExtInit` (the selection), `IShellPropSheetExt` (the page), and
+//!   `IContextMenu` (the right-click command).
 //!
 //! Everything else -- the Win32 dialog, the list view, the worker that owns the
 //! scan -- lives in `rusthashtab-ui`, which is an ordinary library and can
@@ -33,12 +36,17 @@
 
 #[cfg(windows)]
 mod class_factory;
+// The apartment guard the context-menu window thread owns; see `com`.
+#[cfg(windows)]
+mod com;
 #[cfg(windows)]
 mod ext;
 #[cfg(windows)]
 mod module;
 #[cfg(windows)]
 mod register;
+#[cfg(windows)]
+mod standalone;
 
 #[cfg(windows)]
 pub use ext::CLSID;
@@ -207,7 +215,7 @@ pub extern "system" fn RustHashTabModuleBase() -> usize {
 mod tests {
     use super::*;
     use rusthashtab_ui::{MESSAGE_MAGIC, PROGRESS_RESOLUTION};
-    use windows::Win32::UI::Shell::IShellPropSheetExt;
+    use windows::Win32::UI::Shell::{IContextMenu, IShellPropSheetExt};
     // `IID` and `from_raw` are provided by these traits, not by the generated
     // interface structs.
     use windows::core::Interface as _;
@@ -320,6 +328,19 @@ mod tests {
 
         // SAFETY: `shell_ext` is the interface the query just produced.
         drop(unsafe { IShellPropSheetExt::from_raw(shell_ext) });
+
+        // The same object must also answer for the context-menu interface, or the
+        // shell silently omits the right-click command.
+        let mut context: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: `handler` is a live object, and both pointers are live locals for
+        // the duration of the call.
+        let queried =
+            unsafe { windows::core::Interface::query(&handler, &IContextMenu::IID, &mut context) };
+        assert_eq!(queried, S_OK, "the handler does not implement IContextMenu");
+        assert!(!context.is_null());
+
+        // SAFETY: `context` is the interface the query just produced.
+        drop(unsafe { IContextMenu::from_raw(context) });
         drop(handler);
     }
 

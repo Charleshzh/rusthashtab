@@ -3,39 +3,54 @@
 //! # Hard constraint
 //!
 //! The page is a **child dialog created by the shell** and hosted in the file
-//! Properties sheet. Every message arrives at our `DLGPROC` on the shell's STA.
-//! There is no supported way to host a GPU-rendered toolkit here, so the UI is
-//! raw Win32 common controls, exactly as the upstream implementation is:
+//! Properties sheet, or by the standalone window host. Every message arrives at
+//! our `DLGPROC` on the thread that owns the dialog. There is no supported way to
+//! host a GPU-rendered toolkit here, so the UI is raw Win32 common controls:
 //!
 //! * `SysListView32` in report mode, owner-drawn for the match/mismatch colours
 //! * `msctls_progress32`
 //! * a status line
 //! * a push button that copies the selected rows
 //!
+//! # Two hosts, one page
+//!
+//! The shell creates the page as a property sheet page ([`page`]). The context
+//! menu and the standalone launcher have no property sheet, so [`window`] wraps
+//! the same dialog in a plain resizable top-level window and reflows the controls
+//! on `WM_SIZE` from a baseline captured in `WM_INITDIALOG`. Both paths create the
+//! dialog from the same compiled template and run the same [`dialog::dlg_proc`];
+//! only the code that owns the window differs.
+//!
 //! # Lifetime
 //!
-//! The state object behind the dialog is handed to the shell through
-//! `PROPSHEETPAGEW::lParam` as a raw `Box::into_raw` pointer. The shell calls
-//! the page callback with `PSPCB_ADDREF` / `PSPCB_CREATE` / `PSPCB_RELEASE`;
-//! the pointer is reclaimed **exactly once**, on `PSPCB_RELEASE`. [`page`]
-//! documents the three-way ownership table, including the failure path where the
-//! shell takes the page but rejects it.
+//! On the property sheet path the state object behind the dialog is handed to the
+//! shell through `PROPSHEETPAGEW::lParam` as a raw `Box::into_raw` pointer. The
+//! shell calls the page callback with `PSPCB_ADDREF` / `PSPCB_CREATE` /
+//! `PSPCB_RELEASE`; the pointer is reclaimed **exactly once**, on
+//! `PSPCB_RELEASE`. [`page`] documents the three-way ownership table, including
+//! the failure path where the shell takes the page but rejects it. On the window
+//! path the host owns the same box and frees it on `WM_DESTROY`, after the child
+//! dialog has been destroyed.
 //!
 //! # Why the scan is not run from here
 //!
 //! `AddPages` and the dialog procedure both run on the thread that owns the
-//! Properties dialog. Expanding a directory selection or hashing a file there
-//! would freeze the dialog, and the project forbids blocking the UI thread
-//! outright. The hashing therefore lives on a thread the page owns, and reports
-//! back through posted window messages authenticated by [`MESSAGE_MAGIC`].
+//! dialog. Expanding a directory selection or hashing a file there would freeze
+//! it, and the project forbids blocking the UI thread outright. The hashing
+//! therefore lives on a thread the page owns, and reports back through posted
+//! window messages authenticated by [`MESSAGE_MAGIC`].
 
 #![warn(missing_docs)]
 
+/// Checksum-file extensions the shell may advertise in "Open with".
+pub mod associations;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
 pub mod dialog;
 pub mod export;
+#[cfg(windows)]
+mod layout;
 #[cfg(windows)]
 pub mod listview;
 pub mod manifest;
@@ -53,6 +68,8 @@ pub mod strings;
 #[cfg(windows)]
 pub mod task;
 pub mod verify;
+#[cfg(windows)]
+pub mod window;
 #[cfg(windows)]
 mod window_data;
 
@@ -257,6 +274,14 @@ pub struct DialogState {
     /// The page's status line, once `WM_INITDIALOG` has found it.
     #[cfg(windows)]
     pub status: Option<windows::Win32::Foundation::HWND>,
+    /// The template geometry of every control, captured in `WM_INITDIALOG`.
+    ///
+    /// `None` until the controls exist; [`window::open`] then resizes the page to
+    /// fill the top-level window, and the page's `WM_SIZE` reflows from this
+    /// baseline. A property sheet never resizes its page, so a page that never
+    /// leaves the sheet keeps its template geometry and never reads this.
+    #[cfg(windows)]
+    pub(crate) layout: Option<layout::Baseline>,
     /// The page's window handle, or `None` before `WM_INITDIALOG`.
     #[cfg(windows)]
     pub hwnd: Option<windows::Win32::Foundation::HWND>,
@@ -335,6 +360,8 @@ impl DialogState {
             list: None,
             #[cfg(windows)]
             status: None,
+            #[cfg(windows)]
+            layout: None,
             #[cfg(windows)]
             hwnd: None,
             #[cfg(windows)]

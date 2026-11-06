@@ -1,0 +1,41 @@
+[package]
+name = "rusthashtab-standalone"
+description = "The thin rusthashtab.exe launcher: loads rusthashtab_shell.dll from its own directory and calls StandaloneEntryW"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# The shipped binary is `rusthashtab.exe`, not `rusthashtab-standalone.exe`:
+# this is the name a user launches and the one the installer registers for
+# "Open with", so it is part of the user-visible interface.
+[[bin]]
+name = "rusthashtab"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+# Windows-only, and unlike the library crates there is no non-Windows remainder
+# that has to keep compiling (the launcher cannot exist without the loader and
+# user32), so the dependency is not target-gated.
+#
+# The feature list is exactly the transitive closure of the Win32 calls below.
+# Adding a call without its feature is a compile error, so the list cannot drift
+# silently in the direction that matters; the comments map each feature to the
+# calls that justify it.
+[dependencies]
+windows = { workspace = true, features = [
+    # HWND/HINSTANCE/WIN32_ERROR/GetLastError
+    "Win32_Foundation",
+    # GetCommandLineW: the launcher forwards the full command line untouched.
+    "Win32_System_Environment",
+    # GetModuleFileNameW, LoadLibraryW, GetProcAddress.
+    "Win32_System_LibraryLoader",
+    # SetProcessDpiAwarenessContext, the runtime fallback next to the manifest.
+    "Win32_UI_HiDpi",
+    # MessageBoxW, SetProcessDPIAware, SW_SHOWNORMAL.
+    "Win32_UI_WindowsAndMessaging",
+] }

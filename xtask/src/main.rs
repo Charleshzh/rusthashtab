@@ -131,12 +131,13 @@ cargo xtask <command>
             what, and which have no authority attached yet.
 
   shell-check
-            Build the shell extension DLL and print where it is. Nothing is
-            registered unless you ask:
-              --register     register it for the current user (HKCU, no elevation)
+            Build the shell extension DLL and the standalone launcher EXE, and
+            print where both are. Nothing is registered unless you ask:
+              --register     register the DLL for the current user (HKCU, no elevation)
               --unregister   remove that registration
             Registering changes what every Properties dialog on this machine
-            shows, so it is never done implicitly.
+            shows, so it is never done implicitly. The launcher needs no
+            registration: it loads the DLL from its own directory.
 
   reference-check
             Fail if anything from the local reference checkout has become tracked
@@ -372,6 +373,25 @@ fn check(args: &[String]) -> ExitCode {
                     "build",
                     "-p",
                     "rusthashtab-shell",
+                    "--release",
+                    "--target",
+                    target,
+                ],
+            );
+
+            // The standalone launcher has the same requirement: its artifact test
+            // runs the **release EXE** and reads its manifest, because "the manifest
+            // was copied next to the executable" is not visible in a debug build
+            // unless the test happens to look at the release directory. The two
+            // artifacts ship as a pair -- the EXE loads the DLL beside it -- so they
+            // are built side by side.
+            ok &= step(
+                &format!("cargo build -p rusthashtab-standalone --release --target {target}"),
+                "cargo",
+                &[
+                    "build",
+                    "-p",
+                    "rusthashtab-standalone",
                     "--release",
                     "--target",
                     target,

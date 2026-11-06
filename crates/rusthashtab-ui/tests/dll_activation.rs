@@ -26,7 +26,7 @@ use windows::Win32::Foundation::{LPARAM, S_OK};
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Controls::{HPROPSHEETPAGE, LPFNSVADDPROPSHEETPAGE};
-use windows::Win32::UI::Shell::IShellPropSheetExt;
+use windows::Win32::UI::Shell::{IContextMenu, IShellPropSheetExt};
 use windows::core::{BOOL, GUID, Interface, PCWSTR};
 
 /// The CLSID the DLL registers under.
@@ -222,6 +222,23 @@ fn the_built_dll_hands_out_a_property_sheet_page_over_com() {
     let prop_sheet: IShellPropSheetExt = handler
         .cast()
         .expect("the handler does not implement IShellPropSheetExt");
+
+    // The right-click command and the standalone launcher's entry point ship in the
+    // same artifact, and both are reached through things this test has already loaded.
+    // Checking them here -- rather than only in the context-menu test -- means a build
+    // that drops either one is caught by the property-sheet diagnostic too, before a
+    // menu or a window is ever involved.
+    let context_menu: IContextMenu = handler
+        .cast()
+        .expect("the handler does not implement IContextMenu");
+    drop(context_menu);
+
+    // SAFETY: `module` is the live DLL and the name is a NUL-terminated literal.
+    let standalone_entry = unsafe { GetProcAddress(module, windows::core::s!("StandaloneEntryW")) };
+    assert!(
+        standalone_entry.is_some(),
+        "the DLL does not export StandaloneEntryW, so rusthashtab.exe could not start it"
+    );
 
     ACCEPTED
         .lock()

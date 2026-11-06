@@ -51,8 +51,11 @@ pub type AddPageCallback = Option<unsafe extern "system" fn(HPROPSHEETPAGE, LPAR
 ///
 /// [`crate::dialog::dlg_proc`] reads the state out of a `PROPSHEETPAGEW` on
 /// `WM_INITDIALOG`, because that is what `comctl32` hands a property sheet page. A
-/// dialog created directly gets the caller's `lParam` instead, so this wraps it in the
-/// very structure the real procedure expects.
+/// dialog created directly gets the caller's `lParam` instead, so this delegates to
+/// [`crate::dialog::direct_dialog_proc`], which wraps the call in the very
+/// structure the real procedure expects. The wrapper is shared with
+/// [`crate::window`], so a test built on this function exercises the same path the
+/// standalone window uses.
 ///
 /// Everything a test then exercises -- the template, the controls, the message
 /// routing, the hashing thread, the teardown -- is the same code the shell reaches.
@@ -82,23 +85,7 @@ pub extern "system" fn test_dlg_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> isize {
-    // Only `WM_INITDIALOG` needs the `PROPSHEETPAGEW` wrapper: that is the message
-    // whose `lparam` is the state pointer. Every other message must receive the
-    // real `lparam`, because `WM_NOTIFY` carries the custom-draw structure and
-    // reinterpreting it as a page would make the notification unreadable -- the
-    // test harness would then be exercising a path the shell never takes.
-    if message != windows::Win32::UI::WindowsAndMessaging::WM_INITDIALOG {
-        return crate::dialog::dlg_proc(hwnd, message, wparam, lparam);
-    }
-
-    let mut page = PROPSHEETPAGEW {
-        lParam: lparam,
-        ..Default::default()
-    };
-    // `on_init` reads `(*page).lParam`, which is what this arranges. The local is
-    // borrowed only for the duration of the call.
-    let translated = LPARAM((&mut page as *mut PROPSHEETPAGEW) as isize);
-    crate::dialog::dlg_proc(hwnd, message, wparam, translated)
+    crate::dialog::direct_dialog_proc(hwnd, message, wparam, lparam)
 }
 
 /// Build the page and hand it to the shell in one step.
