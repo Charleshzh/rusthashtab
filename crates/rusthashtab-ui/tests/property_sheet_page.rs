@@ -1398,8 +1398,13 @@ fn cancelling_returns_immediately_and_finishes_later() {
     let page = HostedPage::open(vec![path], settings);
     let started = Instant::now();
     page.click(resource::IDC_HASH_CANCEL);
+    // The handler only flips the cancel token and updates two controls, so a
+    // regression that waited for the scan here would still be visible as a much
+    // longer click. The bound is deliberately generous: a loaded CI VM can
+    // deschedule the dialog's thread for hundreds of milliseconds without the
+    // handler waiting for anything (860 ms was observed once on an i686 runner).
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < Duration::from_millis(1500),
         "Cancel blocked the dialog thread for {:?}",
         started.elapsed()
     );

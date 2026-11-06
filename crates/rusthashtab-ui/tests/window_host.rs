@@ -184,12 +184,17 @@ fn control_rect(page: HWND, control: HWND) -> RECT {
     }
 }
 
+/// A window's client area, in pixels.
+fn window_client(hwnd: HWND) -> (i32, i32) {
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is a live window and `rect` is a live local.
+    unsafe { GetClientRect(hwnd, &mut rect) }.expect("a live window has a client area");
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
 /// The page's client size.
 fn page_client(page: HWND) -> (i32, i32) {
-    let mut rect = RECT::default();
-    // SAFETY: `page` is a live window and `rect` is a live local.
-    unsafe { GetClientRect(page, &mut rect) }.expect("a live window has a client area");
-    (rect.right - rect.left, rect.bottom - rect.top)
+    window_client(page)
 }
 
 /// Whether `hwnd` is a live window.
@@ -482,11 +487,16 @@ fn resizing_reflows_the_controls_by_their_anchors() {
         "the results list must have a real size"
     );
 
+    // Grow the window by a fixed amount. The window manager may clamp the result
+    // to the default maximum tracking size of the display (CI runners are
+    // 1024x768), so the growth that actually happened is measured from the
+    // host's client rect below rather than assumed. What this test proves is that
+    // the page and its controls follow the client area, not that a particular
+    // window size was accepted.
     let mut outer = RECT::default();
     // SAFETY: `host` is live.
     unsafe { GetWindowRect(host, &mut outer) }.expect("the host has a rectangle");
-    // Grow the window by a fixed amount; the frame does not change, so the page's
-    // client area grows by exactly the same amount.
+    let before_host = window_client(host);
     // SAFETY: `host` is live and the new size is derived from its own rectangle.
     unsafe {
         SetWindowPos(
@@ -501,16 +511,24 @@ fn resizing_reflows_the_controls_by_their_anchors() {
     }
     .expect("the host can be grown");
 
+    let after_host = window_client(host);
+    let grown_width = after_host.0 - before_host.0;
+    let grown_height = after_host.1 - before_host.1;
+    assert!(
+        grown_width > 0 && grown_height > 0,
+        "the host did not grow on this display: {before_host:?} -> {after_host:?}"
+    );
+
     let after = Snapshot::take(page);
-    let grown_width = after.client_width - before.client_width;
-    let grown_height = after.client_height - before.client_height;
     assert_eq!(
-        grown_width, 200,
-        "the client area must grow with the window"
+        after.client_width - before.client_width,
+        grown_width,
+        "the page's client area must follow the host's"
     );
     assert_eq!(
-        grown_height, 150,
-        "the client area must grow with the window"
+        after.client_height - before.client_height,
+        grown_height,
+        "the page's client area must follow the host's"
     );
 
     // Stretch both ways: both edges follow, the origin does not move.
@@ -518,19 +536,19 @@ fn resizing_reflows_the_controls_by_their_anchors() {
     assert_near(after.list.top, before.list.top, "list top edge");
     assert_near(
         rect_width(&after.list) - rect_width(&before.list),
-        200,
+        grown_width,
         "list width follows the window",
     );
     assert_near(
         rect_height(&after.list) - rect_height(&before.list),
-        150,
+        grown_height,
         "list height follows the window",
     );
 
     // The bottom block moves down without changing height.
     assert_near(
         after.status.top - before.status.top,
-        150,
+        grown_height,
         "the status line moves with the bottom edge",
     );
     assert_near(
@@ -540,12 +558,12 @@ fn resizing_reflows_the_controls_by_their_anchors() {
     );
     assert_near(
         after.progress.bottom - before.progress.bottom,
-        150,
+        grown_height,
         "the progress bar moves with the bottom edge",
     );
     assert_near(
         rect_width(&after.progress) - rect_width(&before.progress),
-        200,
+        grown_width,
         "the progress bar stretches",
     );
 
@@ -559,7 +577,7 @@ fn resizing_reflows_the_controls_by_their_anchors() {
     ] {
         assert_near(
             new.right - old.right,
-            200,
+            grown_width,
             &format!("{name} right edge follows the window"),
         );
         assert_near(
@@ -569,7 +587,7 @@ fn resizing_reflows_the_controls_by_their_anchors() {
         );
         assert_near(
             new.bottom - old.bottom,
-            150,
+            grown_height,
             &format!("{name} bottom edge follows the window"),
         );
     }
@@ -586,7 +604,7 @@ fn resizing_reflows_the_controls_by_their_anchors() {
         assert_near(new.left, old.left, &format!("{name} left edge"));
         assert_near(
             new.bottom - old.bottom,
-            150,
+            grown_height,
             &format!("{name} moves with the bottom edge"),
         );
     }
@@ -594,7 +612,7 @@ fn resizing_reflows_the_controls_by_their_anchors() {
     // The expected-digest edit stretches up to the Check button's column.
     assert_near(
         after.expected.right - before.expected.right,
-        200,
+        grown_width,
         "the expected-digest edit stretches",
     );
     assert!(
@@ -609,12 +627,12 @@ fn resizing_reflows_the_controls_by_their_anchors() {
     let format_label = find_child_with_text(page, "Format:").expect("the label exists");
     assert_near(
         control_rect(page, expected_label).top - before.expected_label_top,
-        150,
+        grown_height,
         "the Expected: label moves down with its row",
     );
     assert_near(
         control_rect(page, format_label).top - before.format_label_top,
-        150,
+        grown_height,
         "the Format: label moves down with its row",
     );
 
